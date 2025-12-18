@@ -612,6 +612,23 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             }
         }
     }
+    
+    /* Handle mouse wheel zoom in views */
+    if (in->wheel_delta != 0 && !g->drag_win) {
+        for (int i = 0; i < 4; i++) {
+            Rect vr = g->view[i].r;
+            Rect content = (Rect){ vr.x + 6, vr.y + 26, vr.w - 12, vr.h - 32 };
+            
+            /* Check if mouse is over view content area */
+            if (pt_in_rect(in->mouse_x, in->mouse_y, content)) {
+                /* Apply zoom: positive delta = zoom in, negative = zoom out */
+                double zoom_factor = 1.0 + (in->wheel_delta * 0.1); /* 10% per scroll step */
+                double new_zoom = g->views[i].zoom * zoom_factor;
+                CadView_SetZoom(&g->views[i], new_zoom);
+                break; /* Only zoom the first view the mouse is over */
+            }
+        }
+    }
 
     /* Tool palette button clicks */
     if (in->mouse_pressed && !g->drag_win) {

@@ -10,6 +10,7 @@ typedef struct GuiInput {
     int mouse_down;      /* current */
     int mouse_pressed;   /* went down this frame */
     int mouse_released;  /* went up this frame */
+    int wheel_delta;     /* mouse wheel scroll delta (positive = zoom in, negative = zoom out) */
 } GuiInput;
 
 typedef struct GuiState GuiState;

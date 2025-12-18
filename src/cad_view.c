@@ -92,17 +92,15 @@ void CadView_ProjectPoint(const CadView* view, double x, double y, double z,
             break;
         case CAD_VIEW_FRONT:
             /* Front view: looking from front, X is left/right, Y is up/down, Z is depth */
-            /* Swapped with RIGHT - showing Z and Y instead of X and Y */
-            px = z;  /* Z becomes horizontal (forward/back) */
+            px = x;  /* X is horizontal (left/right) */
             py = -y; /* Y is vertical (up/down) */
-            pz = x;  /* X is depth */
+            pz = z;  /* Z is depth */
             break;
         case CAD_VIEW_RIGHT:
             /* Right view: looking from right, Z is forward/back, Y is up/down, X is depth */
-            /* Swapped with FRONT - showing X and Y instead of Z and Y */
-            px = x;  /* X is horizontal (left/right) */
+            px = z;  /* Z becomes horizontal (forward/back) */
             py = -y; /* Y is vertical (up/down) */
-            pz = -z; /* Z is depth (negative because we're looking from right) */
+            pz = -x; /* X is depth (negative because we're looking from right) */
             break;
         default:
             px = x;

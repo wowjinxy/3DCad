@@ -79,12 +79,17 @@ int main(int argc, char** argv) {
 
     while (running) {
         int pressed = 0, released = 0;
+        int wheel_delta = 0;
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = 0;
             if (e.type == SDL_MOUSEMOTION) { mx = e.motion.x; my = e.motion.y; }
             if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) { mouse_down = 1; pressed = 1; }
             if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) { mouse_down = 0; released = 1; }
+            if (e.type == SDL_MOUSEWHEEL) {
+                /* SDL_MOUSEWHEEL: positive y = scroll up (zoom in), negative y = scroll down (zoom out) */
+                wheel_delta = e.wheel.y;
+            }
             if (e.type == SDL_WINDOWEVENT && (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESIZED)) {
                 /* nothing special; we query each frame */
             }
@@ -98,6 +103,7 @@ int main(int argc, char** argv) {
         in.mouse_down = mouse_down;
         in.mouse_pressed = pressed;
         in.mouse_released = released;
+        in.wheel_delta = wheel_delta;
 
         gui_update(gui, &in, w, h);
         gui_draw(gui, w, h);
