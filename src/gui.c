@@ -6,6 +6,7 @@
 #include "cad_core.h"
 #include "file_dialog.h"
 #include "cad_view.h"
+#include "cad_export_obj.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -86,8 +87,8 @@ static const char* fileMenuItems[] = {
     "(O)Open...",
     "(S)Save",
     " Save As...",
-    " Floppy",
-    " Print Out",
+    " Import",
+    " Export",
     "-",
     " Load Color...",
     " Load Pallet...",
@@ -238,11 +239,22 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
             }
         }
         break;
-    case 5: /* Floppy */
-        fprintf(stdout, "Floppy mount (not implemented)\n");
+    case 5: /* Import */
+        fprintf(stdout, "Import (not implemented)\n");
         break;
-    case 6: /* Print Out */
-        fprintf(stdout, "Print (not implemented)\n");
+    case 6: /* Export */
+        {
+            char filename[260];
+            if (FileDialog_Save(filename, sizeof(filename), 
+                              "OBJ Files\0*.obj\0All Files\0*.*\0", 
+                              "Export OBJ")) {
+                if (CadExport_OBJ(g->cad, filename)) {
+                    fprintf(stdout, "Exported to: %s\n", filename);
+                } else {
+                    fprintf(stderr, "Error: Failed to export OBJ file\n");
+                }
+            }
+        }
         break;
     case 8: /* Load Color... */
         fprintf(stdout, "Load Color (not implemented)\n");

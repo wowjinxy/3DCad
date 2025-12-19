@@ -27,6 +27,7 @@
     <ClCompile Include="src\cad_core.c" />
     <ClCompile Include="src\file_dialog.c" />
     <ClCompile Include="src\cad_view.c" />
+    <ClCompile Include="src\cad_export_obj.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\GLFW\glfw3.h" />
@@ -38,6 +39,7 @@
     <ClInclude Include="include\cad_core.h" />
     <ClInclude Include="include\file_dialog.h" />
     <ClInclude Include="include\cad_view.h" />
+    <ClInclude Include="include\cad_export_obj.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
