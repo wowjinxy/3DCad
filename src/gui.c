@@ -34,6 +34,17 @@ static int pt_in_rect(int px, int py, Rect r) {
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
 }
 
+/* Check if point is near a window edge (for resizing) */
+/* Returns edge flags: 1=left, 2=right, 4=top, 8=bottom */
+static int get_resize_edge(int px, int py, Rect r, int threshold) {
+    int edge = 0;
+    if (px >= r.x - threshold && px < r.x + threshold) edge |= 1; /* Left */
+    if (px >= r.x + r.w - threshold && px < r.x + r.w + threshold) edge |= 2; /* Right */
+    if (py >= r.y - threshold && py < r.y + threshold) edge |= 4; /* Top */
+    if (py >= r.y + r.h - threshold && py < r.y + r.h + threshold) edge |= 8; /* Bottom */
+    return edge;
+}
+
 typedef struct GuiWin {
     const char* title;
     Rect r;
@@ -70,6 +81,14 @@ struct GuiState {
     int drag_off_x;
     int drag_off_y;
     
+    /* Resizing */
+    GuiWin* resize_win;
+    int resize_edge; /* 0=none, 1=left, 2=right, 4=top, 8=bottom (can combine) */
+    int resize_start_x;
+    int resize_start_y;
+    int resize_start_w;
+    int resize_start_h;
+    
     /* View interaction */
     int view_interacting; /* Index of view being interacted with, or -1 */
     int last_mouse_x;
@@ -78,6 +97,9 @@ struct GuiState {
     /* Point move state */
     int point_move_active; /* 1 if currently moving points, 0 otherwise */
     int point_move_view; /* View index where point move started */
+    
+    /* View window scaling (individual scale per view) */
+    float view_scale[4]; /* Scale factor for each view window (default 1.0) */
 };
 
 static int MenuBarHeight(void) { return 20; }
@@ -125,6 +147,16 @@ static const char* windowMenuItems[] = {
     "-",
     " Clean Up",
     " Home",
+    "-",
+    " Top Scale +",
+    " Top Scale -",
+    " Front Scale +",
+    " Front Scale -",
+    " Right Scale +",
+    " Right Scale -",
+    " 3D Scale +",
+    " 3D Scale -",
+    " All Scales Reset",
     NULL
 };
 
@@ -306,6 +338,50 @@ static void handle_edit_menu_action(GuiState* g, int item_index) {
     }
 }
 
+/* Helper function to update a view window size based on its scale */
+static void update_view_window_size(GuiState* g, int view_idx) {
+    if (!g || view_idx < 0 || view_idx >= 4) return;
+    
+    const int baseX = 180, baseY = 20;
+    const int baseWinW = 560, baseWinH = 330;
+    int winW = (int)(baseWinW * g->view_scale[view_idx]);
+    int winH = (int)(baseWinH * g->view_scale[view_idx]);
+    
+    /* Calculate position based on grid layout */
+    switch (view_idx) {
+    case 0: /* Top - top-left */
+        {
+            int winW1 = (int)(baseWinW * g->view_scale[1]);
+            g->view[0].r = (Rect){ baseX + 0, baseY + 0, winW, winH };
+            /* Update 3D view position */
+            g->view[1].r.x = baseX + winW;
+        }
+        break;
+    case 1: /* 3D View - top-right */
+        {
+            int winW0 = (int)(baseWinW * g->view_scale[0]);
+            g->view[1].r = (Rect){ baseX + winW0, baseY + 0, winW, winH };
+        }
+        break;
+    case 2: /* Front - bottom-left */
+        {
+            int winH0 = (int)(baseWinH * g->view_scale[0]);
+            int winW1 = (int)(baseWinW * g->view_scale[1]);
+            g->view[2].r = (Rect){ baseX + 0, baseY + winH0, winW, winH };
+            /* Update Right view position */
+            g->view[3].r.x = baseX + winW;
+        }
+        break;
+    case 3: /* Right - bottom-right */
+        {
+            int winH0 = (int)(baseWinH * g->view_scale[0]);
+            int winW0 = (int)(baseWinW * g->view_scale[0]);
+            g->view[3].r = (Rect){ baseX + winW0, baseY + winH0, winW, winH };
+        }
+        break;
+    }
+}
+
 static void handle_window_menu_action(GuiState* g, int item_index) {
     if (!g) return;
     
@@ -332,14 +408,24 @@ static void handle_window_menu_action(GuiState* g, int item_index) {
         fprintf(stdout, "Show TenKey window\n");
         break;
     case 10: /* Clean Up */
-        /* Reset window positions to home */
+        /* Reset window positions to home (preserves current scales) */
         g->toolPalette.r = (Rect){ 20, 20, 90, 668 };
-        const int baseX = 180, baseY = 20;
-        const int winW = 560, winH = 330;
-        g->view[0].r = (Rect){ baseX + 0,     baseY + 0,     winW, winH };
-        g->view[1].r = (Rect){ baseX + winW,  baseY + 0,     winW, winH };
-        g->view[2].r = (Rect){ baseX + 0,     baseY + winH,  winW, winH };
-        g->view[3].r = (Rect){ baseX + winW,  baseY + winH,  winW, winH };
+        {
+            const int baseX = 180, baseY = 20;
+            const int baseWinW = 560, baseWinH = 330;
+            int winW0 = (int)(baseWinW * g->view_scale[0]);
+            int winH0 = (int)(baseWinH * g->view_scale[0]);
+            int winW1 = (int)(baseWinW * g->view_scale[1]);
+            int winH1 = (int)(baseWinH * g->view_scale[1]);
+            int winW2 = (int)(baseWinW * g->view_scale[2]);
+            int winH2 = (int)(baseWinH * g->view_scale[2]);
+            int winW3 = (int)(baseWinW * g->view_scale[3]);
+            int winH3 = (int)(baseWinH * g->view_scale[3]);
+            g->view[0].r = (Rect){ baseX + 0,     baseY + 0,     winW0, winH0 };
+            g->view[1].r = (Rect){ baseX + winW0,  baseY + 0,     winW1, winH1 };
+            g->view[2].r = (Rect){ baseX + 0,     baseY + winH0,  winW2, winH2 };
+            g->view[3].r = (Rect){ baseX + winW0,  baseY + winH0,  winW3, winH3 };
+        }
         g->coordBox.r = (Rect){ 20, 860, 425, 80 };
         fprintf(stdout, "Windows cleaned up\n");
         break;
@@ -470,17 +556,36 @@ GuiState* gui_create(void) {
     g->point_move_active = 0;
     g->point_move_view = -1;
     
+    /* Initialize individual view scales */
+    for (int i = 0; i < 4; i++) {
+        g->view_scale[i] = 1.0f; /* Default scale factor */
+    }
+    
     g->toolPalette.title = "Tool";
     g->toolPalette.r = (Rect){ 20, 20, 90, 668 };
     g->toolPalette.draggable = 1;
 
-    /* 4 views (classic 2x2 grid on the right) */
+    /* 4 views (classic 2x2 grid on the right) - apply individual scales */
     const int baseX = 180, baseY = 20;
-    const int winW = 560, winH = 330; /* window outer size */
-    g->view[0] = (GuiWin){ "Top",   { baseX + 0,     baseY + 0,     winW, winH }, 1 };
-    g->view[1] = (GuiWin){ "3D View",{ baseX + winW,  baseY + 0,     winW, winH }, 1 };
-    g->view[2] = (GuiWin){ "Front", { baseX + 0,     baseY + winH,  winW, winH }, 1 };
-    g->view[3] = (GuiWin){ "Right", { baseX + winW,  baseY + winH,  winW, winH }, 1 };
+    const int baseWinW = 560, baseWinH = 330; /* Base window size */
+    int winW0 = (int)(baseWinW * g->view_scale[0]);
+    int winH0 = (int)(baseWinH * g->view_scale[0]);
+    int winW1 = (int)(baseWinW * g->view_scale[1]);
+    int winH1 = (int)(baseWinH * g->view_scale[1]);
+    int winW2 = (int)(baseWinW * g->view_scale[2]);
+    int winH2 = (int)(baseWinH * g->view_scale[2]);
+    int winW3 = (int)(baseWinW * g->view_scale[3]);
+    int winH3 = (int)(baseWinH * g->view_scale[3]);
+    
+    /* Position views accounting for different sizes */
+    /* Top-left: Top view */
+    g->view[0] = (GuiWin){ "Top",   { baseX + 0,     baseY + 0,     winW0, winH0 }, 1 };
+    /* Top-right: 3D View */
+    g->view[1] = (GuiWin){ "3D View",{ baseX + winW0,  baseY + 0,     winW1, winH1 }, 1 };
+    /* Bottom-left: Front view */
+    g->view[2] = (GuiWin){ "Front", { baseX + 0,     baseY + winH0,  winW2, winH2 }, 1 };
+    /* Bottom-right: Right view */
+    g->view[3] = (GuiWin){ "Right", { baseX + winW0,  baseY + winH0,  winW3, winH3 }, 1 };
 
     g->coordBox = (GuiWin){ "COORDINATES", { 20, 860, 425, 80 }, 1 };
 
@@ -596,34 +701,108 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
 
     /* Drag windows by title bar */
     if (in->mouse_pressed) {
-        Rect titlebar;
-        /* Tool palette */
-        titlebar = (Rect){ g->toolPalette.r.x, g->toolPalette.r.y, g->toolPalette.r.w, 20 };
-        if (g->toolPalette.draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
-            g->drag_win = &g->toolPalette;
-        }
-        for (int i = 0; i < 4 && !g->drag_win; i++) {
-            titlebar = (Rect){ g->view[i].r.x, g->view[i].r.y, g->view[i].r.w, 20 };
-            if (g->view[i].draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
-                g->drag_win = &g->view[i];
+        /* Check for window resizing first (edges have priority over title bar) */
+        const int resize_threshold = 5; /* 5 pixel threshold for edge detection */
+        
+        /* Check view windows for resize */
+        for (int i = 0; i < 4 && !g->resize_win; i++) {
+            Rect vr = g->view[i].r;
+            Rect content = (Rect){ vr.x + 6, vr.y + 26, vr.w - 12, vr.h - 32 };
+            /* Check if mouse is over window edge (but not in content area) */
+            if (pt_in_rect(in->mouse_x, in->mouse_y, vr) && 
+                !pt_in_rect(in->mouse_x, in->mouse_y, content)) {
+                int edge = get_resize_edge(in->mouse_x, in->mouse_y, vr, resize_threshold);
+                if (edge) {
+                    g->resize_win = &g->view[i];
+                    g->resize_edge = edge;
+                    g->resize_start_x = in->mouse_x;
+                    g->resize_start_y = in->mouse_y;
+                    g->resize_start_w = vr.w;
+                    g->resize_start_h = vr.h;
+                    break;
+                }
             }
         }
-        titlebar = (Rect){ g->coordBox.r.x, g->coordBox.r.y, g->coordBox.r.w, 20 };
-        if (!g->drag_win && g->coordBox.draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
-            g->drag_win = &g->coordBox;
-        }
+        
+        /* If not resizing, check for dragging */
+        if (!g->resize_win) {
+            Rect titlebar;
+            /* Tool palette */
+            titlebar = (Rect){ g->toolPalette.r.x, g->toolPalette.r.y, g->toolPalette.r.w, 20 };
+            if (g->toolPalette.draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
+                g->drag_win = &g->toolPalette;
+            }
+            for (int i = 0; i < 4 && !g->drag_win; i++) {
+                titlebar = (Rect){ g->view[i].r.x, g->view[i].r.y, g->view[i].r.w, 20 };
+                if (g->view[i].draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
+                    g->drag_win = &g->view[i];
+                }
+            }
+            titlebar = (Rect){ g->coordBox.r.x, g->coordBox.r.y, g->coordBox.r.w, 20 };
+            if (!g->drag_win && g->coordBox.draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
+                g->drag_win = &g->coordBox;
+            }
 
-        if (g->drag_win) {
-            g->drag_off_x = in->mouse_x - g->drag_win->r.x;
-            g->drag_off_y = in->mouse_y - g->drag_win->r.y;
+            if (g->drag_win) {
+                g->drag_off_x = in->mouse_x - g->drag_win->r.x;
+                g->drag_off_y = in->mouse_y - g->drag_win->r.y;
+            }
         }
     }
 
     if (!in->mouse_down) {
         g->drag_win = NULL;
+        g->resize_win = NULL;
+        g->resize_edge = 0;
         g->view_interacting = -1;
         g->point_move_active = 0;
         g->point_move_view = -1;
+    } else if (g->resize_win) {
+        /* Handle window resizing */
+        int dx = in->mouse_x - g->resize_start_x;
+        int dy = in->mouse_y - g->resize_start_y;
+        
+        Rect* r = &g->resize_win->r;
+        int new_x = r->x;
+        int new_y = r->y;
+        int new_w = g->resize_start_w;
+        int new_h = g->resize_start_h;
+        
+        if (g->resize_edge & 1) { /* Left edge */
+            new_x = g->resize_start_x + dx;
+            new_w = g->resize_start_w - dx;
+            if (new_w < 100) { new_w = 100; new_x = r->x + r->w - 100; }
+        }
+        if (g->resize_edge & 2) { /* Right edge */
+            new_w = g->resize_start_w + dx;
+            if (new_w < 100) new_w = 100;
+        }
+        if (g->resize_edge & 4) { /* Top edge */
+            new_y = g->resize_start_y + dy;
+            new_h = g->resize_start_h - dy;
+            if (new_h < 50) { new_h = 50; new_y = r->y + r->h - 50; }
+        }
+        if (g->resize_edge & 8) { /* Bottom edge */
+            new_h = g->resize_start_h + dy;
+            if (new_h < 50) new_h = 50;
+        }
+        
+        r->x = new_x;
+        r->y = new_y;
+        r->w = new_w;
+        r->h = new_h;
+        
+        /* Update scale factor for view windows */
+        if (g->resize_win >= &g->view[0] && g->resize_win <= &g->view[3]) {
+            int view_idx = (int)(g->resize_win - &g->view[0]);
+            const int baseWinW = 560, baseWinH = 330;
+            /* Calculate scale from current size */
+            float scale_w = (float)new_w / (float)baseWinW;
+            float scale_h = (float)new_h / (float)baseWinH;
+            g->view_scale[view_idx] = (scale_w + scale_h) / 2.0f; /* Average of both */
+            if (g->view_scale[view_idx] < 0.5f) g->view_scale[view_idx] = 0.5f;
+            if (g->view_scale[view_idx] > 2.0f) g->view_scale[view_idx] = 2.0f;
+        }
     } else if (g->drag_win) {
         g->drag_win->r.x = in->mouse_x - g->drag_off_x;
         g->drag_win->r.y = in->mouse_y - g->drag_off_y;
@@ -662,8 +841,9 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
         
         g->last_mouse_x = in->mouse_x;
         g->last_mouse_y = in->mouse_y;
-    } else if (g->view_interacting >= 0) {
+    } else if (g->view_interacting >= 0 && !g->resize_win) {
         /* Handle view interaction (rotation for 3D view, pan for others) */
+        /* Note: Resizing windows does NOT affect the CAD view (zoom/pan/rotation) */
         int dx = in->mouse_x - g->last_mouse_x;
         int dy = in->mouse_y - g->last_mouse_y;
         
@@ -680,7 +860,7 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     }
     
     /* Check for view content area clicks (not title bar) */
-    if (in->mouse_pressed && !g->drag_win && g->view_interacting < 0) {
+    if (in->mouse_pressed && !g->drag_win && !g->resize_win && g->view_interacting < 0) {
         for (int i = 0; i < 4; i++) {
             Rect vr = g->view[i].r;
             Rect content = (Rect){ vr.x + 6, vr.y + 26, vr.w - 12, vr.h - 32 };
