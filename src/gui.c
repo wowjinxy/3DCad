@@ -74,6 +74,10 @@ struct GuiState {
     int view_interacting; /* Index of view being interacted with, or -1 */
     int last_mouse_x;
     int last_mouse_y;
+    
+    /* Point move state */
+    int point_move_active; /* 1 if currently moving points, 0 otherwise */
+    int point_move_view; /* View index where point move started */
 };
 
 static int MenuBarHeight(void) { return 20; }
@@ -198,9 +202,21 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
         break;
     case 2: /* (O)Open... */
         if (FileDialog_OpenCAD(filename, sizeof(filename))) {
+            /* Clear all state before loading */
+            CadCore_ClearSelection(g->cad);
+            g->point_move_active = 0;
+            g->point_move_view = -1;
+            g->view_interacting = -1;
+            
+            /* Reset view states */
+            for (int i = 0; i < 4; i++) {
+                CadView_Reset(&g->views[i]);
+            }
+            
             if (CadCore_LoadFile(g->cad, filename)) {
                 strncpy(g->current_filename, filename, sizeof(g->current_filename) - 1);
                 g->current_filename[sizeof(g->current_filename) - 1] = '\0';
+                g->cad->isDirty = 0; /* Reset dirty flag after successful load */
                 fprintf(stdout, "Opened file: %s\n", filename);
             } else {
                 fprintf(stderr, "Error: Failed to open file: %s\n", filename);
@@ -451,7 +467,9 @@ GuiState* gui_create(void) {
         g->tool_icons[i] = NULL;
     }
     g->selected_tool = -1; /* No tool selected initially */
-
+    g->point_move_active = 0;
+    g->point_move_view = -1;
+    
     g->toolPalette.title = "Tool";
     g->toolPalette.r = (Rect){ 20, 20, 90, 668 };
     g->toolPalette.draggable = 1;
@@ -604,11 +622,46 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     if (!in->mouse_down) {
         g->drag_win = NULL;
         g->view_interacting = -1;
+        g->point_move_active = 0;
+        g->point_move_view = -1;
     } else if (g->drag_win) {
         g->drag_win->r.x = in->mouse_x - g->drag_off_x;
         g->drag_win->r.y = in->mouse_y - g->drag_off_y;
         if (g->drag_win->r.x < 0) g->drag_win->r.x = 0;
         if (g->drag_win->r.y < MenuBarHeight()) g->drag_win->r.y = MenuBarHeight();
+    } else if (g->point_move_active && g->point_move_view >= 0) {
+        /* Handle point movement */
+        int dx = in->mouse_x - g->last_mouse_x;
+        int dy = in->mouse_y - g->last_mouse_y;
+        
+        if (dx != 0 || dy != 0) {
+            CadView* view = &g->views[g->point_move_view];
+            Rect vr = g->view[g->point_move_view].r;
+            Rect content = (Rect){ vr.x + 6, vr.y + 26, vr.w - 12, vr.h - 32 };
+            
+            /* Convert screen delta to world delta */
+            double world_dx, world_dy, world_dz;
+            CadView_UnprojectDelta(view, dx, dy, content.w, content.h,
+                                  &world_dx, &world_dy, &world_dz);
+            
+            /* Apply movement to all selected points */
+            for (int i = 0; i < g->cad->selection.pointCount; i++) {
+                int16_t point_idx = g->cad->selection.selectedPoints[i];
+                if (point_idx < 0) continue;
+                
+                CadPoint* pt = CadCore_GetPoint(g->cad, point_idx);
+                if (!pt) continue;
+                
+                pt->pointx += world_dx;
+                pt->pointy += world_dy;
+                pt->pointz += world_dz;
+            }
+            
+            g->cad->isDirty = 1; /* Mark as modified */
+        }
+        
+        g->last_mouse_x = in->mouse_x;
+        g->last_mouse_y = in->mouse_y;
     } else if (g->view_interacting >= 0) {
         /* Handle view interaction (rotation for 3D view, pan for others) */
         int dx = in->mouse_x - g->last_mouse_x;
@@ -636,9 +689,46 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             /* Check if click is in content area (not title bar) */
             if (pt_in_rect(in->mouse_x, in->mouse_y, content) && 
                 !pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
-                g->view_interacting = i;
-                g->last_mouse_x = in->mouse_x;
-                g->last_mouse_y = in->mouse_y;
+                
+                /* Check if point select tool is active (tool 0) */
+                if (g->selected_tool == 0 && g->cad->editMode == CAD_MODE_SELECT_POINT) {
+                    /* Point selection mode - find and select/deselect point */
+                    int viewport_x = content.x;
+                    int viewport_y = content.y;
+                    int viewport_w = content.w;
+                    int viewport_h = content.h;
+                    
+                    int16_t point_idx = CadView_FindNearestPoint(
+                        &g->views[i], g->cad,
+                        in->mouse_x, in->mouse_y,
+                        viewport_x, viewport_y,
+                        viewport_w, viewport_h,
+                        10 /* 10 pixel threshold */
+                    );
+                    
+                    if (point_idx >= 0) {
+                        /* Toggle point selection */
+                        if (CadCore_IsPointSelected(g->cad, point_idx)) {
+                            CadCore_DeselectPoint(g->cad, point_idx);
+                            fprintf(stdout, "Deselected point %d\n", point_idx);
+                        } else {
+                            CadCore_SelectPoint(g->cad, point_idx);
+                            fprintf(stdout, "Selected point %d\n", point_idx);
+                        }
+                    }
+                } else if (g->selected_tool == 6 && g->cad->selection.pointCount > 0) {
+                    /* Point move tool (tool 6) - start moving selected points */
+                    g->point_move_active = 1;
+                    g->point_move_view = i;
+                    g->last_mouse_x = in->mouse_x;
+                    g->last_mouse_y = in->mouse_y;
+                    fprintf(stdout, "Starting point move (%d points selected)\n", g->cad->selection.pointCount);
+                } else {
+                    /* Normal view interaction (pan/rotate) */
+                    g->view_interacting = i;
+                    g->last_mouse_x = in->mouse_x;
+                    g->last_mouse_y = in->mouse_y;
+                }
                 break;
             }
         }
@@ -688,6 +778,21 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                 
                 if (pt_in_rect(in->mouse_x, in->mouse_y, btn_rect)) {
                     g->selected_tool = (g->selected_tool == i) ? -1 : i; /* Toggle selection */
+                    
+                    /* Set edit mode based on selected tool */
+                    if (g->selected_tool == 0) {
+                        /* Point select tool */
+                        CadCore_SetEditMode(g->cad, CAD_MODE_SELECT_POINT);
+                        fprintf(stdout, "Point select tool activated\n");
+                    } else if (g->selected_tool == 6) {
+                        /* Point move tool */
+                        CadCore_SetEditMode(g->cad, CAD_MODE_EDIT_POINT);
+                        fprintf(stdout, "Point move tool activated\n");
+                    } else if (g->selected_tool == -1) {
+                        /* No tool selected - keep current mode */
+                    }
+                    /* Add more tool handlers here as needed */
+                    
                     break;
                 }
             }

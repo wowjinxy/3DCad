@@ -214,16 +214,32 @@ void CadView_Render(const CadView* view, const CadCore* core,
 
             int16_t current = point_idx;
             int count = 0;
+            int16_t visited[64]; /* Track visited points to detect cycles (smaller array) */
+            int visited_count = 0;
+            
             while (current >= 0 && current < CAD_MAX_POINTS && count < npoints) {
+                /* Check for cycles (only check if we have room to track) */
+                if (visited_count < 64) {
+                    int already_visited = 0;
+                    for (int v = 0; v < visited_count; v++) {
+                        if (visited[v] == current) {
+                            already_visited = 1;
+                            break;
+                        }
+                    }
+                    if (already_visited) break;
+                    visited[visited_count++] = current;
+                }
+                
                 CadPoint* pt = CadCore_GetPoint((CadCore*)core, current);
-                if (!pt) break;
+                if (!pt || pt->flags == 0) break; /* Invalid point */
 
                 CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz,
                                      &x_coords[count], &y_coords[count], viewport_w, viewport_h);
 
                 current = pt->nextPoint;
                 count++;
-                if (count > 1000) break;
+                if (count > 1000) break; /* Safety limit */
             }
 
             if (count >= 2) {
@@ -357,10 +373,25 @@ void CadView_Render(const CadView* view, const CadCore* core,
 
         int16_t current = point_idx;
         int count = 0;
+        int16_t visited[64]; /* Track visited points to detect cycles (smaller array) */
+        int visited_count = 0;
 
         while (current >= 0 && current < CAD_MAX_POINTS && count < npoints) {
+            /* Check for cycles (only check if we have room to track) */
+            if (visited_count < 64) {
+                int already_visited = 0;
+                for (int v = 0; v < visited_count; v++) {
+                    if (visited[v] == current) {
+                        already_visited = 1;
+                        break;
+                    }
+                }
+                if (already_visited) break;
+                visited[visited_count++] = current;
+            }
+            
             CadPoint* pt = CadCore_GetPoint((CadCore*)core, current);
-            if (!pt) break;
+            if (!pt || pt->flags == 0) break; /* Invalid point */
 
             CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz,
                                  &x_coords[count], &y_coords[count], viewport_w, viewport_h);
@@ -392,7 +423,7 @@ void CadView_Render(const CadView* view, const CadCore* core,
         }
 
         if (count >= 3) {
-            /* Compute normal in the SAME space as the vertices we draw (fixes “weird shading”) */
+            /* Compute normal in the SAME space as the vertices we draw (fixes ï¿½weird shadingï¿½) */
             double nx = 0.0, ny = 0.0, nz = 1.0;
             {
                 double x1 = (double)x_coords[0] - viewport_w / 2.0;
@@ -467,6 +498,16 @@ void CadView_Render(const CadView* view, const CadCore* core,
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_LIGHTING);
 
+    /* Set up 2D projection for overlay drawing */
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, (double)viewport_w, (double)viewport_h, 0.0, -1.0, 1.0);
+
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
     for (int i = 0; i < core->selection.pointCount; i++) {
         int16_t idx = core->selection.selectedPoints[i];
         if (idx < 0) continue;
@@ -479,16 +520,15 @@ void CadView_Render(const CadView* view, const CadCore* core,
 
         RG_Color red = { 255, 0, 0, 255 };
         int size = 4;
+        /* Draw red square at projected point location */
         rg_fill_rect(x - size, y - size, size * 2, size * 2, red);
     }
 
-    /* Restore a 2D projection (optional cleanup for callers) */
+    /* Restore matrices */
     glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0.0, (double)viewport_w, (double)viewport_h, 0.0, -1.0, 1.0);
-
+    glPopMatrix();
     glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
+    glPopMatrix();
 
     /* Keep scissor clipped to viewport */
     glEnable(GL_SCISSOR_TEST);
@@ -496,5 +536,108 @@ void CadView_Render(const CadView* view, const CadCore* core,
         int sc_y = win_h - (viewport_y + viewport_h);
         if (sc_y < 0) sc_y = 0;
         glScissor(viewport_x, sc_y, viewport_w, viewport_h);
+    }
+}
+
+/* ----------------------------------------------------------------------------
+   Point selection - find nearest point to screen coordinates
+   ---------------------------------------------------------------------------- */
+
+int16_t CadView_FindNearestPoint(const CadView* view, const CadCore* core,
+                                 int screen_x, int screen_y,
+                                 int viewport_x, int viewport_y,
+                                 int viewport_w, int viewport_h,
+                                 int threshold_pixels) {
+    if (!view || !core) return -1;
+    
+    /* Convert screen coordinates to viewport-relative coordinates */
+    int vp_x = screen_x - viewport_x;
+    int vp_y = screen_y - viewport_y;
+    
+    /* Check if click is within viewport */
+    if (vp_x < 0 || vp_x >= viewport_w || vp_y < 0 || vp_y >= viewport_h) {
+        return -1;
+    }
+    
+    /* Find nearest point by projecting all points and finding closest in screen space */
+    int16_t nearest_idx = -1;
+    double nearest_dist_sq = (double)(threshold_pixels * threshold_pixels);
+    
+    for (int i = 0; i < core->data.pointCount && i < CAD_MAX_POINTS; i++) {
+        const CadPoint* pt = &core->data.points[i];
+        if (pt->flags == 0) continue; /* Skip invalid points */
+        
+        /* Project point to screen coordinates (CadView_ProjectPoint already applies zoom/pan) */
+        int proj_x, proj_y;
+        CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz, 
+                            &proj_x, &proj_y, viewport_w, viewport_h);
+        
+        /* Calculate distance squared in screen space (viewport-relative) */
+        double dx = (double)vp_x - (double)proj_x;
+        double dy = (double)vp_y - (double)proj_y;
+        double dist_sq = dx * dx + dy * dy;
+        
+        if (dist_sq < nearest_dist_sq) {
+            nearest_dist_sq = dist_sq;
+            nearest_idx = (int16_t)i;
+        }
+    }
+    
+    return nearest_idx;
+}
+
+/* ----------------------------------------------------------------------------
+   Unproject screen delta to 3D world delta
+   ---------------------------------------------------------------------------- */
+
+void CadView_UnprojectDelta(const CadView* view, int screen_dx, int screen_dy,
+                            int viewport_w, int viewport_h,
+                            double* out_dx, double* out_dy, double* out_dz) {
+    if (!view || !out_dx || !out_dy || !out_dz) return;
+    
+    /* Convert screen delta to viewport space (accounting for zoom) */
+    double vp_dx = (double)screen_dx / view->zoom;
+    double vp_dy = -(double)screen_dy / view->zoom; /* Flip Y for screen to world */
+    
+    /* Convert viewport delta to world delta based on view type */
+    if (view->type == CAD_VIEW_3D) {
+        /* For 3D view, we need to apply inverse rotation */
+        /* This is complex - for now, move in screen X/Y plane */
+        /* In a full implementation, you'd project onto the view plane */
+        double rx = view->rot_x * M_PI / 180.0;
+        double ry = view->rot_y * M_PI / 180.0;
+        
+        /* Approximate: move in the plane perpendicular to view direction */
+        /* Simplified: move in rotated X/Y plane */
+        *out_dx = vp_dx * cos(-ry);
+        *out_dy = vp_dx * sin(-ry) * sin(-rx) + vp_dy * cos(-rx);
+        *out_dz = vp_dx * sin(-ry) * cos(-rx) - vp_dy * sin(-rx);
+    } else {
+        /* Orthographic projections - constrain to view plane */
+        switch (view->type) {
+        case CAD_VIEW_TOP:
+            /* Top view: screen X/Y maps to world X/Z, Y stays constant */
+            *out_dx = vp_dx;
+            *out_dy = 0.0;  /* Y doesn't change in top view */
+            *out_dz = -vp_dy;  /* Screen Y is world -Z */
+            break;
+        case CAD_VIEW_FRONT:
+            /* Front view: screen X/Y maps to world X/Y, Z stays constant */
+            *out_dx = vp_dx;
+            *out_dy = vp_dy;
+            *out_dz = 0.0;  /* Z doesn't change in front view */
+            break;
+        case CAD_VIEW_RIGHT:
+            /* Right view: screen X/Y maps to world Z/Y, X stays constant */
+            *out_dx = 0.0;  /* X doesn't change in right view */
+            *out_dy = vp_dy;
+            *out_dz = vp_dx;  /* Screen X is world Z */
+            break;
+        default:
+            *out_dx = vp_dx;
+            *out_dy = vp_dy;
+            *out_dz = 0.0;
+            break;
+        }
     }
 }

@@ -49,6 +49,24 @@ void CadView_ProjectPoint(const CadView* view, double x, double y, double z,
                          int* out_x, int* out_y, int viewport_w, int viewport_h);
 
 /* ----------------------------------------------------------------------------
+   Point selection (find nearest point to screen coordinates)
+   Returns point index or -1 if none found within threshold
+   ---------------------------------------------------------------------------- */
+int16_t CadView_FindNearestPoint(const CadView* view, const CadCore* core,
+                                 int screen_x, int screen_y,
+                                 int viewport_x, int viewport_y,
+                                 int viewport_w, int viewport_h,
+                                 int threshold_pixels);
+
+/* ----------------------------------------------------------------------------
+   Unproject screen delta to 3D world delta
+   Converts screen space movement (dx, dy in pixels) to 3D world space movement
+   ---------------------------------------------------------------------------- */
+void CadView_UnprojectDelta(const CadView* view, int screen_dx, int screen_dy,
+                            int viewport_w, int viewport_h,
+                            double* out_dx, double* out_dy, double* out_dz);
+
+/* ----------------------------------------------------------------------------
    Rendering
    ---------------------------------------------------------------------------- */
 void CadView_Render(const CadView* view, const CadCore* core, 

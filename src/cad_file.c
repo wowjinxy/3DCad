@@ -321,9 +321,27 @@ int CadFile_Save(const char* filename, const CadFileData* data) {
         if (data->objects[i].flags != 0) {
             uint8_t tag = CAD_TAG_OBJECT;
             int16_t index = (int16_t)i;
+            
+            /* Convert index to big-endian if needed */
+            if (is_little_endian()) {
+                index = swap_int16(index);
+            }
+            
             fwrite(&tag, sizeof(uint8_t), 1, fp);
             fwrite(&index, sizeof(int16_t), 1, fp);
-            fwrite(&data->objects[i], sizeof(CadObject), 1, fp);
+            
+            /* Convert object to big-endian and write */
+            CadObject obj = data->objects[i];
+            if (is_little_endian()) {
+                obj.parentObject = swap_int16(obj.parentObject);
+                obj.nextBrother = swap_int16(obj.nextBrother);
+                obj.childObject = swap_int16(obj.childObject);
+                obj.firstPolygon = swap_int16(obj.firstPolygon);
+                obj.offsetx = swap_double(obj.offsetx);
+                obj.offsety = swap_double(obj.offsety);
+                obj.offsetz = swap_double(obj.offsetz);
+            }
+            fwrite(&obj, sizeof(CadObject), 1, fp);
         }
     }
     
@@ -332,9 +350,24 @@ int CadFile_Save(const char* filename, const CadFileData* data) {
         if (data->polygons[i].flags != 0) {
             uint8_t tag = CAD_TAG_POLYGON;
             int16_t index = (int16_t)i;
+            
+            /* Convert index to big-endian if needed */
+            if (is_little_endian()) {
+                index = swap_int16(index);
+            }
+            
             fwrite(&tag, sizeof(uint8_t), 1, fp);
             fwrite(&index, sizeof(int16_t), 1, fp);
-            fwrite(&data->polygons[i], sizeof(CadPolygon), 1, fp);
+            
+            /* Convert polygon to big-endian and write */
+            CadPolygon poly = data->polygons[i];
+            if (is_little_endian()) {
+                poly.nextPolygon = swap_int16(poly.nextPolygon);
+                poly.firstPoint = swap_int16(poly.firstPoint);
+                poly.animation = swap_int16(poly.animation);
+                poly.both = swap_int16(poly.both);
+            }
+            fwrite(&poly, sizeof(CadPolygon), 1, fp);
         }
     }
     
@@ -343,9 +376,24 @@ int CadFile_Save(const char* filename, const CadFileData* data) {
         if (data->points[i].flags != 0) {
             uint8_t tag = CAD_TAG_POINT;
             int16_t index = (int16_t)i;
+            
+            /* Convert index to big-endian if needed */
+            if (is_little_endian()) {
+                index = swap_int16(index);
+            }
+            
             fwrite(&tag, sizeof(uint8_t), 1, fp);
             fwrite(&index, sizeof(int16_t), 1, fp);
-            fwrite(&data->points[i], sizeof(CadPoint), 1, fp);
+            
+            /* Convert point to big-endian and write */
+            CadPoint pt = data->points[i];
+            if (is_little_endian()) {
+                pt.nextPoint = swap_int16(pt.nextPoint);
+                pt.pointx = swap_double(pt.pointx);
+                pt.pointy = swap_double(pt.pointy);
+                pt.pointz = swap_double(pt.pointz);
+            }
+            fwrite(&pt, sizeof(CadPoint), 1, fp);
         }
     }
     
