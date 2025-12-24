@@ -323,7 +323,7 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
         /* Toggle animation window visibility */
         if (g->animationWindow.r.w == 0 || g->animationWindow.r.h == 0) {
             /* Show window */
-            g->animationWindow.r = (Rect){ 500, 200, 600, 400 };
+            g->animationWindow.r = (Rect){ 500, 200, 430, 150 };
             fprintf(stdout, "Animation window opened\n");
         } else {
             /* Hide window */
@@ -628,7 +628,7 @@ GuiState* gui_create(void) {
     g->view[3] = (GuiWin){ "Right", { baseX + winW0,  baseY + winH0,  winW3, winH3 }, 1 };
 
     g->coordBox = (GuiWin){ "COORDINATES", { 20, 860, 425, 80 }, 1 };
-    g->animationWindow = (GuiWin){ "ANIMATION", { 500, 200, 600, 400 }, 1 };
+    g->animationWindow = (GuiWin){ "ANIMATION", { 500, 200, 430, 150 }, 1 };
     g->animationWindow.r.w = 0; /* Start hidden (width 0) */
     g->animationWindow.r.h = 0; /* Start hidden (height 0) */
     
@@ -712,14 +712,14 @@ void gui_load_tool_icons(GuiState* g, const char* resource_path) {
 void gui_load_anim_icons(GuiState* g, const char* resource_path) {
     if (!g) return;
     
-    /* Animation icon filenames in order (matching animIcons array from bitmap.c) */
+    /* Animation icon filenames in order */
     const char* anim_names[12] = {
-        "beframe_bits_48x24.png",      /* 0: First frame (24x48 in code, but file is 48x24) */
-        "topfram_bits_24x48.png",      /* 1: Last frame */
-        "beforeframe_bits_24x48.png",  /* 2: Previous frame */
-        "goframe_bits_32x48.png",      /* 3: GO/Play button (30x48 in code) */
-        "nextframe_bits_24x48.png",    /* 4: Next frame */
-        "nexframe_bits_24x48.png",     /* 5: Fast forward */
+        "beframe_bits_24x48.png",      /* 0: 10 frames back */
+        "topfram_bits_24x48.png",      /* 1: First/Last frame button */
+        "beforeframe_bits_24x48.png",  /* 2: 1 frame back */
+        "goframe_bits_32x48.png",      /* 3: Preview/Play animation */
+        "nextframe_bits_24x48.png",    /* 4: 1 frame forward */
+        "nexframe_bits_24x48.png",     /* 5: 10 frames forward */
         "kplus_bits_32x20.png",        /* 6: Add keyframe (30x20 in code) */
         "kminus_bits_32x20.png",       /* 7: Delete keyframe (30x20 in code) */
         "plus_bits_32x30.png",         /* 8: Add frame (30x30 in code) */
@@ -1807,47 +1807,47 @@ void gui_draw(GuiState* g, const GuiInput* in, int win_w, int win_h, int fb_w, i
             int icon_spacing = 5;
             int start_x = x;
             
-            /* First Frame button (icon 0: beframe_bits, 24x48) */
+            /* First Frame button (icon 1: topfram_bits, 24x48) */
+            if (g->anim_icons[1]) {
+                rg_draw_texture_inverted(g->anim_icons[1], start_x, y, 24, 48);
+            }
+            start_x += 24 + icon_spacing;
+            
+            /* 10 frames back button (icon 0: beframe_bits, 24x48) */
             if (g->anim_icons[0]) {
-                rg_draw_texture(g->anim_icons[0], start_x, y, 24, 48);
+                rg_draw_texture_inverted(g->anim_icons[0], start_x, y, 24, 48);
             }
             start_x += 24 + icon_spacing;
             
-            /* Fast Rewind button (icon 2: beforeframe_bits, 24x48) */
+            /* 1 frame back button (icon 2: beforeframe_bits, 24x48) */
             if (g->anim_icons[2]) {
-                rg_draw_texture(g->anim_icons[2], start_x, y, 24, 48);
+                rg_draw_texture_inverted(g->anim_icons[2], start_x, y, 24, 48);
             }
             start_x += 24 + icon_spacing;
             
-            /* Previous Frame button (icon 2 again, or we can use beforeframe) */
-            if (g->anim_icons[2]) {
-                rg_draw_texture(g->anim_icons[2], start_x, y, 24, 48);
-            }
-            start_x += 24 + icon_spacing;
-            
-            /* Play/GO button (icon 3: goframe_bits, 30x48) */
+            /* Play/Preview button (icon 3: goframe_bits, 32x48) */
             if (g->anim_icons[3]) {
                 RG_Color play_bg = g->anim_playing ? (RG_Color){180,255,180,255} : (RG_Color){220,220,220,255};
-                rg_fill_rect(start_x - 2, y - 2, 34, 52, play_bg);
-                rg_draw_texture(g->anim_icons[3], start_x, y, 30, 48);
+                rg_fill_rect(start_x - 2, y - 2, 36, 52, play_bg);
+                rg_draw_texture_inverted(g->anim_icons[3], start_x, y, 32, 48);
             }
-            start_x += 30 + icon_spacing;
+            start_x += 32 + icon_spacing;
             
-            /* Next Frame button (icon 4: nextframe_bits, 24x48) */
+            /* 1 frame forward button (icon 4: nextframe_bits, 24x48) */
             if (g->anim_icons[4]) {
-                rg_draw_texture(g->anim_icons[4], start_x, y, 24, 48);
+                rg_draw_texture_inverted(g->anim_icons[4], start_x, y, 24, 48);
             }
             start_x += 24 + icon_spacing;
             
-            /* Fast Forward button (icon 5: nexframe_bits, 24x48) */
+            /* 10 frames forward button (icon 5: nexframe_bits, 24x48) */
             if (g->anim_icons[5]) {
-                rg_draw_texture(g->anim_icons[5], start_x, y, 24, 48);
+                rg_draw_texture_inverted(g->anim_icons[5], start_x, y, 24, 48);
             }
             start_x += 24 + icon_spacing;
             
             /* Last Frame button (icon 1: topfram_bits, 24x48) */
             if (g->anim_icons[1]) {
-                rg_draw_texture(g->anim_icons[1], start_x, y, 24, 48);
+                rg_draw_texture_inverted(g->anim_icons[1], start_x, y, 24, 48);
             }
             
             y += 48 + 15;
