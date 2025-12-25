@@ -27,6 +27,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
 #include <ctype.h>
 
 #define TOOL_COUNT 24
@@ -84,6 +90,14 @@ struct GuiState {
     
     /* Animation icons */
     RG_Texture* anim_icons[12]; /* Animation control icons */
+    
+    /* Shape browser window */
+    GuiWin shapeBrowserWindow;
+    char** shape_names;        /* Array of shape name strings */
+    int shape_count;           /* Number of shapes found */
+    int shape_selected;        /* Selected shape index, or -1 */
+    int shape_scroll_offset;   /* Scroll offset for shape list */
+    char shape_folder_path[260]; /* Path to folder containing ASM files */
 
     /* Dragging */
     GuiWin* drag_win;
@@ -120,6 +134,11 @@ struct GuiState {
 
 static int MenuBarHeight(void) { return 20; }
 
+/* Forward declarations */
+static void scan_asm_folder_for_shapes(GuiState* g, const char* folder_path);
+static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* folder_path);
+static void load_all_constants(const char* shapes_folder);
+
 /* -------------------------------------------------------------------------
    Menu definitions (ported from 3DCad/include/MenuRes.h)
    ------------------------------------------------------------------------- */
@@ -135,6 +154,7 @@ static const char* fileMenuItems[] = {
     " Load Color...",
     " Load Pallet...",
     " Animation",
+    " Open Shape Folder...",
     "-",
     "(Q)Quit",
     NULL
@@ -330,6 +350,15 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
             g->animationWindow.r.w = 0;
             g->animationWindow.r.h = 0;
             fprintf(stdout, "Animation window closed\n");
+        }
+        break;
+    case 11: /* Open Shape Folder... */
+        {
+            char folder_path[260];
+            if (FileDialog_SelectFolder(folder_path, sizeof(folder_path))) {
+                /* Scan ASM files for shapes */
+                scan_asm_folder_for_shapes(g, folder_path);
+            }
         }
         break;
     case 12: /* (Q)Quit */
@@ -632,6 +661,15 @@ GuiState* gui_create(void) {
     g->animationWindow.r.w = 0; /* Start hidden (width 0) */
     g->animationWindow.r.h = 0; /* Start hidden (height 0) */
     
+    g->shapeBrowserWindow = (GuiWin){ "SHAPE BROWSER", { 600, 300, 400, 500 }, 1 };
+    g->shapeBrowserWindow.r.w = 0; /* Start hidden */
+    g->shapeBrowserWindow.r.h = 0;
+    g->shape_names = NULL;
+    g->shape_count = 0;
+    g->shape_selected = -1;
+    g->shape_scroll_offset = 0;
+    g->shape_folder_path[0] = '\0';
+    
     /* Initialize animation state */
     g->anim_current_frame = 0;
     g->anim_total_frames = 0;
@@ -660,7 +698,1640 @@ void gui_destroy(GuiState* g) {
             rg_free_texture(g->anim_icons[i]);
         }
     }
+    
+    /* Free shape names */
+    if (g->shape_names) {
+        for (int i = 0; i < g->shape_count; i++) {
+            if (g->shape_names[i]) {
+                free(g->shape_names[i]);
+            }
+        }
+        free(g->shape_names);
+        g->shape_names = NULL;
+    }
+    g->shape_count = 0;
     free(g);
+}
+
+/* Scan ASM files in a folder for shape definitions */
+static void scan_asm_folder_for_shapes(GuiState* g, const char* folder_path) {
+    if (!g || !folder_path) return;
+    
+    /* Free existing shape names */
+    if (g->shape_names) {
+        for (int i = 0; i < g->shape_count; i++) {
+            if (g->shape_names[i]) {
+                free(g->shape_names[i]);
+            }
+        }
+        free(g->shape_names);
+        g->shape_names = NULL;
+    }
+    g->shape_count = 0;
+    g->shape_selected = -1;
+    g->shape_scroll_offset = 0;
+    strncpy(g->shape_folder_path, folder_path, sizeof(g->shape_folder_path) - 1);
+    g->shape_folder_path[sizeof(g->shape_folder_path) - 1] = '\0';
+    
+    /* Load constants from INC files for resolving symbolic values */
+    load_all_constants(folder_path);
+    
+#ifdef _WIN32
+    /* Windows: Use FindFirstFile/FindNextFile */
+    char search_path[520]; /* MAX_PATH * 2 */
+    snprintf(search_path, sizeof(search_path), "%s\\*.asm", folder_path);
+    
+    WIN32_FIND_DATAA find_data;
+    HANDLE hFind = FindFirstFileA(search_path, &find_data);
+    
+    if (hFind == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "No ASM files found in: %s\n", folder_path);
+        return;
+    }
+    
+    /* First pass: count shapes */
+    int shape_capacity = 256;
+    g->shape_names = (char**)calloc(shape_capacity, sizeof(char*));
+    if (!g->shape_names) {
+        FindClose(hFind);
+        return;
+    }
+    
+    do {
+        if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            char file_path[520];
+            snprintf(file_path, sizeof(file_path), "%s\\%s", folder_path, find_data.cFileName);
+            
+            /* Read file and extract shape names */
+            FILE* f = fopen(file_path, "r");
+            if (f) {
+                char line[1024];
+                while (fgets(line, sizeof(line), f)) {
+                    /* Look for shape_P pattern (points section indicates a shape)
+                       Pattern: shape_name_p (case insensitive, can have whitespace before) */
+                    char line_lower[1024];
+                    strncpy(line_lower, line, sizeof(line_lower) - 1);
+                    line_lower[sizeof(line_lower) - 1] = '\0';
+                    for (int k = 0; line_lower[k]; k++) {
+                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                    }
+                    
+                    char* p_pos = strstr(line_lower, "_p");
+                    if (p_pos) {
+                        /* Check that after _p there's whitespace or end of line (not _p1, _p2, etc.) */
+                        char after_p = p_pos[2];
+                        if (after_p == '\0' || after_p == '\n' || after_p == '\r' || isspace((unsigned char)after_p)) {
+                            /* Extract shape name (everything before _p) */
+                            char* start = line;
+                            while (*start && isspace((unsigned char)*start)) start++;
+                            char* p_pos_orig = line + (p_pos - line_lower);
+                            if (start < p_pos_orig) {
+                                int name_len = p_pos_orig - start;
+                                if (name_len > 0 && name_len < 128) {
+                                    char shape_name[128];
+                                    strncpy(shape_name, start, name_len);
+                                    shape_name[name_len] = '\0';
+                                
+                                /* Check if we already have this shape */
+                                int found = 0;
+                                for (int i = 0; i < g->shape_count; i++) {
+                                    if (g->shape_names[i] && strcmp(g->shape_names[i], shape_name) == 0) {
+                                        found = 1;
+                                        break;
+                                    }
+                                }
+                                
+                                if (!found) {
+                                    /* Add shape name */
+                                    if (g->shape_count >= shape_capacity) {
+                                        shape_capacity *= 2;
+                                        g->shape_names = (char**)realloc(g->shape_names, shape_capacity * sizeof(char*));
+                                        if (!g->shape_names) {
+                                            fclose(f);
+                                            FindClose(hFind);
+                                            return;
+                                        }
+                                    }
+                                    g->shape_names[g->shape_count] = (char*)malloc(name_len + 1);
+                                    if (g->shape_names[g->shape_count]) {
+                                        strcpy(g->shape_names[g->shape_count], shape_name);
+                                        g->shape_count++;
+                                    }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                fclose(f);
+            }
+        }
+    } while (FindNextFileA(hFind, &find_data));
+    
+    
+    FindClose(hFind);
+#else
+    /* Non-Windows: Use dirent */
+    DIR* dir = opendir(folder_path);
+    if (!dir) {
+        fprintf(stderr, "Cannot open folder: %s\n", folder_path);
+        return;
+    }
+    
+    int shape_capacity = 256;
+    g->shape_names = (char**)calloc(shape_capacity, sizeof(char*));
+    if (!g->shape_names) {
+        closedir(dir);
+        return;
+    }
+    
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_REG) {
+            const char* name = entry->d_name;
+            int len = strlen(name);
+            if (len > 4 && strcasecmp(name + len - 4, ".asm") == 0) {
+                char file_path[520];
+                snprintf(file_path, sizeof(file_path), "%s/%s", folder_path, name);
+                
+                FILE* f = fopen(file_path, "r");
+                if (f) {
+                    char line[1024];
+                    while (fgets(line, sizeof(line), f)) {
+                        char line_lower[1024];
+                        strncpy(line_lower, line, sizeof(line_lower) - 1);
+                        line_lower[sizeof(line_lower) - 1] = '\0';
+                        for (int k = 0; line_lower[k]; k++) {
+                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                        }
+                        
+                        char* p_pos = strstr(line_lower, "_p");
+                        if (p_pos) {
+                            /* Check that after _p there's whitespace or end of line */
+                            char after_p = p_pos[2];
+                            if (after_p == '\0' || after_p == '\n' || after_p == '\r' || isspace((unsigned char)after_p)) {
+                                char* start = line;
+                                while (*start && isspace((unsigned char)*start)) start++;
+                                char* p_pos_orig = line + (p_pos - line_lower);
+                                if (start < p_pos_orig) {
+                                    int name_len = p_pos_orig - start;
+                                    if (name_len > 0 && name_len < 128) {
+                                        char shape_name[128];
+                                        strncpy(shape_name, start, name_len);
+                                        shape_name[name_len] = '\0';
+                                        
+                                        int found = 0;
+                                        for (int i = 0; i < g->shape_count; i++) {
+                                            if (g->shape_names[i] && strcmp(g->shape_names[i], shape_name) == 0) {
+                                                found = 1;
+                                                break;
+                                            }
+                                        }
+                                        
+                                        if (!found) {
+                                            if (g->shape_count >= shape_capacity) {
+                                                shape_capacity *= 2;
+                                                g->shape_names = (char**)realloc(g->shape_names, shape_capacity * sizeof(char*));
+                                                if (!g->shape_names) {
+                                                    fclose(f);
+                                                    closedir(dir);
+                                                    return;
+                                                }
+                                            }
+                                            g->shape_names[g->shape_count] = (char*)malloc(name_len + 1);
+                                            if (g->shape_names[g->shape_count]) {
+                                                strcpy(g->shape_names[g->shape_count], shape_name);
+                                                g->shape_count++;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    fclose(f);
+                }
+            }
+        }
+    }
+    closedir(dir);
+#endif
+    
+    /* Sort shape names alphabetically */
+    for (int i = 0; i < g->shape_count - 1; i++) {
+        for (int j = i + 1; j < g->shape_count; j++) {
+            if (g->shape_names[i] && g->shape_names[j] && 
+                strcmp(g->shape_names[i], g->shape_names[j]) > 0) {
+                char* temp = g->shape_names[i];
+                g->shape_names[i] = g->shape_names[j];
+                g->shape_names[j] = temp;
+            }
+        }
+    }
+    
+    fprintf(stdout, "Found %d shapes in folder: %s\n", g->shape_count, folder_path);
+    
+    /* Show shape browser window */
+    if (g->shape_count > 0) {
+        g->shapeBrowserWindow.r = (Rect){ 600, 300, 400, 500 };
+    }
+}
+
+/* Helper: skip whitespace and return pointer to first non-whitespace */
+static char* skip_ws(char* s) {
+    while (*s && (*s == ' ' || *s == '\t')) s++;
+    return s;
+}
+
+/* Helper: find pattern in line (case-insensitive) and return pointer after it */
+static char* find_after(char* line_lower, const char* pattern) {
+    char* p = strstr(line_lower, pattern);
+    if (p) return p + strlen(pattern);
+    return NULL;
+}
+
+/* Simple JSON parser to extract shape-to-file mapping from Shapes.SFEOPTIM */
+static char* find_shape_file_in_json(const char* json_content, const char* shape_name) {
+    if (!json_content || !shape_name) return NULL;
+    
+    /* Build search pattern: "SHAPE_NAME":" */
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", shape_name);
+    
+    /* Find the pattern in JSON */
+    char* pos = strstr(json_content, pattern);
+    if (!pos) return NULL;
+    
+    /* Skip past the pattern to get to the filename */
+    pos += strlen(pattern);
+    
+    /* Extract filename until closing quote */
+    static char filename[64];
+    int i = 0;
+    while (*pos && *pos != '"' && i < sizeof(filename) - 1) {
+        filename[i++] = *pos++;
+    }
+    filename[i] = '\0';
+    
+    if (i == 0) return NULL;
+    
+    return filename;
+}
+
+/* ========== Constant Resolver for ASM symbolic constants ========== */
+
+#define MAX_CONSTANTS 4096
+#define MAX_CONST_NAME 64
+
+typedef struct {
+    char name[MAX_CONST_NAME];
+    int value;
+    int resolved;  /* 1 if value is final, 0 if needs resolution */
+} AsmConstant;
+
+typedef struct {
+    AsmConstant constants[MAX_CONSTANTS];
+    int count;
+} ConstantTable;
+
+static ConstantTable g_constants = { .count = 0 };
+
+static void constants_clear(void) {
+    g_constants.count = 0;
+}
+
+static int constants_find(const char* name) {
+    for (int i = 0; i < g_constants.count; i++) {
+        if (_stricmp(g_constants.constants[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void constants_add(const char* name, int value) {
+    if (g_constants.count >= MAX_CONSTANTS) return;
+    
+    /* Check if already exists */
+    int idx = constants_find(name);
+    if (idx >= 0) {
+        g_constants.constants[idx].value = value;
+        g_constants.constants[idx].resolved = 1;
+        return;
+    }
+    
+    strncpy(g_constants.constants[g_constants.count].name, name, MAX_CONST_NAME - 1);
+    g_constants.constants[g_constants.count].name[MAX_CONST_NAME - 1] = '\0';
+    g_constants.constants[g_constants.count].value = value;
+    g_constants.constants[g_constants.count].resolved = 1;
+    g_constants.count++;
+}
+
+static int constants_get(const char* name, int* out_value) {
+    int idx = constants_find(name);
+    if (idx >= 0 && g_constants.constants[idx].resolved) {
+        *out_value = g_constants.constants[idx].value;
+        return 1;
+    }
+    return 0;
+}
+
+/* Parse a value that may be a number, constant name, or expression */
+static int parse_const_value(const char* str, int* out_value) {
+    if (!str || !out_value) return 0;
+    
+    /* Skip leading whitespace */
+    while (*str == ' ' || *str == '\t') str++;
+    
+    /* Check for negated constant: -constantname */
+    if (*str == '-' && isalpha((unsigned char)str[1])) {
+        /* It's a negated constant like -size */
+        str++; /* skip the minus */
+        char const_name[MAX_CONST_NAME];
+        int name_len = 0;
+        while (isalnum((unsigned char)*str) || *str == '_') {
+            if (name_len < MAX_CONST_NAME - 1) {
+                const_name[name_len++] = *str;
+            }
+            str++;
+        }
+        const_name[name_len] = '\0';
+        
+        int val;
+        if (!constants_get(const_name, &val)) {
+            return 0; /* Can't resolve */
+        }
+        *out_value = -val;
+        return 1;
+    }
+    
+    /* If it starts with a digit or minus followed by digit, it's a number */
+    if (isdigit((unsigned char)*str) || (*str == '-' && isdigit((unsigned char)str[1]))) {
+        char* end;
+        long val = strtol(str, &end, 10);
+        
+        /* Check for operators in the expression */
+        while (*end == '+' || *end == '-' || *end == '*') {
+            char op = *end++;
+            while (*end == ' ' || *end == '\t') end++;
+            
+            /* Next part could be a number or constant */
+            long next_val;
+            if (isdigit((unsigned char)*end) || (*end == '-' && isdigit((unsigned char)end[1]))) {
+                next_val = strtol(end, &end, 10);
+            } else {
+                /* It's a constant name - extract it */
+                char const_name[MAX_CONST_NAME];
+                int name_len = 0;
+                while (isalnum((unsigned char)*end) || *end == '_') {
+                    if (name_len < MAX_CONST_NAME - 1) {
+                        const_name[name_len++] = *end;
+                    }
+                    end++;
+                }
+                const_name[name_len] = '\0';
+                
+                int const_val;
+                if (!constants_get(const_name, &const_val)) {
+                    return 0; /* Can't resolve */
+                }
+                next_val = const_val;
+            }
+            
+            if (op == '+') val += next_val;
+            else if (op == '-') val -= next_val;
+            else if (op == '*') val *= next_val;
+        }
+        
+        *out_value = (int)val;
+        return 1;
+    }
+    
+    /* It starts with a letter - it's a constant name or expression starting with constant */
+    char const_name[MAX_CONST_NAME];
+    int name_len = 0;
+    const char* p = str;
+    while (isalnum((unsigned char)*p) || *p == '_') {
+        if (name_len < MAX_CONST_NAME - 1) {
+            const_name[name_len++] = *p;
+        }
+        p++;
+    }
+    const_name[name_len] = '\0';
+    
+    int val;
+    if (!constants_get(const_name, &val)) {
+        return 0; /* Can't resolve */
+    }
+    
+    /* Check for operators after the constant */
+    while (*p == ' ' || *p == '\t') p++;
+    while (*p == '+' || *p == '-' || *p == '*') {
+        char op = *p++;
+        while (*p == ' ' || *p == '\t') p++;
+        
+        long next_val;
+        if (isdigit((unsigned char)*p) || (*p == '-' && isdigit((unsigned char)p[1]))) {
+            char* end;
+            next_val = strtol(p, &end, 10);
+            p = end;
+        } else {
+            /* Another constant */
+            name_len = 0;
+            while (isalnum((unsigned char)*p) || *p == '_') {
+                if (name_len < MAX_CONST_NAME - 1) {
+                    const_name[name_len++] = *p;
+                }
+                p++;
+            }
+            const_name[name_len] = '\0';
+            
+            int const_val;
+            if (!constants_get(const_name, &const_val)) {
+                return 0;
+            }
+            next_val = const_val;
+        }
+        
+        if (op == '+') val += (int)next_val;
+        else if (op == '-') val -= (int)next_val;
+        else if (op == '*') val *= (int)next_val;
+    }
+    
+    *out_value = val;
+    return 1;
+}
+
+/* Parse a single line for constant definition */
+static void parse_constant_line(const char* line) {
+    /* Format: name equ value  OR  name = value */
+    char line_copy[512];
+    strncpy(line_copy, line, sizeof(line_copy) - 1);
+    line_copy[sizeof(line_copy) - 1] = '\0';
+    
+    /* Skip leading whitespace */
+    char* p = line_copy;
+    while (*p == ' ' || *p == '\t') p++;
+    
+    /* Skip comments */
+    if (*p == ';' || *p == '\0' || *p == '\n' || *p == '\r') return;
+    
+    /* Extract name */
+    char name[MAX_CONST_NAME];
+    int name_len = 0;
+    while (isalnum((unsigned char)*p) || *p == '_') {
+        if (name_len < MAX_CONST_NAME - 1) {
+            name[name_len++] = *p;
+        }
+        p++;
+    }
+    name[name_len] = '\0';
+    if (name_len == 0) return;
+    
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '\t') p++;
+    
+    /* Check for 'equ' or '=' */
+    int is_equ = 0;
+    if (_strnicmp(p, "equ", 3) == 0 && (p[3] == ' ' || p[3] == '\t')) {
+        p += 3;
+        is_equ = 1;
+    } else if (*p == '=') {
+        p++;
+        is_equ = 1;
+    }
+    
+    if (!is_equ) return;
+    
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '\t') p++;
+    
+    /* Remove trailing comment */
+    char* comment = strchr(p, ';');
+    if (comment) *comment = '\0';
+    
+    /* Remove trailing whitespace */
+    int len = (int)strlen(p);
+    while (len > 0 && (p[len-1] == ' ' || p[len-1] == '\t' || p[len-1] == '\n' || p[len-1] == '\r')) {
+        p[--len] = '\0';
+    }
+    
+    /* Try to parse the value */
+    int value;
+    if (parse_const_value(p, &value)) {
+        constants_add(name, value);
+    }
+}
+
+/* Load constants from an INC file */
+static void load_constants_from_file(const char* filepath) {
+    FILE* f = fopen(filepath, "rb");
+    if (!f) return;
+    
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    char* content = (char*)malloc(size + 1);
+    if (!content) {
+        fclose(f);
+        return;
+    }
+    
+    size_t read = fread(content, 1, size, f);
+    fclose(f);
+    content[read] = '\0';
+    
+    /* Parse line by line - do multiple passes to resolve dependencies */
+    for (int pass = 0; pass < 3; pass++) {
+        char* line = content;
+        while (*line) {
+            char* next = strchr(line, '\n');
+            if (next) {
+                *next = '\0';
+                parse_constant_line(line);
+                line = next + 1;
+            } else {
+                parse_constant_line(line);
+                break;
+            }
+        }
+        
+        /* Reset for next pass */
+        /* Reread line breaks */
+        for (size_t i = 0; i < read; i++) {
+            if (content[i] == '\0' && i + 1 < read) content[i] = '\n';
+        }
+    }
+    
+    free(content);
+}
+
+/* Load all constants from INC folder */
+static void load_all_constants(const char* shapes_folder) {
+    constants_clear();
+    
+    /* Build path to INC folder - go up one level from SHAPES */
+    char inc_path[512];
+    strncpy(inc_path, shapes_folder, sizeof(inc_path) - 1);
+    inc_path[sizeof(inc_path) - 1] = '\0';
+    
+    /* Remove trailing slash if present */
+    int len = (int)strlen(inc_path);
+    while (len > 0 && (inc_path[len-1] == '/' || inc_path[len-1] == '\\')) {
+        inc_path[--len] = '\0';
+    }
+    
+    /* Go up one directory (from SHAPES to SF) */
+    char* last_sep = strrchr(inc_path, '\\');
+    if (!last_sep) last_sep = strrchr(inc_path, '/');
+    if (last_sep) {
+        *last_sep = '\0';
+        strcat(inc_path, "\\INC");
+    } else {
+        strcat(inc_path, "\\..\\INC");
+    }
+    
+    fprintf(stdout, "load_all_constants: Looking for INC folder at '%s'\n", inc_path);
+    
+    char filepath[600];
+    
+    /* Load INC files in order of dependency (most basic first) */
+    const char* inc_files[] = {
+        "STRATEQU.INC",  /* Shape-related constants */
+        "VARS.INC",      /* Variables */
+        "STRUCTS.INC",   /* Structure definitions */
+        "MACROS.INC",    /* Macros */
+        NULL
+    };
+    
+    for (int f = 0; inc_files[f] != NULL; f++) {
+        snprintf(filepath, sizeof(filepath), "%s\\%s", inc_path, inc_files[f]);
+        load_constants_from_file(filepath);
+    }
+    
+    /* Also load constants from shape ASM files (they define some local constants) */
+    const char* shape_files[] = {
+        "SHAPES.ASM",
+        "SHAPES2.ASM",
+        "SHAPES3.ASM",
+        "SHAPES4.ASM",
+        "SHAPES5.ASM",
+        "SHAPES6.ASM",
+        "KSHAPES.ASM",
+        "PSHAPES.ASM",
+        "USHAPES.ASM",
+        NULL
+    };
+    
+    for (int f = 0; shape_files[f] != NULL; f++) {
+        snprintf(filepath, sizeof(filepath), "%s\\%s", shapes_folder, shape_files[f]);
+        load_constants_from_file(filepath);
+    }
+    
+    fprintf(stdout, "load_all_constants: Loaded %d constants\n", g_constants.count);
+}
+
+/* ========== End Constant Resolver ========== */
+
+/* Helper: Create a polygon with its own point chain (points are copied, not shared) */
+static int16_t create_polygon_with_points(CadCore* core, double vertices[][3], int vertex_indices[], int num_vertices, uint8_t color) {
+    if (!core || num_vertices < 2 || num_vertices > 12) return INVALID_INDEX;
+    
+    /* Create new points for this polygon and link them */
+    int16_t first_point = INVALID_INDEX;
+    int16_t prev_point = INVALID_INDEX;
+    
+    for (int i = 0; i < num_vertices; i++) {
+        int v_idx = vertex_indices[i];
+        int16_t new_pt = CadCore_AddPoint(core, vertices[v_idx][0], vertices[v_idx][1], vertices[v_idx][2]);
+        if (new_pt == INVALID_INDEX) return INVALID_INDEX;
+        
+        if (first_point == INVALID_INDEX) {
+            first_point = new_pt;
+        }
+        
+        if (prev_point != INVALID_INDEX) {
+            CadPoint* prev = CadCore_GetPoint(core, prev_point);
+            if (prev) prev->nextPoint = new_pt;
+        }
+        
+        prev_point = new_pt;
+    }
+    
+    /* Mark last point as end of chain */
+    if (prev_point != INVALID_INDEX) {
+        CadPoint* last = CadCore_GetPoint(core, prev_point);
+        if (last) last->nextPoint = -1;
+    }
+    
+    /* Create the polygon */
+    return CadCore_AddPolygon(core, first_point, color, (uint8_t)num_vertices);
+}
+
+/* Load a shape from an ASM file into the CAD system */
+static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* folder_path) {
+    if (!g || !g->cad || !shape_name || !folder_path) {
+        fprintf(stderr, "load_shape_from_asm: Invalid parameters\n");
+        return 0;
+    }
+
+    fprintf(stdout, "load_shape_from_asm: Looking for shape '%s' in folder '%s'\n", shape_name, folder_path);
+
+    /* Clear existing CAD data */
+    CadCore_Clear(g->cad);
+
+    /* Try to load the JSON mapping file first */
+    char json_path[520];
+    snprintf(json_path, sizeof(json_path), "%s\\Shapes.SFEOPTIM", folder_path);
+    
+    FILE* json_file = fopen(json_path, "rb");
+    char* target_filename = NULL;
+    
+    if (json_file) {
+        fseek(json_file, 0, SEEK_END);
+        long json_size = ftell(json_file);
+        fseek(json_file, 0, SEEK_SET);
+        
+        char* json_content = (char*)malloc(json_size + 1);
+        if (json_content) {
+            size_t bytes_read = fread(json_content, 1, json_size, json_file);
+            json_content[bytes_read] = '\0';
+            
+            target_filename = find_shape_file_in_json(json_content, shape_name);
+            if (target_filename) {
+                fprintf(stdout, "load_shape_from_asm: Found shape '%s' in file '%s' (from JSON mapping)\n", 
+                        shape_name, target_filename);
+            }
+            
+            free(json_content);
+        }
+        fclose(json_file);
+    }
+    
+    /* Find the ASM file containing this shape */
+#ifdef _WIN32
+    char search_path[520];
+    snprintf(search_path, sizeof(search_path), "%s\\*.asm", folder_path);
+
+    WIN32_FIND_DATAA find_data;
+    HANDLE hFind = FindFirstFileA(search_path, &find_data);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "load_shape_from_asm: No ASM files found in folder '%s'\n", folder_path);
+        return 0;
+    }
+
+    int found = 0;
+    do {
+        if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            /* If we have a target filename from JSON, skip files that don't match */
+            if (target_filename && strcmp(find_data.cFileName, target_filename) != 0) {
+                continue;
+            }
+            
+            char file_path[520];
+            snprintf(file_path, sizeof(file_path), "%s\\%s", folder_path, find_data.cFileName);
+            fprintf(stdout, "load_shape_from_asm: Checking file '%s'\n", find_data.cFileName);
+
+            /* Open in binary mode to avoid text translation issues on Windows */
+            FILE* f = fopen(file_path, "rb");
+            if (f) {
+                fprintf(stdout, "load_shape_from_asm: Opened file '%s'\n", find_data.cFileName);
+                /* Read entire file into memory for easier parsing */
+                fseek(f, 0, SEEK_END);
+                long file_size = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                fprintf(stdout, "load_shape_from_asm: File size: %ld bytes\n", file_size);
+
+                if (file_size <= 0) {
+                    fprintf(stderr, "load_shape_from_asm: File '%s' is empty\n", find_data.cFileName);
+                    fclose(f);
+                    continue;
+                }
+
+                char* content = (char*)malloc(file_size + 1);
+                if (!content) {
+                    fprintf(stderr, "load_shape_from_asm: Failed to allocate memory for file '%s'\n", find_data.cFileName);
+                    fclose(f);
+                    continue;
+                }
+                size_t bytes_read = fread(content, 1, file_size, f);
+                fclose(f);
+                
+                /* On Windows, text mode can cause fewer bytes to be read due to \r\n translation
+                   Accept if we read at least 95% of the file (usually just a few bytes difference) */
+                if (bytes_read < (size_t)(file_size * 0.95)) {
+                    fprintf(stderr, "load_shape_from_asm: Failed to read file '%s' (read %zu of %ld bytes, less than 95%%)\n", 
+                            find_data.cFileName, bytes_read, file_size);
+                    free(content);
+                    continue;
+                }
+                
+                /* Null-terminate at the actual bytes read */
+                content[bytes_read] = '\0';
+                fprintf(stdout, "load_shape_from_asm: Successfully read %zu bytes from '%s' (file size: %ld)\n", 
+                        bytes_read, find_data.cFileName, file_size);
+
+                /* Normalize line endings - handle both \r\n and \n */
+                /* Use bytes_read instead of file_size since we might have read fewer bytes */
+                for (size_t i = 0; i < bytes_read; i++) {
+                    if (content[i] == '\r') {
+                        if (i + 1 < bytes_read && content[i + 1] == '\n') {
+                            /* \r\n -> \n, shift remaining content left by 1 */
+                            memmove(&content[i], &content[i + 1], bytes_read - i - 1);
+                            bytes_read--;
+                            content[bytes_read] = '\0';
+                        } else {
+                            /* Standalone \r -> \n */
+                            content[i] = '\n';
+                        }
+                    }
+                }
+
+                /* Split into lines */
+                char** lines = NULL;
+                int line_count = 0;
+                int line_capacity = 1000;
+                lines = (char**)malloc(line_capacity * sizeof(char*));
+                if (!lines) {
+                    fprintf(stderr, "load_shape_from_asm: Failed to allocate memory for lines\n");
+                    free(content);
+                    continue;
+                }
+
+                char* line_start = content;
+                for (long i = 0; i <= file_size; i++) {
+                    if (content[i] == '\n' || content[i] == '\0') {
+                        if (line_count >= line_capacity) {
+                            line_capacity *= 2;
+                            lines = (char**)realloc(lines, line_capacity * sizeof(char*));
+                            if (!lines) {
+                                fprintf(stderr, "load_shape_from_asm: Failed to reallocate memory for lines\n");
+                                free(content);
+                                break;
+                            }
+                        }
+                        content[i] = '\0';
+                        lines[line_count++] = line_start;
+                        line_start = &content[i + 1];
+                    }
+                }
+                fprintf(stdout, "load_shape_from_asm: Split file into %d lines\n", line_count);
+
+                /* Find points_start and faces_start by parsing ShapeHdr */
+                int points_start = -1;
+                int faces_start = -1;
+                char shape_name_lower[256];
+                strncpy(shape_name_lower, shape_name, sizeof(shape_name_lower) - 1);
+                shape_name_lower[sizeof(shape_name_lower) - 1] = '\0';
+                for (int k = 0; shape_name_lower[k]; k++) {
+                    shape_name_lower[k] = (char)tolower((unsigned char)shape_name_lower[k]);
+                }
+
+                /* First, find the ShapeHdr line to extract actual _P and _F section names */
+                char actual_points_section[256] = {0};
+                char actual_faces_section[256] = {0};
+                int shapehdr_line = -1;
+                
+                for (int i = 0; i < line_count; i++) {
+                    char line_lower[1024];
+                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                    line_lower[sizeof(line_lower) - 1] = '\0';
+                    for (int k = 0; line_lower[k]; k++) {
+                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                    }
+                    
+                    /* Look for shapehdr with this shape name */
+                    /* Format: shapename<whitespace>shapehdr<whitespace>points_section,0,faces_section,... */
+                    char* stripped = line_lower;
+                    while (*stripped && (*stripped == ' ' || *stripped == '\t')) stripped++;
+                    
+                    /* Check if line starts with shape name */
+                    size_t name_len = strlen(shape_name_lower);
+                    if (strncmp(stripped, shape_name_lower, name_len) == 0) {
+                        char* after_name = stripped + name_len;
+                        /* Must be followed by whitespace or tab, then shapehdr */
+                        if (*after_name == ' ' || *after_name == '\t') {
+                            while (*after_name == ' ' || *after_name == '\t') after_name++;
+                            if (_strnicmp(after_name, "shapehdr", 8) == 0) {
+                                shapehdr_line = i;
+                                /* Parse the ShapeHdr parameters */
+                                char* params = after_name + 8;
+                                while (*params == ' ' || *params == '\t') params++;
+                                
+                                /* Extract points section name (first parameter before comma) */
+                                char* comma1 = strchr(params, ',');
+                                if (comma1) {
+                                    int len = (int)(comma1 - params);
+                                    if (len > 0 && len < 256) {
+                                        strncpy(actual_points_section, params, len);
+                                        actual_points_section[len] = '\0';
+                                        /* Trim whitespace */
+                                        while (len > 0 && (actual_points_section[len-1] == ' ' || actual_points_section[len-1] == '\t')) {
+                                            actual_points_section[--len] = '\0';
+                                        }
+                                    }
+                                    
+                                    /* Skip to third parameter (faces section) */
+                                    /* Format: points,0,faces,... */
+                                    char* comma2 = strchr(comma1 + 1, ',');
+                                    if (comma2) {
+                                        char* faces_param = comma2 + 1;
+                                        while (*faces_param == ' ' || *faces_param == '\t') faces_param++;
+                                        char* comma3 = strchr(faces_param, ',');
+                                        if (comma3) {
+                                            int flen = (int)(comma3 - faces_param);
+                                            if (flen > 0 && flen < 256) {
+                                                strncpy(actual_faces_section, faces_param, flen);
+                                                actual_faces_section[flen] = '\0';
+                                                while (flen > 0 && (actual_faces_section[flen-1] == ' ' || actual_faces_section[flen-1] == '\t')) {
+                                                    actual_faces_section[--flen] = '\0';
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                fprintf(stdout, "Found ShapeHdr for %s at line %d: points='%s', faces='%s'\n", 
+                                        shape_name, i, actual_points_section, actual_faces_section);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                /* If no ShapeHdr found, fall back to default naming */
+                char shape_p[256];
+                char shape_f[256];
+                if (actual_points_section[0]) {
+                    strncpy(shape_p, actual_points_section, sizeof(shape_p) - 1);
+                    shape_p[sizeof(shape_p) - 1] = '\0';
+                    for (int k = 0; shape_p[k]; k++) shape_p[k] = (char)tolower((unsigned char)shape_p[k]);
+                } else {
+                    snprintf(shape_p, sizeof(shape_p), "%s_p", shape_name_lower);
+                }
+                
+                if (actual_faces_section[0]) {
+                    strncpy(shape_f, actual_faces_section, sizeof(shape_f) - 1);
+                    shape_f[sizeof(shape_f) - 1] = '\0';
+                    for (int k = 0; shape_f[k]; k++) shape_f[k] = (char)tolower((unsigned char)shape_f[k]);
+                } else {
+                    snprintf(shape_f, sizeof(shape_f), "%s_f", shape_name_lower);
+                }
+
+                /* Now find the actual sections */
+                for (int i = 0; i < line_count; i++) {
+                    char line_lower[1024];
+                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                    line_lower[sizeof(line_lower) - 1] = '\0';
+                    for (int k = 0; line_lower[k]; k++) {
+                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                    }
+                    char* stripped = line_lower;
+                    while (*stripped && (*stripped == ' ' || *stripped == '\t')) stripped++;
+                    
+                    char* end = stripped + strlen(stripped) - 1;
+                    while (end > stripped && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
+                        *end = '\0';
+                        end--;
+                    }
+
+                    /* Look for points section */
+                    if (points_start == -1) {
+                        size_t shape_p_len = strlen(shape_p);
+                        if (strncmp(stripped, shape_p, shape_p_len) == 0) {
+                            char after_p = stripped[shape_p_len];
+                            if (!after_p || after_p == '\0' || after_p == '\n' || after_p == '\r' ||
+                                after_p == ' ' || after_p == '\t') {
+                                points_start = i;
+                                fprintf(stdout, "Found points section for %s at line %d: %s\n", shape_name, i, stripped);
+                            }
+                        }
+                    }
+                    /* Look for faces section */
+                    if (faces_start == -1) {
+                        size_t shape_f_len = strlen(shape_f);
+                        if (strncmp(stripped, shape_f, shape_f_len) == 0) {
+                            char after_f = stripped[shape_f_len];
+                            if (!after_f || !isdigit((unsigned char)after_f)) {
+                                faces_start = i;
+                                fprintf(stdout, "Found faces section for %s at line %d: %s\n", shape_name, i, stripped);
+                            }
+                        }
+                    }
+                }
+
+                fprintf(stdout, "load_shape_from_asm: Searching for '%s' and '%s' in file '%s' (%d lines)\n", 
+                        shape_p, shape_f, find_data.cFileName, line_count);
+                
+                if (points_start == -1) {
+                    /* Shape not in this file, continue to next file (this is normal) */
+                    free(lines);
+                    free(content);
+                    continue;
+                }
+                
+                if (faces_start == -1) {
+                    fprintf(stderr, "WARNING: Could not find faces section '%s' for shape: %s in file: %s (will continue without faces)\n", shape_f, shape_name, find_data.cFileName);
+                }
+
+                /* Parse points - build vertex array first */
+                double vertices[8192][3];
+                int vertex_count = 0;
+                int in_mirrored_section = 0;
+
+                /* First, parse local constants from the points section */
+                /* Local constants appear between the label and the first Points directive */
+                fprintf(stdout, "load_shape_from_asm: Scanning for local constants from line %d\n", points_start);
+                for (int i = points_start; i < line_count && i < points_start + 20; i++) {
+                    const char* line = lines[i];
+                    
+                    /* Check if we hit a Points directive - stop scanning for constants */
+                    char line_lower[1024];
+                    strncpy(line_lower, line, sizeof(line_lower) - 1);
+                    line_lower[sizeof(line_lower) - 1] = '\0';
+                    for (int k = 0; line_lower[k]; k++) {
+                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                    }
+                    if (strstr(line_lower, "pointsb") || strstr(line_lower, "pointsw") ||
+                        strstr(line_lower, "pointsxb") || strstr(line_lower, "pointsxw")) {
+                        break;
+                    }
+                    
+                    /* Look for local constant definition: name = expression */
+                    const char* eq = strchr(line, '=');
+                    if (eq) {
+                        /* Extract name (before =) */
+                        char name[MAX_CONST_NAME];
+                        int name_len = 0;
+                        const char* p = line;
+                        while (*p == ' ' || *p == '\t') p++;
+                        while (p < eq && (isalnum((unsigned char)*p) || *p == '_')) {
+                            if (name_len < MAX_CONST_NAME - 1) {
+                                name[name_len++] = *p;
+                            }
+                            p++;
+                        }
+                        name[name_len] = '\0';
+                        
+                        /* Skip if name is empty or starts with a directive */
+                        if (name_len > 0 && name[0] != '\0' && 
+                            _stricmp(name, "equ") != 0 && _stricmp(name, "set") != 0) {
+                            /* Parse value (after =) */
+                            p = eq + 1;
+                            while (*p == ' ' || *p == '\t') p++;
+                            
+                            int value;
+                            if (parse_const_value(p, &value)) {
+                                constants_add(name, value);
+                                fprintf(stdout, "load_shape_from_asm: Added local constant %s = %d\n", name, value);
+                            }
+                        }
+                    }
+                }
+
+                fprintf(stdout, "load_shape_from_asm: Starting point parsing from line %d\n", points_start);
+                for (int i = points_start; i < line_count; i++) {
+                    char line_lower[1024];
+                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                    line_lower[sizeof(line_lower) - 1] = '\0';
+                    for (int k = 0; line_lower[k]; k++) {
+                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                    }
+
+                    /* Check for EndPoints - stop parsing points */
+                    if (strstr(line_lower, "endpoints")) {
+                        fprintf(stdout, "load_shape_from_asm: Found EndPoints at line %d\n", i);
+                        break;
+                    }
+
+                    /* Check for Pointsb (non-mirrored) - comes first */
+                    if (strstr(line_lower, "pointsb") && !strstr(line_lower, "pointsxb")) {
+                        in_mirrored_section = 0;
+                        fprintf(stdout, "load_shape_from_asm: Found Pointsb at line %d\n", i);
+                        continue;
+                    }
+
+                    /* Check for PointsXb (mirrored) - comes after Pointsb */
+                    if (strstr(line_lower, "pointsxb")) {
+                        in_mirrored_section = 1;
+                        fprintf(stdout, "load_shape_from_asm: Found PointsXb at line %d\n", i);
+                        continue;
+                    }
+
+                    /* Check for Pointsw (non-mirrored word) - comes first */
+                    if (strstr(line_lower, "pointsw") && !strstr(line_lower, "pointsxw")) {
+                        in_mirrored_section = 0;
+                        fprintf(stdout, "load_shape_from_asm: Found Pointsw at line %d\n", i);
+                        continue;
+                    }
+
+                    /* Check for PointsXw (mirrored word) - comes after Pointsw */
+                    if (strstr(line_lower, "pointsxw")) {
+                        in_mirrored_section = 1;
+                        fprintf(stdout, "load_shape_from_asm: Found PointsXw at line %d\n", i);
+                        continue;
+                    }
+
+                    /* Parse point: pb x,y,z, pw x,y,z, pbd2 x,y,z, pwd2 x,y,z
+                       Regex pattern: r'p[wb]d?2?\s+(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)'
+                       pbd2/pwd2 divide coordinates by 2
+                    */
+                    char* pbd2_pos = strstr(line_lower, "pbd2");
+                    char* pwd2_pos = strstr(line_lower, "pwd2");
+                    char* pb_pos = strstr(line_lower, "pb");
+                    char* pw_pos = strstr(line_lower, "pw");
+                    char* point_pos = NULL;
+                    int is_pw = 0;
+                    int divide_by_2 = 0;
+                    int skip_len = 2; /* Default: pb/pw are 2 chars */
+                    
+                    /* Check for pbd2/pwd2 first (they also contain pb/pw) */
+                    if (pbd2_pos && (pbd2_pos == line_lower || pbd2_pos[-1] == ' ' || pbd2_pos[-1] == '\t')) {
+                        point_pos = pbd2_pos;
+                        is_pw = 0;
+                        divide_by_2 = 1;
+                        skip_len = 4;
+                    } else if (pwd2_pos && (pwd2_pos == line_lower || pwd2_pos[-1] == ' ' || pwd2_pos[-1] == '\t')) {
+                        point_pos = pwd2_pos;
+                        is_pw = 1;
+                        divide_by_2 = 1;
+                        skip_len = 4;
+                    } else if (pb_pos && (!pw_pos || pb_pos < pw_pos)) {
+                        /* Make sure it's pb, not pbd2 */
+                        if (pb_pos[2] != 'd') {
+                            point_pos = pb_pos;
+                            is_pw = 0;
+                        }
+                    } else if (pw_pos) {
+                        /* Make sure it's pw, not pwd2 */
+                        if (pw_pos[2] != 'd') {
+                            point_pos = pw_pos;
+                            is_pw = 1;
+                        }
+                    }
+                    
+                    if (point_pos) {
+                        /* Make sure point directive is at start of a word */
+                        if (point_pos == line_lower ||
+                            point_pos[-1] == ' ' || point_pos[-1] == '\t' || point_pos[-1] == '\n' || point_pos[-1] == '\r') {
+                            /* Skip directive and any whitespace after it - use original line for parsing */
+                            int offset = (int)(point_pos - line_lower);
+                            char* orig_coord_start = (char*)lines[i] + offset + skip_len;
+                            while (*orig_coord_start == ' ' || *orig_coord_start == '\t') orig_coord_start++;
+                            
+                            /* Split into three comma-separated parts */
+                            char coord_buf[256];
+                            strncpy(coord_buf, orig_coord_start, sizeof(coord_buf) - 1);
+                            coord_buf[sizeof(coord_buf) - 1] = '\0';
+                            
+                            /* Remove trailing comment */
+                            char* comment = strchr(coord_buf, ';');
+                            if (comment) *comment = '\0';
+                            
+                            /* Split by comma */
+                            char* x_str = coord_buf;
+                            char* y_str = strchr(x_str, ',');
+                            char* z_str = NULL;
+                            
+                            if (y_str) {
+                                *y_str++ = '\0';
+                                while (*y_str == ' ' || *y_str == '\t') y_str++;
+                                z_str = strchr(y_str, ',');
+                                if (z_str) {
+                                    *z_str++ = '\0';
+                                    while (*z_str == ' ' || *z_str == '\t') z_str++;
+                                }
+                            }
+                            
+                            if (x_str && y_str && z_str) {
+                                /* Try to parse each coordinate using constant resolver */
+                                int x, y, z;
+                                int x_ok = parse_const_value(x_str, &x);
+                                int y_ok = parse_const_value(y_str, &y);
+                                int z_ok = parse_const_value(z_str, &z);
+                                
+                                if (x_ok && y_ok && z_ok) {
+                                    /* Apply divide by 2 for pbd2/pwd2 */
+                                    if (divide_by_2) {
+                                        x /= 2;
+                                        y /= 2;
+                                        z /= 2;
+                                    }
+                                    fprintf(stdout, "load_shape_from_asm: Parsed point: p%c%s %d,%d,%d (line %d)\n", 
+                                            is_pw ? 'w' : 'b', divide_by_2 ? "d2" : "", x, y, z, i);
+                                    if (in_mirrored_section) {
+                                        /* Mirrored point - add both +x and -x versions */
+                                        if (vertex_count < 8190) {
+                                            vertices[vertex_count][0] = x;
+                                            vertices[vertex_count][1] = y;
+                                            vertices[vertex_count][2] = z;
+                                            vertex_count++;
+                                            vertices[vertex_count][0] = -x;
+                                            vertices[vertex_count][1] = y;
+                                            vertices[vertex_count][2] = z;
+                                            vertex_count++;
+                                        }
+                                    }
+                                    else {
+                                        /* Non-mirrored point */
+                                        if (vertex_count < 8191) {
+                                            vertices[vertex_count][0] = x;
+                                            vertices[vertex_count][1] = y;
+                                            vertices[vertex_count][2] = z;
+                                            vertex_count++;
+                                        }
+                                    }
+                                } else {
+                                    /* Failed to parse - log which coordinate failed */
+                                    fprintf(stderr, "load_shape_from_asm: Could not resolve point (line %d): x=%s(%s) y=%s(%s) z=%s(%s)\n",
+                                        i, x_str, x_ok ? "ok" : "FAIL", y_str, y_ok ? "ok" : "FAIL", z_str, z_ok ? "ok" : "FAIL");
+                                }
+                            }
+                        }
+                    }
+
+                    /* Check for EndPoints */
+                    if (strstr(line_lower, "endpoints")) {
+                        break;
+                    }
+                }
+
+                /* Note: We don't add vertices to CAD system here anymore.
+                   Points are created per-polygon by create_polygon_with_points() */
+                fprintf(stdout, "Loaded %d vertices for shape: %s\n", vertex_count, shape_name);
+
+                /* Parse faces - scan from faces_start until EndShape
+                   Also need to check for shape_f1, shape_f2, etc. sections */
+                int face_count = 0;
+                
+                /* Find all face sections (shape_f, shape_f1, shape_f2, etc.) */
+                int face_sections[32];
+                int face_section_count = 0;
+                
+                /* Only process faces if we found a valid faces section */
+                if (faces_start < 0) {
+                    fprintf(stderr, "WARNING: No faces section found for shape '%s', loading points only\n", shape_name);
+                    faces_start = line_count; /* Prevent any face parsing loops */
+                }
+                
+                /* Find where this shape ends (EndShape) to limit our search */
+                int shape_end = line_count;
+                for (int i = faces_start; i < line_count; i++) {
+                    char line_lower[1024];
+                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                    line_lower[sizeof(line_lower) - 1] = '\0';
+                    for (int k = 0; line_lower[k]; k++) {
+                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                    }
+                    if (strstr(line_lower, "endshape")) {
+                        shape_end = i + 1;
+                        break;
+                    }
+                }
+                
+                /* Look for ALL face sections (shape_f, shape_f1, shape_f2, etc.) WITHIN this shape only */
+                /* Use the actual face section name from ShapeHdr (shape_f already set above) */
+                char shape_f_base[256];
+                strncpy(shape_f_base, shape_f, sizeof(shape_f_base) - 1);
+                shape_f_base[sizeof(shape_f_base) - 1] = '\0';
+                size_t base_len = strlen(shape_f_base);
+                
+                for (int i = faces_start; i < shape_end && face_section_count < 32; i++) {
+                    char line_lower[1024];
+                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                    line_lower[sizeof(line_lower) - 1] = '\0';
+                    for (int k = 0; line_lower[k]; k++) {
+                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                    }
+                    char* stripped = line_lower;
+                    while (*stripped && (*stripped == ' ' || *stripped == '\t')) stripped++;
+                    char* end = stripped + strlen(stripped) - 1;
+                    while (end > stripped && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
+                        *end = '\0';
+                        end--;
+                    }
+                    
+                    /* Check if this line starts with shape_f (could be shape_f, shape_f1, shape_f2, etc.) */
+                    if (strncmp(stripped, shape_f_base, base_len) == 0) {
+                        /* Check what comes after _f */
+                        char after_f = stripped[base_len];
+                        /* Accept if: end of string, whitespace, or a digit (for f1, f2, etc.) */
+                        if (!after_f || after_f == '\0' || after_f == ' ' || after_f == '\t' || 
+                            isdigit((unsigned char)after_f)) {
+                            /* Make sure it's not already in our list */
+                            int already_found = 0;
+                            for (int j = 0; j < face_section_count; j++) {
+                                if (face_sections[j] == i) {
+                                    already_found = 1;
+                                    break;
+                                }
+                            }
+                            if (!already_found) {
+                                face_sections[face_section_count++] = i;
+                                fprintf(stdout, "Found face section for %s at line %d: %s\n", shape_name, i, stripped);
+                            }
+                        }
+                    }
+                }
+                
+                fprintf(stdout, "load_shape_from_asm: Found %d face section(s) for %s\n", face_section_count, shape_name);
+                
+                /* Parse faces from all face sections */
+                for (int section_idx = 0; section_idx < face_section_count; section_idx++) {
+                    int section_start = face_sections[section_idx];
+                    fprintf(stdout, "load_shape_from_asm: Parsing face section %d starting at line %d\n", section_idx, section_start);
+                    
+                    /* Determine where this section ends - either at Fend/EndShape, or at the start of the next face section */
+                    int section_end = line_count;
+                    if (section_idx + 1 < face_section_count) {
+                        section_end = face_sections[section_idx + 1];
+                    }
+                    
+                    /* Find the actual end of this section (Fend or EndShape) */
+                    for (int i = section_start; i < section_end && i < line_count; i++) {
+                        char line_lower[1024];
+                        strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                        line_lower[sizeof(line_lower) - 1] = '\0';
+                        for (int k = 0; line_lower[k]; k++) {
+                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                        }
+                        if (strstr(line_lower, "endshape") || strstr(line_lower, "fend")) {
+                            section_end = i + 1; /* Stop after this line */
+                            break;
+                        }
+                    }
+                    
+                    /* Skip the label line and look for "Faces" keyword or actual face definitions */
+                    int actual_start = section_start;
+                    for (int i = section_start; i < section_end && i < line_count; i++) {
+                        char line_lower[1024];
+                        strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                        line_lower[sizeof(line_lower) - 1] = '\0';
+                        for (int k = 0; line_lower[k]; k++) {
+                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                        }
+                        /* If we find "faces" keyword or a face definition, start parsing from here */
+                        if (strstr(line_lower, "faces") || strstr(line_lower, "face3") || 
+                            strstr(line_lower, "face4") || strstr(line_lower, "face5")) {
+                            actual_start = i;
+                            break;
+                        }
+                    }
+                    
+                    fprintf(stdout, "load_shape_from_asm: Face section %d: parsing from line %d to %d\n", section_idx, actual_start, section_end);
+                    
+                    for (int i = actual_start; i < section_end && i < line_count; i++) {
+                        char line_lower[1024];
+                        strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
+                        line_lower[sizeof(line_lower) - 1] = '\0';
+                        for (int k = 0; line_lower[k]; k++) {
+                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
+                        }
+                        
+                        /* Check for EndShape or Fend - stop parsing this section */
+                        if (strstr(line_lower, "endshape") || strstr(line_lower, "fend")) {
+                            fprintf(stdout, "load_shape_from_asm: Found end of face section at line %d\n", i);
+                            break;
+                        }
+
+                        /* Parse Face2: line (2 vertices)
+                           Format: Face2 color, viz, nx, ny, nz, v0, v1 */
+                        char* face2_pos = strstr(line_lower, "face2");
+                        if (face2_pos) {
+                            char* num_start = face2_pos + 5;
+                            while (*num_start == ' ' || *num_start == '\t') num_start++;
+                            
+                            char* parse_pos = num_start;
+                            int color = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
+                            
+                            if (parse_pos > num_start) {
+                                if (v0 >= 0 && v0 < vertex_count &&
+                                    v1 >= 0 && v1 < vertex_count) {
+                                    /* Create Face2 (line) with its own point chain */
+                                    int line_verts[2] = { v0, v1 };
+                                    if (create_polygon_with_points(g->cad, vertices, line_verts, 2, color) != INVALID_INDEX) {
+                                        face_count++;
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Parse Face3: triangle
+                           Regex: r'face3\s+(\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)'
+                           Format: Face3<whitespace>color<optional ws>,<optional ws>viz<optional ws>,<optional ws>nx<optional ws>,<optional ws>ny<optional ws>,<optional ws>nz<optional ws>,<optional ws>v0<optional ws>,<optional ws>v1<optional ws>,<optional ws>v2 */
+                        char* face3_pos = strstr(line_lower, "face3");
+                        if (face3_pos) {
+                            /* Skip 'face3' and any whitespace after it */
+                            char* num_start = face3_pos + 5;
+                            while (*num_start == ' ' || *num_start == '\t') num_start++;
+                            
+                            /* Parse using strtol to handle flexible whitespace */
+                            char* parse_pos = num_start;
+                            int color = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v2 = (int)strtol(parse_pos, &parse_pos, 10);
+                            
+                            /* Check if we successfully parsed all 8 values */
+                            if (parse_pos > num_start) {
+                                if (v0 >= 0 && v0 < vertex_count &&
+                                    v1 >= 0 && v1 < vertex_count &&
+                                    v2 >= 0 && v2 < vertex_count) {
+                                    /* Create Face3 (triangle) with its own point chain */
+                                    int tri_verts[3] = { v0, v1, v2 };
+                                    if (create_polygon_with_points(g->cad, vertices, tri_verts, 3, color) != INVALID_INDEX) {
+                                        face_count++;
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Parse Face4: quad
+                           Regex: r'face4\s+(\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)' */
+                        char* face4_pos = strstr(line_lower, "face4");
+                        if (face4_pos) {
+                            char* num_start = face4_pos + 5;
+                            while (*num_start == ' ' || *num_start == '\t') num_start++;
+                            
+                            char* parse_pos = num_start;
+                            int color = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v2 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v3 = (int)strtol(parse_pos, &parse_pos, 10);
+                            
+                            if (parse_pos > num_start) {
+                                if (v0 >= 0 && v0 < vertex_count &&
+                                    v1 >= 0 && v1 < vertex_count &&
+                                    v2 >= 0 && v2 < vertex_count &&
+                                    v3 >= 0 && v3 < vertex_count) {
+                                    /* Split quad into 2 triangles: v0,v1,v2 and v0,v2,v3 */
+                                    /* Each triangle gets its own point chain */
+                                    int tri1_verts[3] = { v0, v1, v2 };
+                                    if (create_polygon_with_points(g->cad, vertices, tri1_verts, 3, color) != INVALID_INDEX) {
+                                        face_count++;
+                                    }
+                                    
+                                    int tri2_verts[3] = { v0, v2, v3 };
+                                    if (create_polygon_with_points(g->cad, vertices, tri2_verts, 3, color) != INVALID_INDEX) {
+                                        face_count++;
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Parse Face5: pentagon
+                           Regex: r'face5\s+(\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)' */
+                        char* face5_pos = strstr(line_lower, "face5");
+                        if (face5_pos) {
+                            char* num_start = face5_pos + 5;
+                            while (*num_start == ' ' || *num_start == '\t') num_start++;
+                            
+                            char* parse_pos = num_start;
+                            int color = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v2 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v3 = (int)strtol(parse_pos, &parse_pos, 10);
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            if (*parse_pos == ',') parse_pos++;
+                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
+                            
+                            int v4 = (int)strtol(parse_pos, &parse_pos, 10);
+                            
+                            if (parse_pos > num_start) {
+                                if (v0 >= 0 && v0 < vertex_count &&
+                                    v1 >= 0 && v1 < vertex_count &&
+                                    v2 >= 0 && v2 < vertex_count &&
+                                    v3 >= 0 && v3 < vertex_count &&
+                                    v4 >= 0 && v4 < vertex_count) {
+                                    /* Split pentagon into 3 triangles: v0,v1,v2, v0,v2,v3, and v0,v3,v4 */
+                                    /* Each triangle gets its own point chain */
+                                    int tri1_verts[3] = { v0, v1, v2 };
+                                    if (create_polygon_with_points(g->cad, vertices, tri1_verts, 3, color) != INVALID_INDEX) {
+                                        face_count++;
+                                    }
+                                    
+                                    int tri2_verts[3] = { v0, v2, v3 };
+                                    if (create_polygon_with_points(g->cad, vertices, tri2_verts, 3, color) != INVALID_INDEX) {
+                                        face_count++;
+                                    }
+                                    
+                                    int tri3_verts[3] = { v0, v3, v4 };
+                                    if (create_polygon_with_points(g->cad, vertices, tri3_verts, 3, color) != INVALID_INDEX) {
+                                        face_count++;
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Check for EndShape */
+                        if (strstr(line_lower, "endshape")) {
+                            found = 1;
+                            break;
+                        }
+                    }
+                }
+
+                fprintf(stdout, "Loaded %d faces for shape: %s\n", face_count, shape_name);
+
+                /* Check if we successfully parsed the shape */
+                if (vertex_count > 0) {
+                    found = 1;
+                    fprintf(stdout, "Successfully parsed shape: %s (vertices: %d, polygons: %d)\n",
+                        shape_name, vertex_count, g->cad->data.polygonCount);
+                }
+
+                free(lines);
+                free(content);
+                if (found) break;
+            }
+        }
+    } while (FindNextFileA(hFind, &find_data));
+
+    FindClose(hFind);
+#else
+    /* Non-Windows implementation would go here */
+    (void)folder_path;
+    (void)shape_name;
+#endif
+
+    return found ? 1 : 0;
 }
 
 void gui_set_font(GuiState* g, FontWin32* font) {
@@ -830,6 +2501,12 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                 titlebar = (Rect){ g->animationWindow.r.x, g->animationWindow.r.y, g->animationWindow.r.w, 20 };
                 if (!g->drag_win && g->animationWindow.draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
                     g->drag_win = &g->animationWindow;
+                }
+            }
+            if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0) {
+                titlebar = (Rect){ g->shapeBrowserWindow.r.x, g->shapeBrowserWindow.r.y, g->shapeBrowserWindow.r.w, 20 };
+                if (!g->drag_win && g->shapeBrowserWindow.draggable && pt_in_rect(in->mouse_x, in->mouse_y, titlebar)) {
+                    g->drag_win = &g->shapeBrowserWindow;
                 }
             }
 
@@ -1153,47 +2830,45 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                                             fprintf(stderr, "Polygon with these points already exists\n");
                                             CadCore_ClearSelection(g->cad);
                                         } else {
-                                            /* Create polygon with first point */
-                                            int16_t poly_idx = CadCore_AddPolygon(g->cad, p1, 0, valid_count);
+                                            /* Create new points for this polygon (copy coordinates from selected points) */
+                                            /* This ensures each polygon has its own independent point chain */
+                                            int16_t new_points[12];
+                                            int new_point_count = 0;
                                             
-                                            if (poly_idx != INVALID_INDEX) {
-                                                /* Link the points together */
-                                                for (int j = 0; j < valid_count; j++) {
-                                                    int16_t current_pt = selected_points[j];
-                                                    int16_t next_pt = (j < valid_count - 1) ? selected_points[j + 1] : INVALID_INDEX;
-                                                    
-                                                    CadPoint* pt = CadCore_GetPoint(g->cad, current_pt);
-                                                    if (!pt) continue;
-                                                    
-                                                    /* Check if this point is already used as firstPoint of another polygon */
-                                                    int is_firstPoint = 0;
-                                                    for (int poly_i = 0; poly_i < g->cad->data.polygonCount; poly_i++) {
-                                                        CadPolygon* existing_poly = CadCore_GetPolygon(g->cad, poly_i);
-                                                        if (!existing_poly || existing_poly->flags == 0) continue;
-                                                        if (existing_poly->firstPoint == current_pt && poly_i != poly_idx) {
-                                                            is_firstPoint = 1;
-                                                            break;
-                                                        }
-                                                    }
-                                                    
-                                                    /* Only set nextPoint if not already a firstPoint, or if nextPoint matches what we want */
-                                                    if (!is_firstPoint) {
-                                                        if (pt->nextPoint == INVALID_INDEX || pt->nextPoint == next_pt) {
-                                                            pt->nextPoint = next_pt;
-                                                        }
-                                                    } else if (pt->nextPoint == next_pt) {
-                                                        /* Already matches, no change needed */
+                                            for (int j = 0; j < valid_count; j++) {
+                                                CadPoint* orig_pt = CadCore_GetPoint(g->cad, selected_points[j]);
+                                                if (!orig_pt) continue;
+                                                
+                                                int16_t new_pt = CadCore_AddPoint(g->cad, orig_pt->pointx, orig_pt->pointy, orig_pt->pointz);
+                                                if (new_pt != INVALID_INDEX) {
+                                                    new_points[new_point_count++] = new_pt;
+                                                }
+                                            }
+                                            
+                                            if (new_point_count >= 2) {
+                                                /* Link the new points together */
+                                                for (int j = 0; j < new_point_count; j++) {
+                                                    CadPoint* pt = CadCore_GetPoint(g->cad, new_points[j]);
+                                                    if (pt) {
+                                                        pt->nextPoint = (j < new_point_count - 1) ? new_points[j + 1] : INVALID_INDEX;
                                                     }
                                                 }
                                                 
-                                                fprintf(stdout, "Created face with %d points (polygon index %d)\n", 
-                                                        valid_count, poly_idx);
+                                                /* Create polygon with first new point */
+                                                int16_t poly_idx = CadCore_AddPolygon(g->cad, new_points[0], 0, new_point_count);
                                                 
-                                                /* Clear selection after creating face */
-                                                CadCore_ClearSelection(g->cad);
+                                                if (poly_idx != INVALID_INDEX) {
+                                                    fprintf(stdout, "Created face with %d points (polygon index %d)\n", 
+                                                            new_point_count, poly_idx);
+                                                } else {
+                                                    fprintf(stderr, "Failed to create polygon\n");
+                                                }
                                             } else {
-                                                fprintf(stderr, "Failed to create polygon (no free slots)\n");
+                                                fprintf(stderr, "Failed to create enough new points\n");
                                             }
+                                            
+                                            /* Clear selection after creating face */
+                                            CadCore_ClearSelection(g->cad);
                                         }
                                     }
                                 }
@@ -1282,6 +2957,58 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     }
     
     /* Handle mouse wheel zoom in views */
+    /* Handle shape browser window interactions */
+    if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0) {
+        Rect sb = g->shapeBrowserWindow.r;
+        Rect sbinner = (Rect){ sb.x + 6, sb.y + 26, sb.w - 12, sb.h - 32 };
+        
+        if (pt_in_rect(in->mouse_x, in->mouse_y, sbinner)) {
+            int y = sbinner.y + 8;
+            int x = sbinner.x + 8;
+            y += 25; /* Skip title */
+            if (g->shape_folder_path[0]) {
+                y += 20; /* Skip folder path */
+            }
+            
+            Rect list_area = (Rect){ x, y, sbinner.w - 16, sbinner.h - (y - sbinner.y) - 8 };
+            
+            if (pt_in_rect(in->mouse_x, in->mouse_y, list_area)) {
+                /* Handle mouse wheel scrolling */
+                if (in->wheel_delta != 0) {
+                    int item_height = 20;
+                    int visible_items = list_area.h / item_height;
+                    int max_scroll = (g->shape_count > visible_items) ? (g->shape_count - visible_items) : 0;
+                    
+                    g->shape_scroll_offset -= in->wheel_delta;
+                    if (g->shape_scroll_offset > max_scroll) g->shape_scroll_offset = max_scroll;
+                    if (g->shape_scroll_offset < 0) g->shape_scroll_offset = 0;
+                }
+                
+                /* Handle mouse click to select shape */
+                if (in->mouse_pressed) {
+                    int item_height = 20;
+                    int click_y = in->mouse_y - list_area.y;
+                    int item_index = (click_y / item_height) + g->shape_scroll_offset;
+                    
+                    if (item_index >= 0 && item_index < g->shape_count) {
+                        g->shape_selected = item_index;
+                        if (g->shape_names[item_index]) {
+                            fprintf(stdout, "Selected shape: %s\n", g->shape_names[item_index]);
+                            /* Load the shape into the CAD view */
+                            if (g->shape_folder_path[0] && g->cad) {
+                                if (load_shape_from_asm(g, g->shape_names[item_index], g->shape_folder_path)) {
+                                    fprintf(stdout, "Loaded shape: %s\n", g->shape_names[item_index]);
+                                } else {
+                                    fprintf(stderr, "Failed to load shape: %s\n", g->shape_names[item_index]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     if (in->wheel_delta != 0 && !g->drag_win) {
         for (int i = 0; i < 4; i++) {
             Rect vr = g->view[i].r;
@@ -1715,6 +3442,10 @@ void gui_draw(GuiState* g, const GuiInput* in, int win_w, int win_h, int fb_w, i
         draw_window_chrome(g, &g->animationWindow, win_h, 1.0f, 1.0f);
     }
     
+    if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0) {
+        draw_window_chrome(g, &g->shapeBrowserWindow, win_h, 1.0f, 1.0f);
+    }
+    
     /* Draw coordinates box content */
     Rect cr = g->coordBox.r;
     Rect cinner = (Rect){ cr.x + 6, cr.y + 26, cr.w - 12, cr.h - 32 };
@@ -1928,6 +3659,69 @@ void gui_draw(GuiState* g, const GuiInput* in, int win_w, int win_h, int fb_w, i
                 rg_fill_rect(btn_end.x, btn_end.y, btn_end.w, btn_end.h, (RG_Color){220,220,220,255});
                 rg_stroke_rect(btn_end.x, btn_end.y, btn_end.w, btn_end.h, (RG_Color){0,0,0,255});
                 font_draw(g->font, btn_end.x + 12, btn_end.y + 6, "end", 0);
+            }
+        }
+    }
+    
+    /* Draw shape browser window content */
+    if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0) {
+        Rect sb = g->shapeBrowserWindow.r;
+        Rect sbinner = (Rect){ sb.x + 6, sb.y + 26, sb.w - 12, sb.h - 32 };
+        rg_fill_rect(sbinner.x, sbinner.y, sbinner.w, sbinner.h, (RG_Color){250,250,250,255});
+        rg_stroke_rect(sbinner.x, sbinner.y, sbinner.w, sbinner.h, (RG_Color){120,120,120,255});
+        
+        if (g->font) {
+            int y = sbinner.y + 8;
+            int x = sbinner.x + 8;
+            
+            /* Title */
+            char title[128];
+            snprintf(title, sizeof(title), "Shapes (%d found)", g->shape_count);
+            font_draw(g->font, x, y, title, 0);
+            y += 25;
+            
+            /* Folder path */
+            if (g->shape_folder_path[0]) {
+                font_draw(g->font, x, y, g->shape_folder_path, 0);
+                y += 20;
+            }
+            
+            /* Scrollable list area */
+            Rect list_area = (Rect){ x, y, sbinner.w - 16, sbinner.h - (y - sbinner.y) - 8 };
+            rg_fill_rect(list_area.x, list_area.y, list_area.w, list_area.h, (RG_Color){255,255,255,255});
+            rg_stroke_rect(list_area.x, list_area.y, list_area.w, list_area.h, (RG_Color){0,0,0,255});
+            
+            /* Draw shape list */
+            int item_height = 20;
+            int visible_items = list_area.h / item_height;
+            int max_scroll = (g->shape_count > visible_items) ? (g->shape_count - visible_items) : 0;
+            if (g->shape_scroll_offset > max_scroll) g->shape_scroll_offset = max_scroll;
+            if (g->shape_scroll_offset < 0) g->shape_scroll_offset = 0;
+            
+            int list_y = list_area.y + 4;
+            for (int i = g->shape_scroll_offset; i < g->shape_count && i < g->shape_scroll_offset + visible_items; i++) {
+                if (g->shape_names[i]) {
+                    RG_Color bg_color = (i == g->shape_selected) ? 
+                        (RG_Color){180,180,255,255} : (RG_Color){255,255,255,255};
+                    rg_fill_rect(list_area.x + 2, list_y, list_area.w - 4, item_height - 2, bg_color);
+                    
+                    if (g->font) {
+                        font_draw(g->font, list_area.x + 4, list_y + 4, g->shape_names[i], 0);
+                    }
+                    list_y += item_height;
+                }
+            }
+            
+            /* Scrollbar */
+            if (g->shape_count > visible_items) {
+                int scrollbar_x = list_area.x + list_area.w - 12;
+                int scrollbar_h = list_area.h;
+                int thumb_h = (visible_items * scrollbar_h) / g->shape_count;
+                int thumb_y = list_area.y + (g->shape_scroll_offset * (scrollbar_h - thumb_h)) / max_scroll;
+                
+                rg_fill_rect(scrollbar_x, list_area.y, 12, scrollbar_h, (RG_Color){220,220,220,255});
+                rg_stroke_rect(scrollbar_x, list_area.y, 12, scrollbar_h, (RG_Color){0,0,0,255});
+                rg_fill_rect(scrollbar_x + 1, thumb_y, 10, thumb_h, (RG_Color){150,150,150,255});
             }
         }
     }

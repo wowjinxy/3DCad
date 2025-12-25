@@ -30,6 +30,7 @@
     <ClCompile Include="src\cad_export_obj.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\dirent.h" />
     <ClInclude Include="include\GLFW\glfw3.h" />
     <ClInclude Include="include\GLFW\glfw3native.h" />
     <ClInclude Include="include\gui.h" />
