@@ -54,7 +54,7 @@ int CadExport_3DG1(const CadCore* core, const char* filename) {
     for (int i = 0; i < core->data.pointCount && i < CAD_MAX_POINTS; i++) {
         const CadPoint* pt = &core->data.points[i];
         if (pt->flags != 0) {
-            point_to_vertex[i] = vertex_count + 1; /* OBJ uses 1-based indexing */
+            point_to_vertex[i] = vertex_count + 1; /* 3DG1 uses 1-based indexing */
             vertex_count++;
         } else {
             point_to_vertex[i] = -1; /* Invalid point */
@@ -63,7 +63,7 @@ int CadExport_3DG1(const CadCore* core, const char* filename) {
 
     /* Write Fundoshi-Kun header */
     fprintf(fp_obj, "3DG1\n"); // 3DG1 magic
-    fprintf(fp_obj, "%d\n", vertex_count); // total points (counting from 1)
+    fprintf(fp_obj, "%d\n", vertex_count); // total points in this shape (1-index)
     
     /* Step 2: Write all vertices */
     for (int i = 0; i < core->data.pointCount && i < CAD_MAX_POINTS; i++) {
@@ -74,14 +74,34 @@ int CadExport_3DG1(const CadCore* core, const char* filename) {
         }
     }
     
-    fprintf(fp_obj, "\n");
+    /* Step 3: Collect unique colors */
+    uint8_t used_colors[256]; // never used again for 3DG1 but this is needed to compute the total at the end
+    int color_count = 0;
+    int color_map[256]; /* Maps color index to material index */
     
-    /* Step 2: Write all faces (polygons) with material assignments */
+    /* Initialize color map */
+    for (int i = 0; i < 256; i++) {
+        color_map[i] = -1;
+    }
+    
+    /* Find all unique colors used in polygons */
+    for (int i = 0; i < core->data.polygonCount && i < CAD_MAX_POLYGONS; i++) {
+        const CadPolygon* poly = &core->data.polygons[i];
+        if (poly->flags == 0 || poly->npoints < CAD_MIN_FACE_POINTS) continue; // Star Fox allows faces with at least 2 points (colored lines) 
+        
+        uint8_t color_idx = poly->color;
+        if (color_map[color_idx] == -1) {
+            color_map[color_idx] = color_count;
+            used_colors[color_count++] = color_idx;
+        }
+    }
+    
+    /* Step 4: Write all faces (polygons) with material assignments */
     uint8_t current_material = 255; /* Invalid, will force first material to be set */
     
     for (int i = 0; i < core->data.polygonCount && i < CAD_MAX_POLYGONS; i++) {
         const CadPolygon* poly = &core->data.polygons[i];
-        if (poly->flags == 0 || poly->npoints < 3) continue;
+        if (poly->flags == 0 || poly->npoints < CAD_MIN_FACE_POINTS) continue; // Star Fox allows faces with at least 2 points (colored lines) 
         
         /* Set material if it changed */
         if (poly->color != current_material) {
@@ -107,19 +127,22 @@ int CadExport_3DG1(const CadCore* core, const char* filename) {
             if (point_count > 1000) break; /* Safety limit */
         }
         
-        /* Write face if we have at least 3 vertices */
-        if (point_count >= 3) {
+        /* Write face if we have at least 2 vertices */
+        /* number_of_points point_index_0 ... point_index_n color_index */
+        if (point_count >= CAD_MIN_FACE_POINTS) { // Star Fox allows faces with at least 2 points (colored lines)
             fprintf(fp_obj, "%d", point_count); // Fundoshi-Kun needs number of points at start of face entry
             for (int j = 0; j < point_count; j++) {
-                int point_idx = (point_indices[j] - 1);  // Fundoshi-Kun vert references are 0 indexed
+                int point_idx = (point_indices[j] - 1);  // Fundoshi-Kun point references are 0-indexed
                 fprintf(fp_obj, " %d", point_idx);
             }
             fprintf(fp_obj, " %d", current_material); // Fundoshi-Kun needs color/texture index at end of face entry
             fprintf(fp_obj, "\n");
         }
     }
-    
+    fprintf(fp_obj, "\x1a"); // End-of-File marker
     fclose(fp_obj);
+    fprintf(stdout, "Exported 3DG1 file: %s (%d vertices, %d faces, %d materials)\n", 
+            filename, vertex_count, core->data.polygonCount, color_count);
     return 1;
 }
 
