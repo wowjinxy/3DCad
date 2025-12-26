@@ -8,6 +8,8 @@
 #include "cad_view.h"
 #include "cad_export_obj.h"
 #include "cad_export_3dg1.h"
+#include "cad_import_3dg1.h"
+#include "cad_import_obj.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -86,7 +88,7 @@ struct GuiState {
     int menu_hover_item; /* 0-based within open menu, -1 none */
     
     /* Submenu state */
-    int submenu_open; /* 1 if export submenu is open, 0 otherwise */
+    int submenu_open; /* 0=none, 5=import, 6=export (using menu item index) */
     int submenu_hover_item; /* 0-based within submenu, -1 none */
     Rect submenu_rect; /* Submenu position/size */
 
@@ -154,7 +156,7 @@ static const char* fileMenuItems[] = {
     "(O)Open...",
     "(S)Save",
     " Save As...",
-    " Import",
+    " Import >",
     " Export >",
     "-",
     " Load Color...",
@@ -163,6 +165,13 @@ static const char* fileMenuItems[] = {
     " Open Shape Folder...",
     "-",
     "(Q)Quit",
+    NULL
+};
+
+/* Import submenu */
+static const char* importSubMenuItems[] = {
+    " .3dg1 (Fundoshi)",
+    " .obj (Wavefront)",
     NULL
 };
 
@@ -329,8 +338,7 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
             }
         }
         break;
-    case 5: /* Import */
-        fprintf(stdout, "Import (not implemented)\n");
+    case 5: /* Import - handled by submenu, do nothing here */
         break;
     case 6: /* Export - handled by submenu, do nothing here */
         break;
@@ -3152,8 +3160,9 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                     int actual_idx = idx + 1;
                     g->menu_hover_item = idx;
                     
-                    /* Close submenu if not hovering Export item */
-                    if (!(g->menu_open == 0 && idx == 5)) {
+                    /* Close submenu if not hovering Import or Export items */
+                    int has_submenu = (g->menu_open == 0 && (idx == 4 || idx == 5));
+                    if (!has_submenu) {
                         g->submenu_open = 0;
                         g->submenu_hover_item = -1;
                     }
@@ -3163,8 +3172,8 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                         const char* raw = items[actual_idx];
                         const char* disp = menu_display_text(raw);
                         if (!(disp[0] == '-' && disp[1] == '\0')) {
-                            /* Don't close menu for Export item - submenu will handle it */
-                            if (g->menu_open == 0 && idx == 5) {
+                            /* Don't close menu for Import/Export items - submenu will handle it */
+                            if (has_submenu) {
                                 /* Keep submenu open, don't trigger action */
                             } else {
                                 /* Handle menu action */
@@ -3182,38 +3191,72 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             } else if (in_submenu) {
                 /* Handle submenu hover and click */
                 int sidx = (in->mouse_y - g->submenu_rect.y) / itemH;
+                
+                /* Get submenu items based on which submenu is open */
+                const char* const* subMenuItems = (g->submenu_open == 5) ? importSubMenuItems : exportSubMenuItems;
                 int subCount = 0;
-                for (const char* const* it = exportSubMenuItems; *it; it++) subCount++;
+                for (const char* const* it = subMenuItems; *it; it++) subCount++;
                 
                 if (sidx >= 0 && sidx < subCount) {
                     g->submenu_hover_item = sidx;
                     
                     if (in->mouse_pressed) {
-                        /* Handle export submenu action */
                         char filename[260];
-                        if (sidx == 0) {
-                            /* Export to .3dg1 */
-                            if (FileDialog_Save(filename, sizeof(filename), 
-                                              "3DG1 Files\0*.3dg1\0All Files\0*.*\0", 
-                                              "Export 3DG1")) {
-                                if (CadExport_3DG1(g->cad, filename)) {
-                                    fprintf(stdout, "Exported to: %s\n", filename);
-                                } else {
-                                    fprintf(stderr, "Error: Failed to export 3DG1 file\n");
+                        
+                        if (g->submenu_open == 5) {
+                            /* Import submenu */
+                            if (sidx == 0) {
+                                /* Import from .3dg1 */
+                                if (FileDialog_Open(filename, sizeof(filename), 
+                                                  "3DG1 Files\0*.3dg1\0All Files\0*.*\0",
+                                                  "Import 3DG1")) {
+                                    if (CadImport_3DG1(g->cad, filename)) {
+                                        fprintf(stdout, "Imported from: %s\n", filename);
+                                        strncpy(g->current_filename, filename, sizeof(g->current_filename) - 1);
+                                    } else {
+                                        fprintf(stderr, "Error: Failed to import 3DG1 file\n");
+                                    }
+                                }
+                            } else if (sidx == 1) {
+                                /* Import from .obj */
+                                if (FileDialog_Open(filename, sizeof(filename), 
+                                                  "OBJ Files\0*.obj\0All Files\0*.*\0",
+                                                  "Import OBJ")) {
+                                    if (CadImport_OBJ(g->cad, filename)) {
+                                        fprintf(stdout, "Imported from: %s\n", filename);
+                                        strncpy(g->current_filename, filename, sizeof(g->current_filename) - 1);
+                                    } else {
+                                        fprintf(stderr, "Error: Failed to import OBJ file\n");
+                                    }
                                 }
                             }
-                        } else if (sidx == 1) {
-                            /* Export to .obj */
-                            if (FileDialog_Save(filename, sizeof(filename), 
-                                              "OBJ Files\0*.obj\0All Files\0*.*\0", 
-                                              "Export OBJ")) {
-                                if (CadExport_OBJ(g->cad, filename)) {
-                                    fprintf(stdout, "Exported to: %s\n", filename);
-                                } else {
-                                    fprintf(stderr, "Error: Failed to export OBJ file\n");
+                        } else if (g->submenu_open == 6) {
+                            /* Export submenu */
+                            if (sidx == 0) {
+                                /* Export to .3dg1 */
+                                if (FileDialog_Save(filename, sizeof(filename), 
+                                                  "3DG1 Files\0*.3dg1\0All Files\0*.*\0", 
+                                                  "Export 3DG1")) {
+                                    if (CadExport_3DG1(g->cad, filename)) {
+                                        fprintf(stdout, "Exported to: %s\n", filename);
+                                    } else {
+                                        fprintf(stderr, "Error: Failed to export 3DG1 file\n");
+                                    }
+                                }
+                            } else if (sidx == 1) {
+                                /* Export to .obj */
+                                if (FileDialog_Save(filename, sizeof(filename), 
+                                                  "OBJ Files\0*.obj\0All Files\0*.*\0", 
+                                                  "Export OBJ")) {
+                                    if (CadExport_OBJ(g->cad, filename)) {
+                                        fprintf(stdout, "Exported to: %s\n", filename);
+                                    } else {
+                                        fprintf(stderr, "Error: Failed to export OBJ file\n");
+                                    }
                                 }
                             }
                         }
+                        
                         /* Close menus */
                         g->menu_open = -1;
                         g->menu_hover_item = -1;
@@ -3380,9 +3423,9 @@ static void gui_draw_dropdown(GuiState* g, int win_w, int win_h) {
                 if (i == g->menu_hover_item) {
                     rg_fill_rect(x + 1, rowY, w - 2, itemH, (RG_Color){210,210,210,255});
                     
-                    /* Check if this is the Export item (index 5 = item 6 in file menu) and open submenu */
-                    if (g->menu_open == 0 && i == 5) {
-                        g->submenu_open = 1;
+                    /* Check if this is Import (index 4) or Export (index 5) and open submenu */
+                    if (g->menu_open == 0 && (i == 4 || i == 5)) {
+                        g->submenu_open = i + 1; /* 5=import, 6=export */
                         g->submenu_rect.x = x + w - 2;
                         g->submenu_rect.y = rowY;
                     }
@@ -3393,15 +3436,18 @@ static void gui_draw_dropdown(GuiState* g, int win_w, int win_h) {
                 }
             }
             
-            /* Draw export submenu if open */
+            /* Draw submenu if open */
             if (g->menu_open == 0 && g->submenu_open) {
                 int subX = g->submenu_rect.x;
                 int subY = g->submenu_rect.y;
                 
+                /* Get submenu items based on which submenu is open */
+                const char* const* subMenuItems = (g->submenu_open == 5) ? importSubMenuItems : exportSubMenuItems;
+                
                 /* Calculate submenu dimensions */
                 int subCount = 0;
                 int subMaxW = 0;
-                for (const char* const* it = exportSubMenuItems; *it; it++) {
+                for (const char* const* it = subMenuItems; *it; it++) {
                     subCount++;
                     const char* subDisp = *it;
                     int stw = g->font ? font_measure(g->font, subDisp) : (int)strlen(subDisp) * 8;
@@ -3419,7 +3465,7 @@ static void gui_draw_dropdown(GuiState* g, int win_w, int win_h) {
                 
                 /* Draw submenu items */
                 for (int si = 0; si < subCount; si++) {
-                    const char* subDisp = exportSubMenuItems[si];
+                    const char* subDisp = subMenuItems[si];
                     int subRowY = subY + si * itemH;
                     
                     if (si == g->submenu_hover_item) {

@@ -20,6 +20,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\cad_export_3dg1.c" />
+    <ClCompile Include="src\cad_import_3dg1.c" />
+    <ClCompile Include="src\cad_import_obj.c" />
     <ClCompile Include="src\main.c" />
     <ClCompile Include="src\gui.c" />
     <ClCompile Include="src\render_gl.c" />
@@ -32,6 +34,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\cad_export_3dg1.h" />
+    <ClInclude Include="include\cad_import_3dg1.h" />
+    <ClInclude Include="include\cad_import_obj.h" />
     <ClInclude Include="include\dirent.h" />
     <ClInclude Include="include\GLFW\glfw3.h" />
     <ClInclude Include="include\GLFW\glfw3native.h" />
