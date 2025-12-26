@@ -10,11 +10,18 @@
 #include <stdint.h>
 
 /* ----------------------------------------------------------------------------
+   Minimum counts
+   ---------------------------------------------------------------------------- */
+#define CAD_MIN_FACE_POINTS    2    /* min face points */
+
+
+/* ----------------------------------------------------------------------------
    Maximum counts
    ---------------------------------------------------------------------------- */
 #define CAD_MAX_OBJECTS     256     /* max objects */
 #define CAD_MAX_POINTS     1024    /* max points */
 #define CAD_MAX_POLYGONS   1024    /* max polygons */
+#define CAD_MAX_FACE_POINTS 12      /* max face points */
 
 /* ----------------------------------------------------------------------------
    File format tags

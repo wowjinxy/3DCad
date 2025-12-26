@@ -171,7 +171,7 @@ int CadExport_OBJ(const CadCore* core, const char* filename) {
     /* Find all unique colors used in polygons */
     for (int i = 0; i < core->data.polygonCount && i < CAD_MAX_POLYGONS; i++) {
         const CadPolygon* poly = &core->data.polygons[i];
-        if (poly->flags == 0 || poly->npoints < 3) continue;
+        if (poly->flags == 0 || poly->npoints < CAD_MIN_FACE_POINTS) continue;
         
         uint8_t color_idx = poly->color;
         if (color_map[color_idx] == -1) {
@@ -202,7 +202,7 @@ int CadExport_OBJ(const CadCore* core, const char* filename) {
     
     for (int i = 0; i < core->data.polygonCount && i < CAD_MAX_POLYGONS; i++) {
         const CadPolygon* poly = &core->data.polygons[i];
-        if (poly->flags == 0 || poly->npoints < 3) continue;
+        if (poly->flags == 0 || poly->npoints < CAD_MIN_FACE_POINTS) continue;
         
         /* Set material if it changed */
         if (poly->color != current_material) {
@@ -229,8 +229,8 @@ int CadExport_OBJ(const CadCore* core, const char* filename) {
             if (point_count > 1000) break; /* Safety limit */
         }
         
-        /* Write face if we have at least 3 vertices */
-        if (point_count >= 3) {
+        /* Write face if we have at least 2 vertices */
+        if (point_count >= CAD_MIN_FACE_POINTS) {
             fprintf(fp_obj, "f");
             for (int j = 0; j < point_count; j++) {
                 fprintf(fp_obj, " %d", point_indices[j]);

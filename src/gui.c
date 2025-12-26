@@ -7,6 +7,7 @@
 #include "file_dialog.h"
 #include "cad_view.h"
 #include "cad_export_obj.h"
+#include "cad_export_3dg1.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -83,6 +84,11 @@ struct GuiState {
     int menu_count;
     int menu_open; /* index or -1 */
     int menu_hover_item; /* 0-based within open menu, -1 none */
+    
+    /* Submenu state */
+    int submenu_open; /* 1 if export submenu is open, 0 otherwise */
+    int submenu_hover_item; /* 0-based within submenu, -1 none */
+    Rect submenu_rect; /* Submenu position/size */
 
     /* Tool icons */
     RG_Texture* tool_icons[TOOL_COUNT];
@@ -149,14 +155,21 @@ static const char* fileMenuItems[] = {
     "(S)Save",
     " Save As...",
     " Import",
-    " Export",
+    " Export >",
     "-",
     " Load Color...",
-    " Load Pallet...",
+    " Load Palette...",
     " Animation",
     " Open Shape Folder...",
     "-",
     "(Q)Quit",
+    NULL
+};
+
+/* Export submenu */
+static const char* exportSubMenuItems[] = {
+    " .3dg1 (Fundoshi)",
+    " .obj (Wavefront)",
     NULL
 };
 
@@ -319,19 +332,7 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
     case 5: /* Import */
         fprintf(stdout, "Import (not implemented)\n");
         break;
-    case 6: /* Export */
-        {
-            char filename[260];
-            if (FileDialog_Save(filename, sizeof(filename), 
-                              "OBJ Files\0*.obj\0All Files\0*.*\0", 
-                              "Export OBJ")) {
-                if (CadExport_OBJ(g->cad, filename)) {
-                    fprintf(stdout, "Exported to: %s\n", filename);
-                } else {
-                    fprintf(stderr, "Error: Failed to export OBJ file\n");
-                }
-            }
-        }
+    case 6: /* Export - handled by submenu, do nothing here */
         break;
     case 8: /* Load Color... */
         fprintf(stdout, "Load Color (not implemented)\n");
@@ -611,6 +612,9 @@ GuiState* gui_create(void) {
     g->menu_count = 5;
     g->menu_open = -1;
     g->menu_hover_item = -1;
+    g->submenu_open = 0;
+    g->submenu_hover_item = -1;
+    g->submenu_rect = (Rect){0, 0, 0, 0};
 
     /* Initialize tool icons to NULL */
     for (int i = 0; i < TOOL_COUNT; i++) {
@@ -1335,7 +1339,8 @@ static void load_all_constants(const char* shapes_folder) {
 /* ========== End Constant Resolver ========== */
 
 /* Helper: Create a polygon with its own point chain (points are copied, not shared) */
-static int16_t create_polygon_with_points(CadCore* core, double vertices[][3], int vertex_indices[], int num_vertices, uint8_t color) {
+/* max_vertices: maximum valid vertex index (for bounds checking) */
+static int16_t create_polygon_with_points_safe(CadCore* core, double vertices[][3], int vertex_indices[], int num_vertices, uint8_t color, int max_vertices) {
     if (!core || num_vertices < 2 || num_vertices > 12) return INVALID_INDEX;
     
     /* Create new points for this polygon and link them */
@@ -1344,6 +1349,11 @@ static int16_t create_polygon_with_points(CadCore* core, double vertices[][3], i
     
     for (int i = 0; i < num_vertices; i++) {
         int v_idx = vertex_indices[i];
+        /* Bounds check to prevent crashes */
+        if (v_idx < 0 || v_idx >= max_vertices) {
+            fprintf(stderr, "create_polygon_with_points: vertex index %d out of bounds (max %d)\n", v_idx, max_vertices);
+            return INVALID_INDEX;
+        }
         int16_t new_pt = CadCore_AddPoint(core, vertices[v_idx][0], vertices[v_idx][1], vertices[v_idx][2]);
         if (new_pt == INVALID_INDEX) return INVALID_INDEX;
         
@@ -1680,10 +1690,11 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                 int vertex_count = 0;
                 int in_mirrored_section = 0;
 
-                /* First, parse local constants from the points section */
-                /* Local constants appear between the label and the first Points directive */
-                fprintf(stdout, "load_shape_from_asm: Scanning for local constants from line %d\n", points_start);
-                for (int i = points_start; i < line_count && i < points_start + 20; i++) {
+                /* First, parse local constants from between ShapeHdr and the first Points directive */
+                /* Local constants can appear BEFORE the points section label (e.g., d = 5 before Lcube_P) */
+                int const_scan_start = (shapehdr_line >= 0) ? shapehdr_line : (points_start > 10 ? points_start - 10 : 0);
+                fprintf(stdout, "load_shape_from_asm: Scanning for local constants from line %d to %d\n", const_scan_start, points_start + 20);
+                for (int i = const_scan_start; i < line_count && i < points_start + 20; i++) {
                     const char* line = lines[i];
                     
                     /* Check if we hit a Points directive - stop scanning for constants */
@@ -1858,6 +1869,8 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                         y /= 2;
                                         z /= 2;
                                     }
+                                    /* Negate Y to convert from SNES coordinate system (Y down) to OpenGL (Y up) */
+                                    y = -y;
                                     fprintf(stdout, "load_shape_from_asm: Parsed point: p%c%s %d,%d,%d (line %d)\n", 
                                             is_pw ? 'w' : 'b', divide_by_2 ? "d2" : "", x, y, z, i);
                                     if (in_mirrored_section) {
@@ -1898,7 +1911,7 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                 }
 
                 /* Note: We don't add vertices to CAD system here anymore.
-                   Points are created per-polygon by create_polygon_with_points() */
+                   Points are created per-polygon by create_polygon_with_points_safe() */
                 fprintf(stdout, "Loaded %d vertices for shape: %s\n", vertex_count, shape_name);
 
                 /* Parse faces - scan from faces_start until EndShape
@@ -2080,7 +2093,7 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     v1 >= 0 && v1 < vertex_count) {
                                     /* Create Face2 (line) with its own point chain */
                                     int line_verts[2] = { v0, v1 };
-                                    if (create_polygon_with_points(g->cad, vertices, line_verts, 2, color) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, line_verts, 2, color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -2142,7 +2155,7 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     v2 >= 0 && v2 < vertex_count) {
                                     /* Create Face3 (triangle) with its own point chain */
                                     int tri_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points(g->cad, vertices, tri_verts, 3, color) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri_verts, 3, color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -2207,12 +2220,12 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     /* Split quad into 2 triangles: v0,v1,v2 and v0,v2,v3 */
                                     /* Each triangle gets its own point chain */
                                     int tri1_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points(g->cad, vertices, tri1_verts, 3, color) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri1_verts, 3, color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                     
                                     int tri2_verts[3] = { v0, v2, v3 };
-                                    if (create_polygon_with_points(g->cad, vertices, tri2_verts, 3, color) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri2_verts, 3, color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -2283,17 +2296,17 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     /* Split pentagon into 3 triangles: v0,v1,v2, v0,v2,v3, and v0,v3,v4 */
                                     /* Each triangle gets its own point chain */
                                     int tri1_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points(g->cad, vertices, tri1_verts, 3, color) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri1_verts, 3, color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                     
                                     int tri2_verts[3] = { v0, v2, v3 };
-                                    if (create_polygon_with_points(g->cad, vertices, tri2_verts, 3, color) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri2_verts, 3, color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                     
                                     int tri3_verts[3] = { v0, v3, v4 };
-                                    if (create_polygon_with_points(g->cad, vertices, tri3_verts, 3, color) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri3_verts, 3, color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -3129,29 +3142,91 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             Rect drop = { x, MenuBarHeight(), dropW, count * itemH };
 
             /* Update hover state */
-            if (pt_in_rect(in->mouse_x, in->mouse_y, drop)) {
+            int in_main_menu = pt_in_rect(in->mouse_x, in->mouse_y, drop);
+            int in_submenu = g->submenu_open && pt_in_rect(in->mouse_x, in->mouse_y, g->submenu_rect);
+            
+            if (in_main_menu) {
                 int idx = (in->mouse_y - drop.y) / itemH;
                 if (idx >= 0 && idx < count) {
                     /* Map to actual item index (skip header, so +1) */
                     int actual_idx = idx + 1;
                     g->menu_hover_item = idx;
                     
+                    /* Close submenu if not hovering Export item */
+                    if (!(g->menu_open == 0 && idx == 5)) {
+                        g->submenu_open = 0;
+                        g->submenu_hover_item = -1;
+                    }
+                    
                     /* Handle click on dropdown item */
                     if (in->mouse_pressed && items[actual_idx]) {
                         const char* raw = items[actual_idx];
                         const char* disp = menu_display_text(raw);
                         if (!(disp[0] == '-' && disp[1] == '\0')) {
-                            /* Handle menu action */
-                            handle_menu_action(g, g->menu_open, actual_idx);
-                            g->menu_open = -1;
-                            g->menu_hover_item = -1;
+                            /* Don't close menu for Export item - submenu will handle it */
+                            if (g->menu_open == 0 && idx == 5) {
+                                /* Keep submenu open, don't trigger action */
+                            } else {
+                                /* Handle menu action */
+                                handle_menu_action(g, g->menu_open, actual_idx);
+                                g->menu_open = -1;
+                                g->menu_hover_item = -1;
+                                g->submenu_open = 0;
+                                g->submenu_hover_item = -1;
+                            }
                         }
                     }
                 } else {
                     g->menu_hover_item = -1;
                 }
+            } else if (in_submenu) {
+                /* Handle submenu hover and click */
+                int sidx = (in->mouse_y - g->submenu_rect.y) / itemH;
+                int subCount = 0;
+                for (const char* const* it = exportSubMenuItems; *it; it++) subCount++;
+                
+                if (sidx >= 0 && sidx < subCount) {
+                    g->submenu_hover_item = sidx;
+                    
+                    if (in->mouse_pressed) {
+                        /* Handle export submenu action */
+                        char filename[260];
+                        if (sidx == 0) {
+                            /* Export to .3dg1 */
+                            if (FileDialog_Save(filename, sizeof(filename), 
+                                              "3DG1 Files\0*.3dg1\0All Files\0*.*\0", 
+                                              "Export 3DG1")) {
+                                if (CadExport_3DG1(g->cad, filename)) {
+                                    fprintf(stdout, "Exported to: %s\n", filename);
+                                } else {
+                                    fprintf(stderr, "Error: Failed to export 3DG1 file\n");
+                                }
+                            }
+                        } else if (sidx == 1) {
+                            /* Export to .obj */
+                            if (FileDialog_Save(filename, sizeof(filename), 
+                                              "OBJ Files\0*.obj\0All Files\0*.*\0", 
+                                              "Export OBJ")) {
+                                if (CadExport_OBJ(g->cad, filename)) {
+                                    fprintf(stdout, "Exported to: %s\n", filename);
+                                } else {
+                                    fprintf(stderr, "Error: Failed to export OBJ file\n");
+                                }
+                            }
+                        }
+                        /* Close menus */
+                        g->menu_open = -1;
+                        g->menu_hover_item = -1;
+                        g->submenu_open = 0;
+                        g->submenu_hover_item = -1;
+                    }
+                } else {
+                    g->submenu_hover_item = -1;
+                }
             } else {
                 g->menu_hover_item = -1;
+                g->submenu_open = 0;
+                g->submenu_hover_item = -1;
                 /* Click outside dropdown (but not on menu bar) closes menu */
                 if (in->mouse_pressed) {
                     g->menu_open = -1;
@@ -3304,10 +3379,56 @@ static void gui_draw_dropdown(GuiState* g, int win_w, int win_h) {
 
                 if (i == g->menu_hover_item) {
                     rg_fill_rect(x + 1, rowY, w - 2, itemH, (RG_Color){210,210,210,255});
+                    
+                    /* Check if this is the Export item (index 5 = item 6 in file menu) and open submenu */
+                    if (g->menu_open == 0 && i == 5) {
+                        g->submenu_open = 1;
+                        g->submenu_rect.x = x + w - 2;
+                        g->submenu_rect.y = rowY;
+                    }
                 }
 
                 if (g->font) {
                     font_draw(g->font, x + 8, rowY + 3, disp, 0);
+                }
+            }
+            
+            /* Draw export submenu if open */
+            if (g->menu_open == 0 && g->submenu_open) {
+                int subX = g->submenu_rect.x;
+                int subY = g->submenu_rect.y;
+                
+                /* Calculate submenu dimensions */
+                int subCount = 0;
+                int subMaxW = 0;
+                for (const char* const* it = exportSubMenuItems; *it; it++) {
+                    subCount++;
+                    const char* subDisp = *it;
+                    int stw = g->font ? font_measure(g->font, subDisp) : (int)strlen(subDisp) * 8;
+                    if (stw > subMaxW) subMaxW = stw;
+                }
+                
+                int subW = subMaxW + 24;
+                int subH = subCount * itemH;
+                g->submenu_rect.w = subW;
+                g->submenu_rect.h = subH;
+                
+                /* Draw submenu background */
+                rg_fill_rect(subX, subY, subW, subH, (RG_Color){245,245,245,255});
+                rg_stroke_rect(subX, subY, subW, subH, (RG_Color){0,0,0,255});
+                
+                /* Draw submenu items */
+                for (int si = 0; si < subCount; si++) {
+                    const char* subDisp = exportSubMenuItems[si];
+                    int subRowY = subY + si * itemH;
+                    
+                    if (si == g->submenu_hover_item) {
+                        rg_fill_rect(subX + 1, subRowY, subW - 2, itemH, (RG_Color){210,210,210,255});
+                    }
+                    
+                    if (g->font) {
+                        font_draw(g->font, subX + 8, subRowY + 3, subDisp, 0);
+                    }
                 }
             }
         }

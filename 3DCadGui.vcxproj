@@ -19,6 +19,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\cad_export_3dg1.c" />
     <ClCompile Include="src\main.c" />
     <ClCompile Include="src\gui.c" />
     <ClCompile Include="src\render_gl.c" />
@@ -30,6 +31,7 @@
     <ClCompile Include="src\cad_export_obj.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\cad_export_3dg1.h" />
     <ClInclude Include="include\dirent.h" />
     <ClInclude Include="include\GLFW\glfw3.h" />
     <ClInclude Include="include\GLFW\glfw3native.h" />
@@ -41,6 +43,7 @@
     <ClInclude Include="include\file_dialog.h" />
     <ClInclude Include="include\cad_view.h" />
     <ClInclude Include="include\cad_export_obj.h" />
+    <ClInclude Include="include\stb_image.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
