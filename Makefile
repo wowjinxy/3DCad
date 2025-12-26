@@ -12,7 +12,7 @@ CFLAGS = -std=c11 -O2 -Wall -Iinclude
 LDFLAGS = -L$(LIBDIR)
 # GLFW needs to be linked with GDI32 on MSYS2
 # Passing --static so MSYS2 DLLs don't need to be included with the binary
-LIBS = -lglfw3 -lopengl32 -lcomdlg32 -lgdi32 --static
+LIBS = -lglfw3 -lopengl32 -lcomdlg32 -lgdi32 -lole32 -luuid -lshell32 --static
 
 SRCS = $(wildcard src/*.c)
 OBJDIR = build/$(PLATFORM)
