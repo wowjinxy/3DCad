@@ -345,7 +345,7 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
     case 8: /* Load Color... */
         fprintf(stdout, "Load Color (not implemented)\n");
         break;
-    case 9: /* Load Pallet... */
+    case 9: /* Load Palette... */
         fprintf(stdout, "Load Palette (not implemented)\n");
         break;
     case 10: /* Animation */
@@ -1877,8 +1877,10 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                         y /= 2;
                                         z /= 2;
                                     }
-                                    /* Negate Y to convert from SNES coordinate system (Y down) to OpenGL (Y up) */
+                                    /* Negate Y to convert from Star Fox coordinate system (Y down) to OpenGL (Y up) */
                                     y = -y;
+                                    /* Invert X to convert from Star Fox coordinate system to OpenGL */
+                                    x = -x;
                                     fprintf(stdout, "load_shape_from_asm: Parsed point: p%c%s %d,%d,%d (line %d)\n", 
                                             is_pw ? 'w' : 'b', divide_by_2 ? "d2" : "", x, y, z, i);
                                     if (in_mirrored_section) {
