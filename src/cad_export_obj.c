@@ -186,7 +186,7 @@ int CadExport_OBJ(const CadCore* core, const char* filename) {
         float r, g, b;
         color_index_to_rgb(color_idx, &r, &g, &b);
         
-        fprintf(fp_mtl, "newmtl material_%d\n", color_idx);
+        fprintf(fp_mtl, "newmtl FX%d\n", color_idx);
         fprintf(fp_mtl, "Ka %.3f %.3f %.3f\n", r * 0.2f, g * 0.2f, b * 0.2f); /* Ambient */
         fprintf(fp_mtl, "Kd %.3f %.3f %.3f\n", r, g, b); /* Diffuse */
         fprintf(fp_mtl, "Ks %.3f %.3f %.3f\n", 0.5f, 0.5f, 0.5f); /* Specular */
@@ -207,7 +207,7 @@ int CadExport_OBJ(const CadCore* core, const char* filename) {
         /* Set material if it changed */
         if (poly->color != current_material) {
             current_material = poly->color;
-            fprintf(fp_obj, "usemtl material_%d\n", current_material);
+            fprintf(fp_obj, "usemtl FX%d\n", current_material);
         }
         
         /* Collect polygon vertices */
