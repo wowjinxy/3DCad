@@ -8,7 +8,7 @@
 | `3DGI` animation text | Yes | Yes | Same recovered grammar with alternate header |
 | 3DG1 | Yes | Yes | Preserves 2–16-point faces |
 | Wavefront OBJ | Yes | Yes | Negative indices and two-point line export supported |
-| ASM shape libraries | Yes | No | Search/preview followed by explicit document Replace |
+| ASM shape libraries | Yes | No | Search/preview followed by explicit Replace; recovered `CLIP_PLANE` directives become static colored normal guides |
 | `.COL` / `.PAL` | Yes | No | Indexed BGR555 preview data |
 | SF2 Transfer | No | No | Deferred until deterministic game export is recovered |
 
@@ -19,5 +19,6 @@ atomic replacement.
 
 The optional corpus harnesses validate 500 recovered CAD files (475 X11 and 25
 legacy), 379 recovered ANM files (358 `3DAN` and 21 `3DGI`), and an ASM catalog
-of 445 entries (443 decoded and two explicitly unsupported clipping-plane
-helpers). Recovered assets remain external to the repository.
+of 445 decoded entries. The two clipping-plane helpers preserve their endpoints
+and plane-slot colors as static guides, not executable runtime clipping state.
+Recovered assets remain external to the repository.

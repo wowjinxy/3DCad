@@ -140,6 +140,23 @@ static const char kDifferentMlaserShape[] =
     "  Face4 1,0,0,1,0,0,1,2,5\n"
     "  EndShape\n";
 
+/* Clean-room fixture for the recovered seven-argument CLIP_PLANE macro.  The
+   importer intentionally represents its runtime plane slots as finite static
+   normal guides rather than trying to emulate the game clipping system. */
+static const char kClipPlaneConstants[] =
+    "guide_slot equ 19\n";
+
+static const char kClipPlaneShape[] =
+    "ClipGuide_P\n"
+    "  Pointsb 1\n"
+    "  pb 0,0,0\n"
+    "  EndPoints\n"
+    "ClipGuide_F\n"
+    "  Faces\n"
+    "  CLIP_PLANE guide_slot,1,-2,3,4,5,-6\n"
+    "  clip_plane 42,-10,20,-30,10,-20,30\n"
+    "  EndShape\n";
+
 static CadAsmTextSource text_source(const char* name, const char* text) {
     CadAsmTextSource source;
     source.name = name;
@@ -371,6 +388,163 @@ static int test_mlaser_requires_recovered_signature(void) {
     return 1;
 }
 
+static int test_clip_plane_static_guides(void) {
+    CadAsmTextSource source = text_source("clip_guides.asm",
+                                          kClipPlaneShape);
+    CadAsmTextSource constants = text_source("clip_constants.inc",
+                                             kClipPlaneConstants);
+    CadAsmImportOptions options = CadImportAsm_DefaultOptions();
+    CadFileData* output = (CadFileData*)malloc(sizeof(*output));
+    CadAsmImportInfo info;
+    CadResult result;
+    size_t diagnostic;
+    int foundGuideWarning = 0;
+    CHECK(output);
+
+    memset(&info, 0, sizeof(info));
+    result = CadImportAsm_DecodeShape(&source, 1, &constants, 1,
+                                      "clipguide", NULL, output, &info);
+    report_failure(&result);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(result.warningCount == 1);
+    for (diagnostic = 0; diagnostic < result.diagnosticCount; ++diagnostic) {
+        if (result.diagnostics[diagnostic].severity ==
+                CAD_DIAGNOSTIC_WARNING &&
+            strstr(result.diagnostics[diagnostic].message,
+                   "static colored two-point guides") != NULL) {
+            CHECK(result.diagnostics[diagnostic].recordIndex == 7);
+            foundGuideWarning = 1;
+        }
+    }
+    CHECK(foundGuideWarning);
+    CHECK(info.sourcePointCount == 1);
+    CHECK(info.polygonCount == 2);
+    CHECK(info.generatedPointCount == 4);
+    CHECK(output->objectCount == 1);
+    CHECK(output->objects[0].firstPolygon == 0);
+    CHECK(output->polygonCount == 2);
+    CHECK(output->pointCount == 4);
+    CHECK(output->polygons[0].flags == 1);
+    CHECK(output->polygons[0].nextPolygon == 1);
+    CHECK(output->polygons[1].nextPolygon == -1);
+    CHECK(output->polygons[0].npoints == 2);
+    CHECK(output->polygons[1].npoints == 2);
+    CHECK(output->polygons[0].color == 19);
+    CHECK(output->polygons[1].color == 42);
+    CHECK(output->polygons[0].side == 0);
+    CHECK(output->polygons[0].animation == -1);
+    CHECK(output->polygons[0].both == -1);
+    CHECK(output->points[0].flags == 2);
+    CHECK(output->points[0].nextPoint == 1);
+    CHECK(output->points[1].nextPoint == -1);
+    CHECK(output->points[2].nextPoint == 3);
+    CHECK(output->points[3].nextPoint == -1);
+    CHECK(output->points[0].pointx == 1.0);
+    CHECK(output->points[0].pointy == 2.0);
+    CHECK(output->points[0].pointz == 3.0);
+    CHECK(output->points[1].pointx == 4.0);
+    CHECK(output->points[1].pointy == -5.0);
+    CHECK(output->points[1].pointz == -6.0);
+    CHECK(output->points[2].pointx == -10.0);
+    CHECK(output->points[2].pointy == -20.0);
+    CHECK(output->points[3].pointx == 10.0);
+    CHECK(output->points[3].pointy == 20.0);
+    result = CadCodec_Validate(output);
+    CHECK(CadResult_IsSuccess(&result));
+
+    options.invertY = 0;
+    result = CadImportAsm_DecodeShape(&source, 1, &constants, 1,
+                                      "ClipGuide", &options, output, NULL);
+    report_failure(&result);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(result.warningCount == 1);
+    CHECK(output->points[0].pointy == -2.0);
+    CHECK(output->points[1].pointy == 5.0);
+    CHECK(output->points[2].pointy == 20.0);
+    CHECK(output->points[3].pointy == -20.0);
+
+    free(output);
+    return 1;
+}
+
+static int test_clip_plane_errors_are_transactional(void) {
+    static const char* const invalidShapes[] = {
+        "BrokenClip_P\nPointsb 1\npb 0,0,0\nEndPoints\n"
+        "BrokenClip_F\nFaces\nCLIP_PLANE 1,0,0,0,1,0\nEndShape\n",
+        "BrokenClip_P\nPointsb 1\npb 0,0,0\nEndPoints\n"
+        "BrokenClip_F\nFaces\nCLIP_PLANE 256,0,0,0,1,0,0\nEndShape\n",
+        "BrokenClip_P\nPointsb 1\npb 0,0,0\nEndPoints\n"
+        "BrokenClip_F\nFaces\nCLIP_PLANE 1,0,0,0,32768,0,0\nEndShape\n",
+        "BrokenClip_P\nPointsb 1\npb 0,0,0\nEndPoints\n"
+        "BrokenClip_F\nFaces\nCLIP_PLANE 1,2,3,4,2,3,4\nEndShape\n"
+    };
+    static const CadStatus expectedStatuses[] = {
+        CAD_STATUS_INVALID_NUMBER,
+        CAD_STATUS_INDEX_OUT_OF_RANGE,
+        CAD_STATUS_INDEX_OUT_OF_RANGE,
+        CAD_STATUS_INVALID_TOPOLOGY
+    };
+    const size_t capacity = 65536;
+    char* capacityText = (char*)malloc(capacity);
+    CadFileData* output = (CadFileData*)malloc(sizeof(*output));
+    CadFileData* before = (CadFileData*)malloc(sizeof(*before));
+    CadAsmImportInfo info;
+    CadAsmImportInfo infoBefore;
+    CadAsmTextSource source;
+    CadResult result;
+    size_t caseIndex;
+    size_t used = 0;
+    int plane;
+    CHECK(capacityText && output && before);
+
+    memset(output, 0x96, sizeof(*output));
+    *before = *output;
+    memset(&info, 0x69, sizeof(info));
+    infoBefore = info;
+    for (caseIndex = 0;
+         caseIndex < sizeof(invalidShapes) / sizeof(invalidShapes[0]);
+         ++caseIndex) {
+        source = text_source("invalid_clip.asm", invalidShapes[caseIndex]);
+        result = CadImportAsm_DecodeShape(&source, 1, NULL, 0,
+                                          "BrokenClip", NULL,
+                                          output, &info);
+        CHECK(!CadResult_IsSuccess(&result));
+        CHECK(result.status == expectedStatuses[caseIndex]);
+        CHECK(result.warningCount == 0);
+        CHECK(result.diagnosticCount > 0);
+        CHECK(memcmp(output, before, sizeof(*output)) == 0);
+        CHECK(memcmp(&info, &infoBefore, sizeof(info)) == 0);
+    }
+
+    used += (size_t)snprintf(
+        capacityText + used, capacity - used,
+        "FullClip_P\nPointsb 1\npb 0,0,0\nEndPoints\n"
+        "FullClip_F\nFaces\n");
+    for (plane = 0; plane < 513; ++plane) {
+        used += (size_t)snprintf(capacityText + used, capacity - used,
+                                "CLIP_PLANE 1,0,0,0,1,0,0\n");
+        CHECK(used < capacity);
+    }
+    used += (size_t)snprintf(capacityText + used, capacity - used,
+                             "EndShape\n");
+    CHECK(used < capacity);
+    source.name = "full_clip.asm";
+    source.bytes = (const uint8_t*)capacityText;
+    source.size = used;
+    result = CadImportAsm_DecodeShape(&source, 1, NULL, 0,
+                                      "FullClip", NULL, output, &info);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(result.status == CAD_STATUS_INDEX_OUT_OF_RANGE);
+    CHECK(result.warningCount == 0);
+    CHECK(memcmp(output, before, sizeof(*output)) == 0);
+    CHECK(memcmp(&info, &infoBefore, sizeof(info)) == 0);
+
+    free(before);
+    free(output);
+    free(capacityText);
+    return 1;
+}
+
 static int test_transactional_errors(void) {
     static const char invalidShape[] =
         "Bad_P\n"
@@ -554,6 +728,8 @@ int main(int argc, char** argv) {
     RUN(test_mlaser_static_preview);
     RUN(test_mlaser_malformed_first_frame_is_transactional);
     RUN(test_mlaser_requires_recovered_signature);
+    RUN(test_clip_plane_static_guides);
+    RUN(test_clip_plane_errors_are_transactional);
     RUN(test_transactional_errors);
     RUN(test_native_capacity_failure);
 #undef RUN

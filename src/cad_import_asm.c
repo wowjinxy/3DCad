@@ -1173,6 +1173,91 @@ static int append_face(CadFileData* data, const AsmVertex* vertices,
     return 1;
 }
 
+static int append_clip_plane(CadFileData* data, const int* arguments,
+                             int invertY, const AsmLine* line,
+                             CadResult* result) {
+    CadPolygon* polygon;
+    CadPoint* firstPoint;
+    CadPoint* secondPoint;
+    int polygonIndex;
+    int pointIndex;
+    int coordinate;
+    int color = arguments[0];
+    if (color < 0 || color > 255) {
+        asm_add_diagnostic(result, CAD_DIAGNOSTIC_ERROR,
+                           CAD_STATUS_INDEX_OUT_OF_RANGE,
+                           line->byteOffset, line->lineNumber,
+                           "ASM clip-plane slot %d is outside 0..255",
+                           color);
+        return 0;
+    }
+    /* The recovered CLIP_PLANE macro stores each endpoint coordinate in a
+       signed word.  Keep this constrained preview path faithful to that
+       representation instead of silently accepting values the macro cannot
+       encode. */
+    for (coordinate = 1; coordinate < 7; ++coordinate) {
+        if (arguments[coordinate] < INT16_MIN ||
+            arguments[coordinate] > INT16_MAX) {
+            asm_add_diagnostic(result, CAD_DIAGNOSTIC_ERROR,
+                               CAD_STATUS_INDEX_OUT_OF_RANGE,
+                               line->byteOffset, line->lineNumber,
+                               "ASM clip-plane coordinate %d is outside the signed 16-bit range",
+                               arguments[coordinate]);
+            return 0;
+        }
+    }
+    if (arguments[1] == arguments[4] &&
+        arguments[2] == arguments[5] &&
+        arguments[3] == arguments[6]) {
+        asm_add_diagnostic(result, CAD_DIAGNOSTIC_ERROR,
+                           CAD_STATUS_INVALID_TOPOLOGY,
+                           line->byteOffset, line->lineNumber,
+                           "ASM clip-plane endpoints must define a non-zero normal");
+        return 0;
+    }
+    if (data->polygonCount >= CAD_MAX_POLYGONS ||
+        data->pointCount + 2 > CAD_MAX_POINTS) {
+        asm_add_diagnostic(result, CAD_DIAGNOSTIC_ERROR,
+                           CAD_STATUS_INDEX_OUT_OF_RANGE,
+                           line->byteOffset, line->lineNumber,
+                           "ASM shape exceeds native polygon/point capacity");
+        return 0;
+    }
+
+    polygonIndex = data->polygonCount++;
+    pointIndex = data->pointCount;
+    polygon = &data->polygons[polygonIndex];
+    polygon->flags = 1;
+    polygon->selectFlag = 0;
+    polygon->nextPolygon = -1;
+    polygon->firstPoint = (int16_t)pointIndex;
+    polygon->animation = -1;
+    polygon->both = -1;
+    polygon->side = 0;
+    polygon->color = (uint8_t)color;
+    polygon->npoints = 2;
+    if (polygonIndex > 0)
+        data->polygons[polygonIndex - 1].nextPolygon = (int16_t)polygonIndex;
+
+    firstPoint = &data->points[pointIndex];
+    firstPoint->flags = 2;
+    firstPoint->selectFlag = 0;
+    firstPoint->nextPoint = (int16_t)(pointIndex + 1);
+    firstPoint->pointx = arguments[1];
+    firstPoint->pointy = invertY ? -arguments[2] : arguments[2];
+    firstPoint->pointz = arguments[3];
+
+    secondPoint = &data->points[pointIndex + 1];
+    secondPoint->flags = 2;
+    secondPoint->selectFlag = 0;
+    secondPoint->nextPoint = -1;
+    secondPoint->pointx = arguments[4];
+    secondPoint->pointy = invertY ? -arguments[5] : arguments[5];
+    secondPoint->pointz = arguments[6];
+    data->pointCount += 2;
+    return 1;
+}
+
 static int parse_face_directive(const char* line, const char** arguments,
                                 int* facePointCount) {
     const char* cursor = line;
@@ -1209,18 +1294,38 @@ static int parse_face_directive(const char* line, const char** arguments,
 static int parse_faces(const AsmSourceView* source, size_t faceStart,
                        const AsmConstantTable* constants,
                        const AsmVertex* vertices, size_t vertexCount,
-                       CadFileData* output, CadResult* result) {
+                       int invertY, CadFileData* output,
+                       CadResult* result) {
     size_t lineIndex;
+    const AsmLine* firstClipPlane = NULL;
+    size_t clipPlaneCount = 0;
     int foundEnd = 0;
     for (lineIndex = faceStart; lineIndex < source->lineCount; ++lineIndex) {
         const AsmLine* line = &source->lines[lineIndex];
         const char* argumentText = NULL;
+        const char* clipPlane = NULL;
         int facePointCount = 0;
         int status;
         int arguments[5 + CAD_MAX_FACE_POINTS];
         if (line_has_word(line->text, "EndShape")) {
             foundEnd = 1;
             break;
+        }
+        clipPlane = find_directive(line->text, "CLIP_PLANE");
+        if (clipPlane) {
+            if (!parse_csv_integers(clipPlane + strlen("CLIP_PLANE"),
+                                    constants, arguments, 7)) {
+                asm_add_diagnostic(result, CAD_DIAGNOSTIC_ERROR,
+                                   CAD_STATUS_INVALID_NUMBER,
+                                   line->byteOffset, line->lineNumber,
+                                   "Malformed or unresolved CLIP_PLANE directive");
+                return 0;
+            }
+            if (!append_clip_plane(output, arguments, invertY,
+                                   line, result)) return 0;
+            if (!firstClipPlane) firstClipPlane = line;
+            ++clipPlaneCount;
+            continue;
         }
         status = parse_face_directive(line->text, &argumentText,
                                       &facePointCount);
@@ -1257,7 +1362,7 @@ static int parse_faces(const AsmSourceView* source, size_t faceStart,
                            CAD_STATUS_INVALID_TOPOLOGY,
                            source->lines[faceStart].byteOffset,
                            source->lines[faceStart].lineNumber,
-                           "ASM shape contains no supported Face2..Face16 directives");
+                           "ASM shape contains no supported Face2..Face16 or CLIP_PLANE directives");
         return 0;
     }
     output->objects[0].flags = 1;
@@ -1267,6 +1372,13 @@ static int parse_faces(const AsmSourceView* source, size_t faceStart,
     output->objects[0].childObject = -1;
     output->objects[0].firstPolygon = 0;
     output->objectCount = 1;
+    if (clipPlaneCount) {
+        asm_add_diagnostic(
+            result, CAD_DIAGNOSTIC_WARNING, CAD_STATUS_OK,
+            firstClipPlane->byteOffset, firstClipPlane->lineNumber,
+            "Represented %u runtime CLIP_PLANE slot%s as static colored two-point guides; plane-slot behavior is not preserved",
+            (unsigned)clipPlaneCount, clipPlaneCount == 1 ? "" : "s");
+    }
     return 1;
 }
 
@@ -1396,7 +1508,8 @@ CadResult CadImportAsm_DecodeCatalogShape(
     }
     if (pointsParsed < 0 || !pointsParsed ||
         !parse_faces(&source, faceStart, &constants, vertices,
-                     candidateInfo.sourcePointCount, candidate, &result)) {
+                     candidateInfo.sourcePointCount, options->invertY != 0,
+                     candidate, &result)) {
         if (macroGeneratedPoints &&
             (result.status == CAD_STATUS_INDEX_OUT_OF_RANGE ||
              result.status == CAD_STATUS_INVALID_NUMBER ||

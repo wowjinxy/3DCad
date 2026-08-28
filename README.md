@@ -29,7 +29,8 @@ baseline.
   undo/redo with an entire drag stored as one operation.
 - Transactional OBJ, 3DG1, ANM, and ASM-shape workflows. OBJ supports negative
   indices and exports two-point faces as lines; 3DG1 preserves 2–16 point faces
-  without repeated round-trip growth.
+  without repeated round-trip growth. Recovered `CLIP_PLANE` helpers preview as
+  colored two-point normal guides with an explicit runtime-semantics warning.
 - Historical `.COL` and `.PAL` loading, full 0–255 polygon color indices, and a
   BGR555 palette preview. `.COL` consumes the historical first 0x200 bytes and
   tolerates trailing data; `.PAL` uses the exact recovered 0x8200-byte layout.
@@ -155,8 +156,9 @@ second encodings without committing recovered assets.
 `ThreeDCadAsmImportTests --corpus <shape files...> --constants <include
 files...>` audits recovered ASM catalogs. Set `THREEDCAD_EXPECT_ASM_TOTAL`,
 `THREEDCAD_EXPECT_ASM_DECODED`, and `THREEDCAD_EXPECT_ASM_UNSUPPORTED` to make
-the census exact. The current SF2 catalog resolves 445 entries: 443 decode and
-the two clipping-plane helpers remain classified explicitly as unsupported.
+the census exact. The current SF2 catalog resolves and decodes all 445 entries.
+The two recovered clipping-plane helpers are represented as static colored
+normal guides rather than emulating the game runtime's plane-slot behavior.
 
 ## Core API
 
