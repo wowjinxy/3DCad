@@ -54,8 +54,13 @@ jobs:
           --output-on-failure
 
   linux-core:
-    name: Linux core, tools, and tests
+    name: Linux Clang ASan/UBSan core, tools, and tests
     runs-on: ubuntu-latest
+
+    env:
+      CC: clang
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
 
     steps:
       - name: Check out sources
@@ -67,6 +72,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DTHREEDCAD_BUILD_GUI=OFF
           -DTHREEDCAD_BUILD_TOOLS=ON
+          -DTHREEDCAD_ENABLE_SANITIZERS=ON
           -DBUILD_TESTING=ON
 
       - name: Build

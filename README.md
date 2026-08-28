@@ -27,7 +27,7 @@ baseline.
 - Transactional New/Open/Import/Replace/Quit flows, Save/Discard/Cancel prompts,
   atomic native saves, UTF-8 paths, dirty document titles, and 64-state
   undo/redo with an entire drag stored as one operation.
-- Transactional OBJ, 3DG1, and ASM-shape workflows. OBJ supports negative
+- Transactional OBJ, 3DG1, ANM, and ASM-shape workflows. OBJ supports negative
   indices and exports two-point faces as lines; 3DG1 preserves 2–16 point faces
   without repeated round-trip growth.
 - Historical `.COL` and `.PAL` loading, full 0–255 polygon color indices, and a
@@ -45,14 +45,25 @@ represent animation or paired-side metadata, it is opened as an unnamed dirty
 conversion and Save As writes the later compatible stream. The original source
 is never silently overwritten.
 
-Animation tags 3/4 embedded in native X11 CAD streams are preserved and
-round-trip even though the full animation editor is deferred. Coordinate
-transforms propagate to corresponding frame points. Topology-changing tools
-require creating a confirmed static copy. The separate historical `3DAN` and
-`3DGI` `.anm` project formats are not opened by this static-editor release.
+Animation tags 3/4 embedded in native X11 CAD streams are preserved and edited
+in place. An unchanged native document is saved from its retained, validated
+source bytes so record ordering and uninterpreted recovered bytes remain exact;
+the fixed-offset encoder takes over after a model edit. The compact timeline
+supports 1–64 fixed-topology morph frames,
+creation for all or selected faces, frame insertion/duplication/deletion,
+whole-pose and selected-point copies, current/all-frame transforms, scrubbing,
+12 FPS playback, looping, and display-only interpolation. An exact displayed
+pose—including an interpolated pose—can be baked into an unnamed static copy.
 
-See [docs/FILE_FORMATS.md](docs/FILE_FORMATS.md) for the recovered layouts and
-validation rules.
+Standalone `3DAN` and `3DGI` `.anm` files import transactionally as unnamed
+native documents and export deterministically with the recovered rounding and
+DOS-EOF behavior. ANM input paths are never reused as native save paths.
+Topology-changing tools remain disabled while animation is attached, with the
+reason exposed by the shared editor controller.
+
+See [docs/FILE_FORMATS.md](docs/FILE_FORMATS.md) for recovered layouts,
+[docs/ANIMATION.md](docs/ANIMATION.md) for the authoring workflow, and
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the compatibility matrix.
 
 ## Requirements
 
@@ -100,13 +111,19 @@ ctest --test-dir build/core --output-on-failure
 - 3D middle-drag or wheel: zoom; right-drag: pan
 - Point tool: click one orthographic view, then a compatible second view to
   supply the hidden coordinate
+- Face tool: click vertices in order; Backspace removes the last, Enter closes,
+  and Escape cancels
+- `F`: frame the active selection; Home frames the complete document
+- Timeline: scrub the zero-based strip, use Play/Pause/Stop and frame controls,
+  and toggle interpolation, looping, or All Frames
 
 ## Tests and recovered corpus
 
-CTest covers codecs, topology repair, animation round trips, history,
-transactional failures, OBJ/3DG1 behavior, view projection, and hit testing.
-GitHub Actions runs Windows Debug/Release GUI builds and a portable GUI-off
-Linux core/tools build.
+CTest covers codecs, topology repair, animation lifecycle and playback,
+named/composite history, transactional failures, ANM/OBJ/3DG1 behavior,
+platform filesystem failures, view projection, and hit testing. GitHub Actions
+runs Windows Debug/Release GUI builds and a portable GUI-off Linux Clang build
+under AddressSanitizer and UndefinedBehaviorSanitizer.
 
 Recovered assets are not copied into this repository. To enable the optional
 external corpus test, configure with the directory containing the recovered
@@ -121,15 +138,39 @@ cmake -S . -B build\x64 `
 The current recovery corpus contains 500 files: 475 later X11 streams and 25
 legacy packed streams. All are expected to decode and validate.
 
+The optional standalone animation corpus is configured separately:
+
+```powershell
+cmake -S . -B build\x64 `
+  -DTHREEDCAD_ANM_CORPUS="D:\recovered\animations" `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+```
+
+The recovered ANM corpus contains 379 files: 358 `3DAN` and 21 `3DGI`. The
+harness checks native validation, semantic round trips, and deterministic
+second encodings without committing recovered assets.
+
+`ThreeDCadAsmImportTests --corpus <shape files...> --constants <include
+files...>` audits recovered ASM catalogs. Set `THREEDCAD_EXPECT_ASM_TOTAL`,
+`THREEDCAD_EXPECT_ASM_DECODED`, and `THREEDCAD_EXPECT_ASM_UNSUPPORTED` to make
+the census exact. The current SF2 catalog resolves 445 entries: 442 decode and
+the three known unsupported entries remain classified explicitly.
+
 ## Core API
 
 `ThreeDCadCore` is independent of SDL and Win32 GUI code. `CadDocument` owns
-model state, paths, dirty tracking, palette data, and the 64-entry undo/redo
-history. `CadCodec_Decode`, `CadCodec_Encode`, and `CadCodec_Validate` operate
-on caller-provided buffers and return `CadResult` with structured diagnostics.
-All editor input paths share the `EditorTool_Begin` / `Update` / `Commit` /
-`Cancel` transaction lifecycle, so one gesture produces one validated history
-entry or rolls back completely.
+model state, paths, dirty tracking, palette data, and the 64-entry named
+undo/redo history. `CadCodec_*` and `CadAnmCodec_*` operate on caller-provided
+buffers and return `CadResult` with structured diagnostics; bounded UTF-8 file
+access and atomic replacement live in platform services. `EditorController`
+provides one capability/disabled-reason source and the shared begin/update/
+commit/cancel mutation boundary. Invalid geometry rolls back without changing
+history, revision, or dirty state.
+
+`CadAnimation_*`, `CadPose`, `CadScene`, and `CadAnimationSession` provide the
+fixed-topology authoring and allocation-free playback path. Stable static point
+IDs map to frame points by face-chain ordinal, and one immutable posed scene is
+shared by rendering, picking, and coordinate display each GUI iteration.
 
 ## Command-line converter
 
@@ -143,8 +184,7 @@ Disable it with `-DTHREEDCAD_BUILD_TOOLS=OFF`.
 
 ## Deferred historical systems
 
-Standalone `3DAN`/`3DGI` `.anm` import/export, full 64-frame animation
-authoring, deterministic SF2 Transfer/export, floppy mounting, XWD printing,
-and NEWS printer-port transport are intentionally not part of this
-static-editor release. Dormant Object/Group/Extrude/Spin menus are also not
-exposed.
+Advanced onion skinning, range editing, ping-pong playback, per-frame timing,
+bones/curves, and animated topology/colors remain out of scope. Deterministic
+SF2 Transfer/export, floppy mounting, XWD printing, NEWS printer-port transport,
+and dormant Object/Group/Extrude/Spin authoring are also deferred.
