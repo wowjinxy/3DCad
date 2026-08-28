@@ -49,6 +49,97 @@ static const char kZuluShape[] =
     "Face2 1,0,0,0,1,0,1\n"
     "EndShape\n";
 
+/* Clean-room fixture for the recovered local mlaser convention.  The values,
+   names, topology, and frame count are deliberately synthetic. */
+static const char kMlaserShape[] =
+    "mlaser macro nose,middle,tail,half_width\n"
+    "  Pointsb 6\n"
+    "  pb 0,0,\\3\n"
+    "  pb -\\4,0,\\2\n"
+    "  pb 0,0,\\1\n"
+    "  pb \\4,0,\\2\n"
+    "  pb 0,-2,\\2\n"
+    "  pb 0,2,\\2\n"
+    "  EndPoints\n"
+    "  endm\n"
+    "Pulse ShapeHdr Pulse_P,0,Pulse_F,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,<Pulse>\n"
+    "Pulse_P\n"
+    "  DataHdr\n"
+    "  Frames 2\n"
+    "  JumpTab .pose1\n"
+    "  JumpTab .pose0\n"
+    ".pose0 mlaser 99,88,77,6\n"
+    ".pose1 mlaser 12,-7,-33,5\n"
+    "Pulse_F\n"
+    "  Faces\n"
+    "  Face4 12,0,0,1,0,0,1,2,3\n"
+    "  Face4 13,0,1,0,0,0,4,2,5\n"
+    "  EndShape\n";
+
+static const char kMalformedMlaserShape[] =
+    "mlaser macro nose,middle,tail,half_width\n"
+    "  Pointsb 6\n"
+    "  pb 0,0,\\3\n"
+    "  pb -\\4,0,\\2\n"
+    "  pb 0,0,\\1\n"
+    "  pb \\4,0,\\2\n"
+    "  pb 0,-2,\\2\n"
+    "  pb 0,2,\\2\n"
+    "  EndPoints\n"
+    "  endm\n"
+    "Broken ShapeHdr Broken_P,0,Broken_F,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,<Broken>\n"
+    "Broken_P\n"
+    "  DataHdr\n"
+    "  Frames 2\n"
+    "  JumpTab .pose0\n"
+    "  JumpTab .pose1\n"
+    ".pose0 mlaser 1,2,3\n"
+    ".pose1 mlaser 4,5,6,7\n"
+    "Broken_F\n"
+    "  Faces\n"
+    "  Face4 1,0,0,1,0,0,1,2,3\n"
+    "  EndShape\n";
+
+static const char kDifferentMlaserShape[] =
+    /* A later redefinition controls the invocation and must win. */
+    "mlaser macro nose,middle,tail,half_width\n"
+    "  Pointsb 6\n"
+    "  pb 0,0,\\3\n"
+    "  pb -\\4,0,\\2\n"
+    "  pb 0,0,\\1\n"
+    "  pb \\4,0,\\2\n"
+    "  pb 0,-2,\\2\n"
+    "  pb 0,2,\\2\n"
+    "  EndPoints\n"
+    "  endm\n"
+    "mlaser macro nose,middle,tail,half_width\n"
+    "  Pointsb 6\n"
+    "  pb 1,0,\\3\n" /* Deliberately differs from the recovered macro. */
+    "  pb -\\4,0,\\2\n"
+    "  pb 0,0,\\1\n"
+    "  pb \\4,0,\\2\n"
+    "  pb 0,-2,\\2\n"
+    "  pb 0,2,\\2\n"
+    "  EndPoints\n"
+    "  endm\n"
+    "Mismatch ShapeHdr Mismatch_P,0,Mismatch_F,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,<Mismatch>\n"
+    "Mismatch_P\n"
+    "  DataHdr\n"
+    "  Frames 1\n"
+    "  JumpTab .pose0\n"
+    ".pose0 mlaser 1,2,3,4\n"
+    "Mismatch_static\n"
+    "  Pointsb 4\n"
+    "  pb 0,0,0\n"
+    "  pb 1,0,0\n"
+    "  pb 0,1,0\n"
+    "  pb 0,0,1\n"
+    "  EndPoints\n"
+    "Mismatch_F\n"
+    "  Faces\n"
+    "  Face4 1,0,0,1,0,0,1,2,5\n"
+    "  EndShape\n";
+
 static CadAsmTextSource text_source(const char* name, const char* text) {
     CadAsmTextSource source;
     source.name = name;
@@ -182,6 +273,101 @@ static int test_options_and_core_wrapper(void) {
     CHECK(core->selection.polygonCount == 0);
     CHECK(core->isDirty == 1);
     free(core);
+    return 1;
+}
+
+static int test_mlaser_static_preview(void) {
+    CadAsmTextSource source = text_source("synthetic_laser.asm", kMlaserShape);
+    CadFileData* output = (CadFileData*)malloc(sizeof(*output));
+    CadAsmImportInfo info;
+    CadResult result;
+    size_t diagnostic;
+    int foundPreviewWarning = 0;
+    CHECK(output);
+
+    memset(&info, 0, sizeof(info));
+    result = CadImportAsm_DecodeShape(&source, 1, NULL, 0, "Pulse", NULL,
+                                      output, &info);
+    report_failure(&result);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(result.warningCount == 1);
+    for (diagnostic = 0; diagnostic < result.diagnosticCount; ++diagnostic) {
+        if (result.diagnostics[diagnostic].severity == CAD_DIAGNOSTIC_WARNING &&
+            strstr(result.diagnostics[diagnostic].message,
+                   "static preview") != NULL)
+            foundPreviewWarning = 1;
+    }
+    CHECK(foundPreviewWarning);
+    CHECK(info.sourcePointCount == 6);
+    CHECK(info.polygonCount == 2);
+    CHECK(info.generatedPointCount == 8);
+    CHECK(output->polygonCount == 2);
+    CHECK(output->pointCount == 8);
+
+    /* Only the first jump-table pose is used.  Default import flips Y. */
+    CHECK(output->points[0].pointx == 0.0);
+    CHECK(output->points[0].pointy == 0.0);
+    CHECK(output->points[0].pointz == -33.0);
+    CHECK(output->points[1].pointx == -5.0);
+    CHECK(output->points[1].pointz == -7.0);
+    CHECK(output->points[2].pointz == 12.0);
+    CHECK(output->points[3].pointx == 5.0);
+    CHECK(output->points[5].pointy == 2.0);
+    CHECK(output->points[7].pointy == -2.0);
+    result = CadCodec_Validate(output);
+    CHECK(CadResult_IsSuccess(&result));
+
+    free(output);
+    return 1;
+}
+
+static int test_mlaser_malformed_first_frame_is_transactional(void) {
+    CadAsmTextSource source = text_source("broken_laser.asm",
+                                          kMalformedMlaserShape);
+    CadFileData* output = (CadFileData*)malloc(sizeof(*output));
+    CadFileData* before = (CadFileData*)malloc(sizeof(*before));
+    CadAsmImportInfo info;
+    CadAsmImportInfo infoBefore;
+    CadResult result;
+    CHECK(output && before);
+    memset(output, 0xa7, sizeof(*output));
+    *before = *output;
+    memset(&info, 0x4d, sizeof(info));
+    infoBefore = info;
+
+    result = CadImportAsm_DecodeShape(&source, 1, NULL, 0, "Broken", NULL,
+                                      output, &info);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(result.status == CAD_STATUS_UNRECOGNIZED_FORMAT);
+    CHECK(result.diagnosticCount > 0);
+    CHECK(strstr(result.diagnostics[0].message, "mlaser") != NULL);
+    CHECK(memcmp(output, before, sizeof(*output)) == 0);
+    CHECK(memcmp(&info, &infoBefore, sizeof(info)) == 0);
+
+    free(before);
+    free(output);
+    return 1;
+}
+
+static int test_mlaser_requires_recovered_signature(void) {
+    CadAsmTextSource source = text_source("different_laser.asm",
+                                          kDifferentMlaserShape);
+    CadFileData* output = (CadFileData*)malloc(sizeof(*output));
+    CadFileData* before = (CadFileData*)malloc(sizeof(*before));
+    CadResult result;
+    CHECK(output && before);
+    memset(output, 0xb3, sizeof(*output));
+    *before = *output;
+
+    result = CadImportAsm_DecodeShape(&source, 1, NULL, 0, "Mismatch", NULL,
+                                      output, NULL);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(result.status == CAD_STATUS_UNRECOGNIZED_FORMAT);
+    CHECK(result.warningCount == 0);
+    CHECK(memcmp(output, before, sizeof(*output)) == 0);
+
+    free(before);
+    free(output);
     return 1;
 }
 
@@ -365,6 +551,9 @@ int main(int argc, char** argv) {
 #define RUN(test) do { ++total; if (test()) ++passed; } while (0)
     RUN(test_catalog_and_decode);
     RUN(test_options_and_core_wrapper);
+    RUN(test_mlaser_static_preview);
+    RUN(test_mlaser_malformed_first_frame_is_transactional);
+    RUN(test_mlaser_requires_recovered_signature);
     RUN(test_transactional_errors);
     RUN(test_native_capacity_failure);
 #undef RUN

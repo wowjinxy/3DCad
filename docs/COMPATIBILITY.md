@@ -19,5 +19,5 @@ atomic replacement.
 
 The optional corpus harnesses validate 500 recovered CAD files (475 X11 and 25
 legacy), 379 recovered ANM files (358 `3DAN` and 21 `3DGI`), and an ASM catalog
-of 445 entries (442 decoded and three known unsupported). Recovered assets
-remain external to the repository.
+of 445 entries (443 decoded and two explicitly unsupported clipping-plane
+helpers). Recovered assets remain external to the repository.

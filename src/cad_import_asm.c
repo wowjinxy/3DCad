@@ -883,6 +883,143 @@ static int append_source_vertex(AsmVertex* vertices, size_t* count,
     return 1;
 }
 
+static int compact_line_equals_ci(const char* line, const char* expected) {
+    if (!line || !expected) return 0;
+    for (;;) {
+        while (*line && isspace((unsigned char)*line)) ++line;
+        if (ascii_tolower((unsigned char)*line) !=
+            ascii_tolower((unsigned char)*expected)) return 0;
+        if (!*expected) return 1;
+        ++line;
+        ++expected;
+    }
+}
+
+static int has_supported_mlaser_macro(const AsmSourceView* source,
+                                      size_t beforeLine) {
+    static const char* const body[] = {
+        "pointsb6",
+        "pb0,0,\\3",
+        "pb-\\4,0,\\2",
+        "pb0,0,\\1",
+        "pb\\4,0,\\2",
+        "pb0,-2,\\2",
+        "pb0,2,\\2",
+        "endpoints",
+        "endm"
+    };
+    const size_t bodyCount = sizeof(body) / sizeof(body[0]);
+    size_t lineIndex;
+    int foundDefinition = 0;
+    int latestDefinitionSupported = 0;
+    if (beforeLine > source->lineCount) beforeLine = source->lineCount;
+    for (lineIndex = 0; lineIndex < beforeLine; ++lineIndex) {
+        const char* cursor = source->lines[lineIndex].text;
+        char first[CAD_ASM_NAME_CAPACITY];
+        char second[CAD_ASM_NAME_CAPACITY];
+        size_t bodyIndex = 0;
+        size_t candidateLine;
+        if (!next_word(&cursor, first, sizeof(first), NULL) ||
+            !next_word(&cursor, second, sizeof(second), NULL) ||
+            !ascii_equal_ci(first, "mlaser") ||
+            !ascii_equal_ci(second, "macro")) continue;
+        foundDefinition = 1;
+        for (candidateLine = lineIndex + 1;
+             candidateLine < beforeLine && bodyIndex < bodyCount;
+             ++candidateLine) {
+            const char* text = skip_space_const(
+                source->lines[candidateLine].text);
+            if (!*text) continue;
+            if (!compact_line_equals_ci(text, body[bodyIndex])) break;
+            ++bodyIndex;
+        }
+        latestDefinitionSupported = bodyIndex == bodyCount;
+    }
+    return foundDefinition && latestDefinitionSupported;
+}
+
+/* WSHAPES.ASM's elaser2 point stream emits each animation frame through the
+   recovered local `mlaser` macro.  ASM import is intentionally a static
+   preview rather than a general assembler, so verify that exact macro body,
+   resolve the first jump-table target, and use that frame as the displayed
+   pose.  The six vertices below are the macro's fixed output. */
+static int parse_first_mlaser_frame(const AsmSourceView* source,
+                                    size_t pointStart, size_t faceStart,
+                                    const AsmConstantTable* constants,
+                                    int invertY, AsmVertex* vertices,
+                                    size_t* vertexCount, size_t* endLine,
+                                    CadResult* result) {
+    size_t lineIndex;
+    char firstTarget[CAD_ASM_NAME_CAPACITY];
+    if (!has_supported_mlaser_macro(source, pointStart)) return 0;
+    firstTarget[0] = '\0';
+    for (lineIndex = pointStart + 1;
+         lineIndex < source->lineCount && lineIndex < faceStart;
+         ++lineIndex) {
+        const AsmLine* line = &source->lines[lineIndex];
+        const char* directive;
+        const char* cursor;
+        directive = find_directive(line->text, "JumpTab");
+        if (!directive) continue;
+        cursor = directive + strlen("JumpTab");
+        if (!next_word(&cursor, firstTarget, sizeof(firstTarget), NULL)) {
+            asm_add_diagnostic(result, CAD_DIAGNOSTIC_ERROR,
+                               CAD_STATUS_INVALID_NUMBER,
+                               line->byteOffset, line->lineNumber,
+                               "Malformed first mlaser jump-table target");
+            return -1;
+        }
+        break;
+    }
+    if (!firstTarget[0]) return 0;
+    for (lineIndex = pointStart + 1;
+         lineIndex < source->lineCount && lineIndex < faceStart;
+         ++lineIndex) {
+        const AsmLine* line = &source->lines[lineIndex];
+        const char* cursor = line->text;
+        char label[CAD_ASM_NAME_CAPACITY];
+        char invocation[CAD_ASM_NAME_CAPACITY];
+        int values[4];
+        if (!next_word(&cursor, label, sizeof(label), NULL) ||
+            !ascii_equal_ci(label, firstTarget)) continue;
+        if (!next_word(&cursor, invocation, sizeof(invocation), NULL) ||
+            !ascii_equal_ci(invocation, "mlaser")) return 0;
+        if (!parse_csv_integers(cursor, constants, values, 4) ||
+            values[3] == INT_MIN) {
+            asm_add_diagnostic(result, CAD_DIAGNOSTIC_ERROR,
+                               CAD_STATUS_INVALID_NUMBER,
+                               line->byteOffset, line->lineNumber,
+                               "Malformed or overflowing mlaser frame");
+            return -1;
+        }
+        if (!append_source_vertex(vertices, vertexCount,
+                                  0, 0, values[2], 0, invertY,
+                                  line, result) ||
+            !append_source_vertex(vertices, vertexCount,
+                                  -values[3], 0, values[1], 0, invertY,
+                                  line, result) ||
+            !append_source_vertex(vertices, vertexCount,
+                                  0, 0, values[0], 0, invertY,
+                                  line, result) ||
+            !append_source_vertex(vertices, vertexCount,
+                                  values[3], 0, values[1], 0, invertY,
+                                  line, result) ||
+            !append_source_vertex(vertices, vertexCount,
+                                  0, -2, values[1], 0, invertY,
+                                  line, result) ||
+            !append_source_vertex(vertices, vertexCount,
+                                  0, 2, values[1], 0, invertY,
+                                  line, result)) return -1;
+        if (endLine) *endLine = lineIndex + 1;
+        asm_add_diagnostic(
+            result, CAD_DIAGNOSTIC_WARNING, CAD_STATUS_OK,
+            line->byteOffset, line->lineNumber,
+            "Expanded the first mlaser frame as a static preview; runtime frames are not imported");
+        return 1;
+    }
+    return 0;
+}
+
 static int parse_points(const AsmSourceView* source, size_t pointStart,
                         const AsmConstantTable* constants, int invertY,
                         AsmVertex* vertices, size_t* vertexCount,
@@ -1168,6 +1305,7 @@ CadResult CadImportAsm_DecodeCatalogShape(
     size_t localStart = 0;
     size_t lineIndex;
     int macroGeneratedPoints = 0;
+    int pointsParsed = 0;
     if (!asmSources || asmSourceCount == 0 || !shape || !output ||
         shape->sourceIndex >= asmSourceCount) {
         asm_add_diagnostic(&result, CAD_DIAGNOSTIC_ERROR,
@@ -1245,9 +1383,18 @@ CadResult CadImportAsm_DecodeCatalogShape(
         return result;
     }
     CadFile_Init(candidate);
-    if (!parse_points(&source, pointStart, &constants, options->invertY != 0,
-                      vertices, &candidateInfo.sourcePointCount, &pointEnd,
-                      &result) ||
+    if (macroGeneratedPoints) {
+        pointsParsed = parse_first_mlaser_frame(
+            &source, pointStart, faceStart, &constants,
+            options->invertY != 0, vertices,
+            &candidateInfo.sourcePointCount, &pointEnd, &result);
+    }
+    if (pointsParsed == 0) {
+        pointsParsed = parse_points(
+            &source, pointStart, &constants, options->invertY != 0,
+            vertices, &candidateInfo.sourcePointCount, &pointEnd, &result);
+    }
+    if (pointsParsed < 0 || !pointsParsed ||
         !parse_faces(&source, faceStart, &constants, vertices,
                      candidateInfo.sourcePointCount, candidate, &result)) {
         if (macroGeneratedPoints &&

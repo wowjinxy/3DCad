@@ -153,8 +153,8 @@ second encodings without committing recovered assets.
 `ThreeDCadAsmImportTests --corpus <shape files...> --constants <include
 files...>` audits recovered ASM catalogs. Set `THREEDCAD_EXPECT_ASM_TOTAL`,
 `THREEDCAD_EXPECT_ASM_DECODED`, and `THREEDCAD_EXPECT_ASM_UNSUPPORTED` to make
-the census exact. The current SF2 catalog resolves 445 entries: 442 decode and
-the three known unsupported entries remain classified explicitly.
+the census exact. The current SF2 catalog resolves 445 entries: 443 decode and
+the two clipping-plane helpers remain classified explicitly as unsupported.
 
 ## Core API
 
