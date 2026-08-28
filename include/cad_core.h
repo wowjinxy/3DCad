@@ -6,6 +6,7 @@
    ============================================================================ */
 
 #include "cad_file.h"
+#include <stddef.h>
 #include <stdint.h>
 
 /* ----------------------------------------------------------------------------
@@ -103,8 +104,8 @@ void CadCore_SelectPoint(CadCore* core, int16_t pointIndex);
 void CadCore_SelectPolygon(CadCore* core, int16_t polygonIndex);
 void CadCore_DeselectPoint(CadCore* core, int16_t pointIndex);
 void CadCore_DeselectPolygon(CadCore* core, int16_t polygonIndex);
-int CadCore_IsPointSelected(CadCore* core, int16_t pointIndex);
-int CadCore_IsPolygonSelected(CadCore* core, int16_t polygonIndex);
+int CadCore_IsPointSelected(const CadCore* core, int16_t pointIndex);
+int CadCore_IsPolygonSelected(const CadCore* core, int16_t polygonIndex);
 void CadCore_SelectAll(CadCore* core);
 
 /* ----------------------------------------------------------------------------
@@ -126,6 +127,17 @@ int16_t CadCore_GetFirstPolygonOfObject(CadCore* core, int16_t objectIndex);
    ---------------------------------------------------------------------------- */
 int CadCore_ValidatePolygon(CadCore* core, int16_t polygonIndex);
 int CadCore_ValidatePoint(CadCore* core, int16_t pointIndex);
+
+/* Validate every active record and all object/polygon/point/animation links.
+   diagnostic may be NULL; otherwise it receives a short first-error message. */
+int CadCore_ValidateDocument(const CadCore* core, char* diagnostic,
+                             size_t diagnosticCapacity);
+
+/* Recompute high-water counts, selection arrays and the last root polygon.
+   RepairTopology also removes dangling links and restores reciprocal face
+   pairing; it is intended for explicit recovery/import paths, not rendering. */
+void CadCore_RebuildDerivedState(CadCore* core);
+int CadCore_RepairTopology(CadCore* core);
 
 /* ----------------------------------------------------------------------------
    Statistics
@@ -151,6 +163,6 @@ int CadCore_ArePointsMerged(CadCore* core);
 int CadCore_IsFullyMerged(CadCore* core);
 
 /* Check if a point is connected to any polygon (not orphaned) */
-int CadCore_IsPointConnected(CadCore* core, int16_t pointIndex);
+int CadCore_IsPointConnected(const CadCore* core, int16_t pointIndex);
 
 

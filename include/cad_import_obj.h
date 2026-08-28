@@ -2,10 +2,10 @@
 
 #include "cad_core.h"
 
-/* Import CAD data from Wavefront OBJ format (.obj)
-   Note: Limited support due to SuperFX engine constraints
-   - Supports vertices (v) and faces (f)
-   - Ignores materials, normals, texture coordinates
-   - Maximum 8192 vertices, 4096 polygons
-*/
+/* Import Wavefront OBJ geometry transactionally.
+   Supports vertices, faces, line records (polylines become two-point
+   segments), negative/relative indices, and material_N color names. Texture
+   coordinates and normals are syntax-checked but are not retained by the CAD
+   model. On failure, core is left unchanged and a diagnostic is written to
+   stderr. */
 int CadImport_OBJ(CadCore* core, const char* filename);

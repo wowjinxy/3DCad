@@ -21,7 +21,10 @@
 #define CAD_MAX_OBJECTS     256     /* max objects */
 #define CAD_MAX_POINTS     1024    /* max points */
 #define CAD_MAX_POLYGONS   1024    /* max polygons */
-#define CAD_MAX_FACE_POINTS 12      /* max face points */
+#define CAD_MAX_FACE_POINTS 16      /* recovered editor/game limit */
+#define CAD_MAX_ANIMATION_INDICES 256
+#define CAD_MAX_ANIMATION_POINTS  8192
+#define CAD_ANIMATION_FRAMES        64
 
 /* ----------------------------------------------------------------------------
    File format tags
@@ -29,6 +32,8 @@
 #define CAD_TAG_OBJECT     0       /* Object record */
 #define CAD_TAG_POLYGON    1       /* Polygon record */
 #define CAD_TAG_POINT      2       /* Point record */
+#define CAD_TAG_ANIMATION_INDEX 3  /* 64-frame animation index */
+#define CAD_TAG_ANIMATION_POINT 4  /* Animation point record */
 
 /* ----------------------------------------------------------------------------
    Point record (vertex)
@@ -72,6 +77,18 @@ typedef struct {
     double   offsetz;        /* Offset Z relative to parent */
 } CadObject;
 
+/* A polygon animation maps each of the original 64 frames to the first
+   animation-point record for that frame.  The on-disk X11 representation is
+   130 bytes (one flag byte, one padding byte, then 64 big-endian int16s). */
+typedef struct {
+    uint8_t flags;
+    int16_t frame[CAD_ANIMATION_FRAMES];
+} CadAnimationIndex;
+
+/* Animation points use the same logical fields as regular points and the
+   same fixed 32-byte X11 payload, but live in a separate 8192-entry table. */
+typedef CadPoint CadAnimationPoint;
+
 /* ----------------------------------------------------------------------------
    CAD file data structure
    ---------------------------------------------------------------------------- */
@@ -79,10 +96,14 @@ typedef struct {
     CadObject  objects[CAD_MAX_OBJECTS];
     CadPolygon polygons[CAD_MAX_POLYGONS];
     CadPoint   points[CAD_MAX_POINTS];
+    CadAnimationIndex animationIndices[CAD_MAX_ANIMATION_INDICES];
+    CadAnimationPoint animationPoints[CAD_MAX_ANIMATION_POINTS];
     
     int objectCount;
     int polygonCount;
     int pointCount;
+    int animationIndexCount;
+    int animationPointCount;
 } CadFileData;
 
 /* ----------------------------------------------------------------------------
