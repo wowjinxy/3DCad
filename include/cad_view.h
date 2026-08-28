@@ -5,6 +5,7 @@
    CAD view rendering and camera system
    ============================================================================ */
 
+#include "cad_animation.h"
 #include "cad_core.h"
 #include <stdint.h>
 
@@ -49,6 +50,20 @@ void CadView_Pan(CadView* view, double dx, double dy);
 void CadView_Rotate(CadView* view, double dx, double dy);
 void CadView_RotateRoll(CadView* view, double degrees);
 void CadView_Pan3DVertical(CadView* view, double dy); /* Pan 3D view up/down relative to current angle */
+/* Fit a finite axis-aligned world-space box inside the viewport.  The 3D
+   camera returns to its home orientation; orthographic view orientation is
+   unchanged. */
+int CadView_FrameBounds(CadView* view,
+                        double min_x, double min_y, double min_z,
+                        double max_x, double max_y, double max_z,
+                        int viewport_w, int viewport_h);
+/* Fit bounds without changing the current 3D orbit orientation or roll.
+   Orthographic views behave identically to CadView_FrameBounds. */
+int CadView_FrameBoundsPreserveOrientation(
+    CadView* view,
+    double min_x, double min_y, double min_z,
+    double max_x, double max_y, double max_z,
+    int viewport_w, int viewport_h);
 void CadView_SetPalette(CadView* view, const uint8_t* rgba256x4);
 void CadView_ClearPalette(CadView* view);
 
@@ -74,6 +89,16 @@ int16_t CadView_FindNearestPoint(const CadView* view, const CadCore* core,
                                  int viewport_w, int viewport_h,
                                  int threshold_pixels);
 
+/* Pose-aware counterpart used by the editor.  Point IDs remain the stable
+   static topology IDs, while projection and depth come exclusively from the
+   immutable pose carried by scene. */
+int16_t CadView_FindNearestScenePoint(const CadView* view,
+                                      const CadScene* scene,
+                                      int screen_x, int screen_y,
+                                      int viewport_x, int viewport_y,
+                                      int viewport_w, int viewport_h,
+                                      int threshold_pixels);
+
 /* ----------------------------------------------------------------------------
    Find all points at the same location as the nearest point
    Fills out_indices array with point indices (up to max_count)
@@ -87,12 +112,28 @@ int CadView_FindPointsAtLocation(const CadView* view, const CadCore* core,
                                  double world_threshold,
                                  int16_t* out_indices, int max_count);
 
+int CadView_FindScenePointsAtLocation(const CadView* view,
+                                      const CadScene* scene,
+                                      int screen_x, int screen_y,
+                                      int viewport_x, int viewport_y,
+                                      int viewport_w, int viewport_h,
+                                      int threshold_pixels,
+                                      double world_threshold,
+                                      int16_t* out_indices, int max_count);
+
 /* Find the nearest visible polygon edge/interior in screen space. */
 int16_t CadView_FindNearestPolygon(const CadView* view, const CadCore* core,
                                    int screen_x, int screen_y,
                                    int viewport_x, int viewport_y,
                                    int viewport_w, int viewport_h,
                                    int threshold_pixels);
+
+int16_t CadView_FindNearestScenePolygon(const CadView* view,
+                                        const CadScene* scene,
+                                        int screen_x, int screen_y,
+                                        int viewport_x, int viewport_y,
+                                        int viewport_w, int viewport_h,
+                                        int threshold_pixels);
 
 /* ----------------------------------------------------------------------------
    Unproject screen delta to 3D world delta
@@ -119,4 +160,10 @@ void CadView_UnprojectPoint(const CadView* view, int screen_x, int screen_y,
 void CadView_Render(const CadView* view, const CadCore* core,
                     int pixel_x, int pixel_y, int pixel_w, int pixel_h,
                     int framebuffer_h, int logical_w, int logical_h);
+
+/* Render the same immutable pose used for picking and coordinate feedback.
+   CadView_Render remains available for static/core-only callers. */
+void CadView_RenderScene(const CadView* view, const CadScene* scene,
+                         int pixel_x, int pixel_y, int pixel_w, int pixel_h,
+                         int framebuffer_h, int logical_w, int logical_h);
 

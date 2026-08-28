@@ -47,7 +47,11 @@ typedef enum CadCommandId {
     CAD_COMMAND_MERGE_POINTS,
     CAD_COMMAND_MERGE_POLYGONS,
     CAD_COMMAND_MERGE_ALL,
-    CAD_COMMAND_POLYGON_SORT
+    CAD_COMMAND_POLYGON_SORT,
+    /* New IDs are appended so existing command values remain stable. */
+    CAD_COMMAND_FILE_IMPORT_ANM,
+    CAD_COMMAND_FILE_EXPORT_ANM_3DAN,
+    CAD_COMMAND_FILE_EXPORT_ANM_3DGI
 } CadCommandId;
 
 enum {

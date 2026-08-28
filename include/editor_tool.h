@@ -72,6 +72,8 @@ void EditorTool_Init(EditorTool* tool, CadDocument* document);
 void EditorTool_BindDocument(EditorTool* tool, CadDocument* document);
 int EditorTool_IsActive(const EditorTool* tool);
 CadResult EditorTool_Begin(EditorTool* tool, CadToolId id);
+CadResult EditorTool_BeginNamed(EditorTool* tool, CadToolId id,
+                                const char* historyLabel);
 CadResult EditorTool_Update(EditorTool* tool);
 CadResult EditorTool_Commit(EditorTool* tool);
 void EditorTool_Cancel(EditorTool* tool);

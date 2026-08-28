@@ -9,9 +9,10 @@
 
 #include "font_win32.h"
 #include "gui.h"
+#include "cad_version.h"
 
 #define APP_NAME "3DCad"
-#define APP_VERSION "0.2.0"
+#define APP_VERSION THREEDCAD_VERSION
 #define APP_IDENTIFIER "io.github.wowjinxy.3dcad"
 #define DEFAULT_WINDOW_WIDTH 1258
 #define DEFAULT_WINDOW_HEIGHT 983
@@ -24,6 +25,9 @@ typedef struct AppState {
     FontWin32* font;
     GuiInput input;
     float pending_wheel;
+    float pending_button_x;
+    float pending_button_y;
+    bool pending_button_position;
     bool vsync_enabled;
     bool font_refresh_pending;
     char current_title[1024];
@@ -320,6 +324,12 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         app->input.mouse_x = (int)event->button.x;
         app->input.mouse_y = (int)event->button.y;
+        if (!app->input.mouse_pressed && !app->input.mouse_right_pressed &&
+            !app->input.mouse_middle_pressed) {
+            app->pending_button_x = event->button.x;
+            app->pending_button_y = event->button.y;
+            app->pending_button_position = true;
+        }
         if (event->button.button == SDL_BUTTON_LEFT) {
             app->input.mouse_down = 1;
             app->input.mouse_pressed = 1;
@@ -330,11 +340,24 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
             app->input.mouse_middle_down = 1;
             app->input.mouse_middle_pressed = 1;
         }
+        if (!SDL_CaptureMouse(true)) {
+            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
+                         "Mouse capture was unavailable: %s", SDL_GetError());
+        }
         break;
 
     case SDL_EVENT_MOUSE_BUTTON_UP:
         app->input.mouse_x = (int)event->button.x;
         app->input.mouse_y = (int)event->button.y;
+        /* If a complete click arrives between iterations, keep the press
+           coordinate as the routing edge.  Release-only frames use the
+           release coordinate. */
+        if (!app->input.mouse_pressed && !app->input.mouse_right_pressed &&
+            !app->input.mouse_middle_pressed) {
+            app->pending_button_x = event->button.x;
+            app->pending_button_y = event->button.y;
+            app->pending_button_position = true;
+        }
         if (event->button.button == SDL_BUTTON_LEFT) {
             app->input.mouse_down = 0;
             app->input.mouse_released = 1;
@@ -344,6 +367,10 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
         } else if (event->button.button == SDL_BUTTON_MIDDLE) {
             app->input.mouse_middle_down = 0;
             app->input.mouse_middle_released = 1;
+        }
+        if (!app->input.mouse_down && !app->input.mouse_right_down &&
+            !app->input.mouse_middle_down) {
+            SDL_CaptureMouse(false);
         }
         break;
 
@@ -358,6 +385,14 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
 
     case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
         app->font_refresh_pending = true;
+        break;
+
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        SDL_CaptureMouse(false);
+        gui_cancel_input(app->gui);
+        memset(&app->input, 0, sizeof(app->input));
+        app->pending_button_position = false;
+        app->pending_wheel = 0.0f;
         break;
 
     default:
@@ -399,6 +434,7 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
     if (window_width <= 0 || window_height <= 0 || pixel_width <= 0 || pixel_height <= 0 ||
         (SDL_GetWindowFlags(app->window) & SDL_WINDOW_MINIMIZED) != 0) {
         clear_transient_input(&app->input);
+        app->pending_button_position = false;
         SDL_Delay(10);
         return SDL_APP_CONTINUE;
     }
@@ -409,8 +445,17 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
     const float mouse_scale_x = (float)gui_width / (float)window_width;
     const float mouse_scale_y = (float)gui_height / (float)window_height;
 
-    app->input.mouse_x = (int)(mouse_x * mouse_scale_x);
-    app->input.mouse_y = (int)(mouse_y * mouse_scale_y);
+    if (app->pending_button_position) {
+        /* SDL_GetMouseState can already have moved by the time Iterate runs.
+           Route the edge using the event's own position instead. */
+        app->input.mouse_x =
+            (int)(app->pending_button_x * mouse_scale_x);
+        app->input.mouse_y =
+            (int)(app->pending_button_y * mouse_scale_y);
+    } else {
+        app->input.mouse_x = (int)(mouse_x * mouse_scale_x);
+        app->input.mouse_y = (int)(mouse_y * mouse_scale_y);
+    }
     if (left_down != (app->input.mouse_down != 0)) {
         app->input.mouse_pressed |= left_down;
         app->input.mouse_released |= !left_down;
@@ -449,6 +494,7 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
     }
 
     clear_transient_input(&app->input);
+    app->pending_button_position = false;
     if (!app->vsync_enabled) {
         SDL_Delay(1);
     }

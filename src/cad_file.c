@@ -1,5 +1,6 @@
 #include "cad_file.h"
 #include "cad_codec.h"
+#include "platform_fs.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -62,8 +63,14 @@ CadObject* CadFile_GetObject(CadFileData* data, int16_t index) {
 
 int CadFile_Load(const char* filename, CadFileData* data) {
     CadResult result;
+    uint8_t* bytes = NULL;
+    size_t size = 0;
     if (!filename || !data) return 0;
-    result = CadCodec_LoadPath(filename, CAD_FORMAT_AUTO, data);
+    result = CadPlatform_ReadFile(filename, CAD_PLATFORM_DEFAULT_FILE_LIMIT,
+                                  &bytes, &size);
+    if (CadResult_IsSuccess(&result))
+        result = CadCodec_Decode(bytes, size, CAD_FORMAT_AUTO, data);
+    CadPlatform_Free(bytes);
     if (!CadResult_IsSuccess(&result)) {
         print_failure("load", filename, &result);
         return 0;
@@ -73,8 +80,13 @@ int CadFile_Load(const char* filename, CadFileData* data) {
 
 int CadFile_Save(const char* filename, const CadFileData* data) {
     CadResult result;
+    uint8_t* bytes = NULL;
+    size_t size = 0;
     if (!filename || !data) return 0;
-    result = CadCodec_SavePathAtomic(filename, data, CAD_FORMAT_X11_STREAM);
+    result = CadCodec_Encode(data, CAD_FORMAT_X11_STREAM, &bytes, &size);
+    if (CadResult_IsSuccess(&result))
+        result = CadPlatform_WriteFileAtomic(filename, bytes, size);
+    CadCodec_FreeBuffer(bytes);
     if (!CadResult_IsSuccess(&result)) {
         print_failure("save", filename, &result);
         return 0;

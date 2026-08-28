@@ -44,6 +44,9 @@ GuiState* gui_create(void);
 void gui_destroy(GuiState* g);
 GuiCommand gui_take_command(GuiState* g);
 int gui_request_quit(GuiState* g);
+/* Releases every editor-owned pointer/text capture.  Active transactional
+   gestures are rolled back, making this safe for native window focus loss. */
+void gui_cancel_input(GuiState* g);
 void gui_handle_key(GuiState* g, int key, unsigned modifiers, int pressed);
 const char* gui_window_title(GuiState* g);
 

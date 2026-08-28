@@ -6,13 +6,21 @@
 #include "cad_core.h"
 #include "file_dialog.h"
 #include "cad_view.h"
+#include "animation_panel.h"
+#include "desktop_layout.h"
 #include "cad_export_obj.h"
 #include "cad_export_3dg1.h"
 #include "cad_import_3dg1.h"
+#include "cad_import_asm.h"
 #include "cad_import_obj.h"
 #include "cad_document.h"
+#include "cad_animation.h"
+#include "cad_anm_codec.h"
+#include "cad_geometry.h"
 #include "editor_commands.h"
+#include "editor_controller.h"
 #include "editor_tool.h"
+#include "platform_fs.h"
 #include <math.h>
 
 #ifndef M_PI
@@ -30,6 +38,7 @@
 #endif
 
 #include <SDL3/SDL_opengl.h>
+#include <SDL3/SDL_timer.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,9 +53,7 @@
 #define GUI_HISTORY_LIMIT 64
 #define GUI_PATH_CAPACITY 4096
 
-typedef struct Rect {
-    int x, y, w, h;
-} Rect;
+typedef CadAnimationPanelRect Rect;
 
 static int pt_in_rect(int px, int py, Rect r) {
     return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
@@ -78,8 +85,19 @@ typedef enum GuiPointerOwner {
     GUI_POINTER_AREA_SELECT,
     GUI_POINTER_TRANSFORM,
     GUI_POINTER_SHAPE_BROWSER,
-    GUI_POINTER_SCROLLBAR
+    GUI_POINTER_SCROLLBAR,
+    GUI_POINTER_ANIMATION
 } GuiPointerOwner;
+
+/* Auxiliary editor windows form one desktop layer above the modeling views.
+   IDs are stable array indices; aux_z_order is stored back-to-front. */
+typedef enum GuiAuxWindowId {
+    GUI_AUX_TOOL_PALETTE = 0,
+    GUI_AUX_COORDINATES,
+    GUI_AUX_ANIMATION,
+    GUI_AUX_SHAPE_BROWSER,
+    GUI_AUX_COUNT
+} GuiAuxWindowId;
 
 struct GuiState {
     FontWin32* font;
@@ -88,7 +106,14 @@ struct GuiState {
     /* CAD core */
     CadDocument document;
     CadCore* cad; /* Stable convenience alias for document.core. */
-    EditorTool edit_tool;
+    EditorController controller;
+
+    CadAnimationSession animation;
+    CadAnimationInfo animation_info;
+    CadScene scene;
+    double animation_now;
+    int scene_valid;
+    int animation_info_valid;
     
     /* View states */
     CadView views[4];        /* One view state per view window */
@@ -124,8 +149,12 @@ struct GuiState {
     int layout_height;
     int auto_layout;
     int view_visible[4];
+    int view_z_order[4]; /* back-to-front desktop stacking order */
+    int aux_z_order[GUI_AUX_COUNT]; /* back-to-front auxiliary stack */
     int tool_palette_visible;
     int coordinates_visible;
+    int animation_visible;
+    int animation_docked;
 
     /* Numeric transform panel. */
     int state_visible;
@@ -152,6 +181,11 @@ struct GuiState {
     int shape_selected;        /* Selected shape index, or -1 */
     int shape_scroll_offset;   /* Scroll offset for shape list */
     char shape_folder_path[GUI_PATH_CAPACITY];
+    CadAsmTextSource* shape_asm_sources;
+    size_t shape_asm_source_count;
+    CadAsmTextSource* shape_constant_sources;
+    size_t shape_constant_source_count;
+    CadAsmCatalog* shape_catalog;
     CadCore* shape_preview;
     CadView shape_preview_view;
     int shape_preview_valid;
@@ -168,6 +202,8 @@ struct GuiState {
     int resize_edge; /* 0=none, 1=left, 2=right, 4=top, 8=bottom (can combine) */
     int resize_start_x;
     int resize_start_y;
+    int resize_window_x;
+    int resize_window_y;
     int resize_start_w;
     int resize_start_h;
     
@@ -206,19 +242,22 @@ struct GuiState {
     /* View window scaling (individual scale per view) */
     float view_scale[4]; /* Scale factor for each view window (default 1.0) */
     
-    /* Animation state */
-    int anim_current_frame; /* Current frame number (0-based) */
-    int anim_total_frames;  /* Total number of frames */
-    int anim_playing;        /* 1 if playing, 0 if paused */
-    int anim_loop;          /* 1 if looping, 0 if not */
+    /* Timeline interaction.  Copy is intentionally a two-step operation:
+       arm it on the source frame, then click a destination in the strip. */
+    int anim_scrubbing;
+    int anim_copy_mode; /* 0 none, 1 complete pose, 2 selected points */
+    int anim_copy_source;
 };
+
+static void raise_aux(GuiState* g, int aux_id);
 
 static int MenuBarHeight(void) { return 20; }
 
 /* Forward declarations */
 static void scan_asm_folder_for_shapes(GuiState* g, const char* folder_path);
-static int load_shape_from_asm(CadCore* core, const char* shape_name, const char* folder_path);
-static void load_all_constants(const char* shapes_folder);
+static int load_shape_from_asm(GuiState* g, CadCore* core,
+                               const char* shape_name);
+static void free_asm_browser_sources(GuiState* g);
 
 /* -------------------------------------------------------------------------
    Menu definitions (ported from 3DCad/include/MenuRes.h)
@@ -242,13 +281,16 @@ static const CadMenuItemDescriptor fileMenuItems[] = {
 /* Import submenu */
 static const CadMenuItemDescriptor importSubMenuItems[] = {
     { CAD_COMMAND_FILE_IMPORT_3DG1, ".3dg1 (Fundoshi)", 0 },
-    { CAD_COMMAND_FILE_IMPORT_OBJ, ".obj (Wavefront)", 0 }
+    { CAD_COMMAND_FILE_IMPORT_OBJ, ".obj (Wavefront)", 0 },
+    { CAD_COMMAND_FILE_IMPORT_ANM, ".anm (3DAN / 3DGI)", 0 }
 };
 
 /* Export submenu */
 static const CadMenuItemDescriptor exportSubMenuItems[] = {
     { CAD_COMMAND_FILE_EXPORT_3DG1, ".3dg1 (Fundoshi)", 0 },
-    { CAD_COMMAND_FILE_EXPORT_OBJ, ".obj (Wavefront)", 0 }
+    { CAD_COMMAND_FILE_EXPORT_OBJ, ".obj (Wavefront)", 0 },
+    { CAD_COMMAND_FILE_EXPORT_ANM_3DAN, ".anm (3DAN)", 0 },
+    { CAD_COMMAND_FILE_EXPORT_ANM_3DGI, ".anm (3DGI legacy header)", 0 }
 };
 
 static const CadMenuItemDescriptor editMenuItems[] = {
@@ -353,6 +395,23 @@ static const CadToolId toolPaletteOrder[CAD_TOOL_COUNT] = {
     CAD_TOOL_POINT_DELETE, CAD_TOOL_FACE_DELETE, CAD_TOOL_UNDO
 };
 
+static EditorCommandContext editor_command_context(const GuiState* g) {
+    EditorCommandContext context;
+    memset(&context, 0, sizeof(context));
+    if (!g || !g->cad) return context;
+    context.selectedPointCount = g->cad->selection.pointCount;
+    context.selectedPolygonCount = g->cad->selection.polygonCount;
+    context.clipboardHasData = g->clipboard_has_data;
+    for (int i = 0; i < 4; ++i) context.viewVisible[i] = g->view_visible[i];
+    context.coordinatesVisible = g->coordinates_visible;
+    context.toolPaletteVisible = g->tool_palette_visible;
+    context.animationPanelVisible = g->animation_visible;
+    context.statePanelVisible = g->state_visible;
+    context.wireframe3D = g->views[1].wireframe;
+    context.activeTool = g->selected_tool;
+    return context;
+}
+
 static const MenuDescriptor* menu_for_index(int idx) {
     switch (idx) {
     case 0: case 1: case 2: case 3: case 4: return &menuDescriptors[idx];
@@ -377,6 +436,25 @@ static const char* menu_display_text(const char* s) {
     return s;
 }
 
+static const char* menu_item_display_text(const GuiState* g,
+                                          const CadMenuItemDescriptor* item,
+                                          char* buffer, size_t capacity) {
+    const char* history_label = NULL;
+    if (!item) return "";
+    if (g && item->command == CAD_COMMAND_EDIT_UNDO)
+        history_label = CadDocument_GetUndoLabel(&g->document);
+    else if (g && item->command == CAD_COMMAND_EDIT_REDO)
+        history_label = CadDocument_GetRedoLabel(&g->document);
+    if (history_label && history_label[0] && buffer && capacity) {
+        snprintf(buffer, capacity, "%s%s %s",
+                 item->command == CAD_COMMAND_EDIT_UNDO ? "(U)" : "(Y)",
+                 item->command == CAD_COMMAND_EDIT_UNDO ? "Undo" : "Redo",
+                 history_label);
+        return buffer;
+    }
+    return menu_display_text(item->label);
+}
+
 /* -------------------------------------------------------------------------
    Menu action handlers
    ------------------------------------------------------------------------- */
@@ -391,33 +469,176 @@ static void gui_set_status(GuiState* g, const char* format, ...) {
 
 static void apply_document_palette(GuiState* g) {
     if (!g) return;
-    const uint8_t* source = NULL;
-    if (g->document.paletteDataSize == CAD_PALETTE_DATA_SIZE) source = g->document.paletteData;
-    else if (g->document.colorDataSize == CAD_COLOR_DATA_SIZE) source = g->document.colorData;
-    if (!source) {
+    if (!g->document.paletteValid) {
         for (int i = 0; i < 4; ++i) CadView_ClearPalette(&g->views[i]);
         return;
     }
     uint8_t rgba[256][4];
     for (int i = 0; i < 256; ++i) {
-        unsigned word = (unsigned)source[i * 2] | ((unsigned)source[i * 2 + 1] << 8);
-        rgba[i][0] = (uint8_t)(((word >> 0) & 31u) * 255u / 31u);
-        rgba[i][1] = (uint8_t)(((word >> 5) & 31u) * 255u / 31u);
-        rgba[i][2] = (uint8_t)(((word >> 10) & 31u) * 255u / 31u);
-        rgba[i][3] = 255;
+        rgba[i][0] = g->document.palette[i].r;
+        rgba[i][1] = g->document.palette[i].g;
+        rgba[i][2] = g->document.palette[i].b;
+        rgba[i][3] = g->document.palette[i].a;
     }
     for (int i = 0; i < 4; ++i) CadView_SetPalette(&g->views[i], &rgba[0][0]);
 }
 
+static const char* cad_result_message(const CadResult* result) {
+    if (!result) return "unknown error";
+    CadDiagnosticSeverity preferred = CadResult_IsSuccess(result)
+                                          ? CAD_DIAGNOSTIC_WARNING
+                                          : CAD_DIAGNOSTIC_ERROR;
+    for (int i = 0; i < result->diagnosticCount; ++i) {
+        if (result->diagnostics[i].severity == preferred &&
+            result->diagnostics[i].message[0])
+            return result->diagnostics[i].message;
+    }
+    for (int i = 0; i < result->diagnosticCount; ++i) {
+        if (result->diagnostics[i].message[0])
+            return result->diagnostics[i].message;
+    }
+    return CadStatus_Name(result->status);
+}
+
+static void format_warning_diagnostics(const CadResult* result,
+                                       char* output, size_t output_size) {
+    size_t used = 0;
+    unsigned shown = 0;
+    if (!output || output_size == 0) return;
+    output[0] = '\0';
+    if (!result) return;
+    for (size_t i = 0; i < result->diagnosticCount && shown < 3; ++i) {
+        const CadDiagnostic* diagnostic = &result->diagnostics[i];
+        int written;
+        if (diagnostic->severity != CAD_DIAGNOSTIC_WARNING ||
+            !diagnostic->message[0]) continue;
+        written = snprintf(output + used, output_size - used, "%s%s",
+                           shown ? "\n" : "", diagnostic->message);
+        if (written < 0 || (size_t)written >= output_size - used) {
+            output[output_size - 1] = '\0';
+            return;
+        }
+        used += (size_t)written;
+        ++shown;
+    }
+}
+
+static void animation_invalidate(GuiState* g) {
+    if (!g) return;
+    g->animation.cacheValid = 0;
+    g->animation_info_valid = 0;
+    g->scene_valid = 0;
+    g->anim_scrubbing = 0;
+    g->anim_copy_mode = 0;
+}
+
+/* Build one immutable displayed pose per GUI iteration.  CadScene keeps the
+   stable document topology and the evaluated coordinates separate, so every
+   view, picker, overlay, and coordinate read observes the exact same pose. */
+static void animation_update_scene(GuiState* g, double now_seconds) {
+    CadResult result;
+    if (!g || !g->cad) return;
+    g->animation_now = now_seconds;
+    if (!g->animation_info_valid) {
+        result = CadAnimation_Inspect(&g->cad->data, &g->animation_info);
+        if (!CadResult_IsSuccess(&result)) {
+            if (g->scene_valid)
+                gui_set_status(g, "Animation preview unavailable: %s",
+                               cad_result_message(&result));
+            g->scene_valid = 0;
+            return;
+        }
+        g->animation_info_valid = 1;
+    }
+    result = CadAnimationSession_Evaluate(&g->animation, &g->cad->data,
+                                          now_seconds, &g->scene);
+    if (!CadResult_IsSuccess(&result)) {
+        if (g->scene_valid)
+            gui_set_status(g, "Animation preview unavailable: %s",
+                           cad_result_message(&result));
+        g->scene_valid = 0;
+        return;
+    }
+    g->scene_valid = 1;
+}
+
+static int gui_scene_point(const GuiState* g, int16_t point_index,
+                           CadPosition* position) {
+    const CadPoint* point;
+    if (!g || !g->cad || !position || point_index < 0 ||
+        point_index >= g->cad->data.pointCount) return 0;
+    point = &g->cad->data.points[point_index];
+    if (!point->flags) return 0;
+    if (g->scene_valid && CadScene_GetPoint(&g->scene, point_index, position))
+        return isfinite(position->x) && isfinite(position->y) &&
+               isfinite(position->z);
+    position->x = point->pointx;
+    position->y = point->pointy;
+    position->z = point->pointz;
+    return isfinite(position->x) && isfinite(position->y) &&
+           isfinite(position->z);
+}
+
+static int16_t gui_find_nearest_point(const GuiState* g, int view_index,
+                                      int screen_x, int screen_y,
+                                      Rect viewport, int threshold_pixels) {
+    if (!g || !g->cad || view_index < 0 || view_index >= 4) return INVALID_INDEX;
+    if (g->scene_valid)
+        return CadView_FindNearestScenePoint(&g->views[view_index], &g->scene,
+                                             screen_x, screen_y,
+                                             viewport.x, viewport.y,
+                                             viewport.w, viewport.h,
+                                             threshold_pixels);
+    return CadView_FindNearestPoint(&g->views[view_index], g->cad,
+                                    screen_x, screen_y,
+                                    viewport.x, viewport.y,
+                                    viewport.w, viewport.h,
+                                    threshold_pixels);
+}
+
+static int gui_find_points_at_location(const GuiState* g, int view_index,
+                                       int screen_x, int screen_y,
+                                       Rect viewport, int threshold_pixels,
+                                       double world_threshold,
+                                       int16_t* indices, int capacity) {
+    if (!g || !g->cad || view_index < 0 || view_index >= 4) return 0;
+    if (g->scene_valid)
+        return CadView_FindScenePointsAtLocation(
+            &g->views[view_index], &g->scene, screen_x, screen_y,
+            viewport.x, viewport.y, viewport.w, viewport.h,
+            threshold_pixels, world_threshold, indices, capacity);
+    return CadView_FindPointsAtLocation(
+        &g->views[view_index], g->cad, screen_x, screen_y,
+        viewport.x, viewport.y, viewport.w, viewport.h,
+        threshold_pixels, world_threshold, indices, capacity);
+}
+
+static int16_t gui_find_nearest_polygon(const GuiState* g, int view_index,
+                                        int screen_x, int screen_y,
+                                        Rect viewport, int threshold_pixels) {
+    if (!g || !g->cad || view_index < 0 || view_index >= 4) return INVALID_INDEX;
+    if (g->scene_valid)
+        return CadView_FindNearestScenePolygon(
+            &g->views[view_index], &g->scene, screen_x, screen_y,
+            viewport.x, viewport.y, viewport.w, viewport.h,
+            threshold_pixels);
+    return CadView_FindNearestPolygon(
+        &g->views[view_index], g->cad, screen_x, screen_y,
+        viewport.x, viewport.y, viewport.w, viewport.h,
+        threshold_pixels);
+}
+
 static void reset_interaction(GuiState* g) {
     if (!g) return;
+    int cancelled_edit = 0;
     /* A document edit is inseparable from the gesture that owns it.  Any
        workflow reset must roll that gesture back before clearing capture, so
        menus, file dialogs, and document replacement cannot strand a partial
        drag or a stale EditorTool phase. */
-    if (EditorTool_IsActive(&g->edit_tool) || g->document.transactionBefore) {
-        EditorTool_Cancel(&g->edit_tool);
+    if (EditorController_IsEditing(&g->controller) || g->document.transactionBefore) {
+        EditorController_CancelEdit(&g->controller);
         g->cad = &g->document.core;
+        cancelled_edit = 1;
     }
     g->drag_win = NULL;
     g->resize_win = NULL;
@@ -441,6 +662,7 @@ static void reset_interaction(GuiState* g) {
     g->state_visible = 0;
     g->state_active_field = -1;
     g->state_replace_on_input = 1;
+    if (cancelled_edit) animation_invalidate(g);
 }
 
 static void history_clear(GuiState* g) {
@@ -448,11 +670,17 @@ static void history_clear(GuiState* g) {
     CadDocument_ClearHistory(&g->document);
 }
 
-static int history_push(GuiState* g) {
+static int history_begin(GuiState* g, CadToolId tool, int tool_edit,
+                         const char* label) {
     if (!g || !g->cad) return 0;
-    if (EditorTool_IsActive(&g->edit_tool) || g->document.transactionBefore)
-        EditorTool_Cancel(&g->edit_tool);
-    CadResult result = EditorTool_Begin(&g->edit_tool, g->selected_tool);
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    if (EditorController_IsEditing(&g->controller) || g->document.transactionBefore)
+        EditorController_CancelEdit(&g->controller);
+    CadResult result = tool_edit
+        ? EditorController_BeginEdit(&g->controller, tool,
+                                     label && label[0] ? label : "Edit")
+        : EditorController_BeginCommandEdit(&g->controller,
+                                            label && label[0] ? label : "Edit");
     if (!CadResult_IsSuccess(&result)) {
         gui_set_status(g, "Edit cancelled: could not create an undo snapshot (%s)",
                        CadStatus_Name(result.status));
@@ -461,25 +689,41 @@ static int history_push(GuiState* g) {
     return 1;
 }
 
+static int history_push_named(GuiState* g, const char* label) {
+    return history_begin(g, CAD_TOOL_NONE, 0, label);
+}
+
+static int history_push(GuiState* g) {
+    const char* label = "Edit";
+    int has_tool = g && g->selected_tool >= 0 &&
+                   g->selected_tool < CAD_TOOL_COUNT;
+    if (has_tool)
+        label = toolDescriptors[g->selected_tool].name;
+    return history_begin(g, has_tool ? g->selected_tool : CAD_TOOL_NONE,
+                         has_tool, label);
+}
+
 static int history_commit(GuiState* g) {
     if (!g || !g->document.transactionBefore) return 0;
-    CadResult result = EditorTool_Update(&g->edit_tool);
-    if (CadResult_IsSuccess(&result)) result = EditorTool_Commit(&g->edit_tool);
-    else EditorTool_Cancel(&g->edit_tool);
+    CadResult result = EditorController_UpdateEdit(&g->controller);
+    if (CadResult_IsSuccess(&result)) result = EditorController_CommitEdit(&g->controller);
+    else EditorController_CancelEdit(&g->controller);
     g->cad = &g->document.core;
     if (!CadResult_IsSuccess(&result)) {
         gui_set_status(g, "Edit rolled back: could not commit its undo snapshot (%s)",
                        CadStatus_Name(result.status));
         return 0;
     }
+    animation_invalidate(g);
     return 1;
 }
 
 static void history_cancel(GuiState* g) {
     if (!g) return;
-    if (EditorTool_IsActive(&g->edit_tool) || g->document.transactionBefore)
-        EditorTool_Cancel(&g->edit_tool);
+    if (EditorController_IsEditing(&g->controller) || g->document.transactionBefore)
+        EditorController_CancelEdit(&g->controller);
     g->cad = &g->document.core;
+    animation_invalidate(g);
 }
 
 static int history_undo(GuiState* g) {
@@ -487,11 +731,15 @@ static int history_undo(GuiState* g) {
         gui_set_status(g, "Nothing to undo");
         return 0;
     }
+    char label[CAD_DOCUMENT_HISTORY_LABEL_CAPACITY];
+    snprintf(label, sizeof(label), "%s",
+             CadDocument_GetUndoLabel(&g->document));
     CadDocument_Undo(&g->document);
     g->cad = &g->document.core;
+    animation_invalidate(g);
     apply_document_palette(g);
     reset_interaction(g);
-    gui_set_status(g, "Undo");
+    gui_set_status(g, "Undo %s", label);
     return 1;
 }
 
@@ -500,11 +748,15 @@ static int history_redo(GuiState* g) {
         gui_set_status(g, "Nothing to redo");
         return 0;
     }
+    char label[CAD_DOCUMENT_HISTORY_LABEL_CAPACITY];
+    snprintf(label, sizeof(label), "%s",
+             CadDocument_GetRedoLabel(&g->document));
     CadDocument_Redo(&g->document);
     g->cad = &g->document.core;
+    animation_invalidate(g);
     apply_document_palette(g);
     reset_interaction(g);
-    gui_set_status(g, "Redo");
+    gui_set_status(g, "Redo %s", label);
     return 1;
 }
 
@@ -513,7 +765,8 @@ static int save_document_as(GuiState* g) {
     if (!g || !g->cad || !FileDialog_SaveCAD(filename, sizeof(filename))) return 0;
     CadResult result = CadDocument_Save(&g->document, filename);
     if (!CadResult_IsSuccess(&result)) {
-        gui_set_status(g, "Could not save %s", filename);
+        gui_set_status(g, "Could not save %s: %s", filename,
+                       cad_result_message(&result));
         return 0;
     }
     g->cad = &g->document.core;
@@ -526,7 +779,8 @@ static int save_document(GuiState* g) {
     if (!g->document.savePath) return save_document_as(g);
     CadResult result = CadDocument_SaveCurrent(&g->document);
     if (!CadResult_IsSuccess(&result)) {
-        gui_set_status(g, "Could not save %s", g->document.savePath);
+        gui_set_status(g, "Could not save %s: %s", g->document.savePath,
+                       cad_result_message(&result));
         return 0;
     }
     g->cad = &g->document.core;
@@ -556,9 +810,10 @@ static void replace_document(GuiState* g, const CadCore* replacement,
                              const char* native_filename, int imported) {
     if (!g || !g->cad || !replacement) return;
     CadDocument_New(&g->document);
-    EditorTool_BindDocument(&g->edit_tool, &g->document);
+    EditorController_BindDocument(&g->controller, &g->document);
     g->document.core = *replacement;
     g->cad = &g->document.core;
+    animation_invalidate(g);
     if (native_filename) {
         /* Native files are normally installed through CadDocument_Load. */
         g->document.sourceFormat = CAD_FORMAT_X11_STREAM;
@@ -582,27 +837,20 @@ static void editor_face_information(GuiState* g);
 static void editor_grid_merge(GuiState* g);
 static void editor_point_merge(GuiState* g);
 static void editor_polygon_merge(GuiState* g);
+static void editor_merge_all(GuiState* g);
 static void editor_polygon_sort(GuiState* g);
 static void layout_cleanup(GuiState* g, int win_w, int win_h);
+static int frame_document_views(GuiState* g, int selection_only);
+static int create_face_from_selection(GuiState* g);
+static void update_face_creation_status(GuiState* g, int view_index);
 static void activate_tool(GuiState* g, CadToolId tool);
+static void animation_invalidate(GuiState* g);
+static void animation_update_scene(GuiState* g, double now_seconds);
 static void state_panel_open(GuiState* g);
 static void state_panel_close(GuiState* g);
 static int state_panel_apply(GuiState* g);
 static void state_panel_key(GuiState* g, int key, unsigned modifiers);
 static void gui_draw_interaction_overlays(GuiState* g, int view_index);
-
-static FILE* gui_fopen_utf8(const char* path, const char* mode) {
-    if (!path || !mode) return NULL;
-#ifdef _WIN32
-    wchar_t wide_path[GUI_PATH_CAPACITY * 2];
-    wchar_t wide_mode[16];
-    int length = MultiByteToWideChar(CP_UTF8, 0, path, -1, wide_path, ARRAY_COUNT(wide_path));
-    int mode_length = MultiByteToWideChar(CP_UTF8, 0, mode, -1, wide_mode, ARRAY_COUNT(wide_mode));
-    return length > 0 && mode_length > 0 ? _wfopen(wide_path, wide_mode) : NULL;
-#else
-    return fopen(path, mode);
-#endif
-}
 
 #ifdef _WIN32
 static int gui_utf8_to_wide(const char* source, wchar_t* target, int capacity) {
@@ -618,42 +866,20 @@ static int gui_wide_to_utf8(const wchar_t* source, char* target, int capacity) {
 }
 #endif
 
-static size_t read_binary_file_utf8(const char* path, void* buffer, size_t capacity) {
-    FILE* file = gui_fopen_utf8(path, "rb");
-    if (!file) return 0;
-    size_t read = fread(buffer, 1, capacity, file);
-    int extra = fgetc(file);
-    fclose(file);
-    return extra == EOF ? read : 0;
-}
-
-static size_t read_binary_prefix_utf8(const char* path, void* buffer, size_t required,
-                                      int* had_trailing_data) {
-    FILE* file = gui_fopen_utf8(path, "rb");
-    if (had_trailing_data) *had_trailing_data = 0;
-    if (!file) return 0;
-    size_t read = fread(buffer, 1, required, file);
-    if (read == required) {
-        int extra = fgetc(file);
-        if (had_trailing_data) *had_trailing_data = extra != EOF;
-    }
-    fclose(file);
-    return read;
-}
-
 static void execute_editor_command(GuiState* g, CadCommandId command) {
     char filename[GUI_PATH_CAPACITY];
     if (!g || !g->cad) return;
 
-    if (EditorTool_IsActive(&g->edit_tool) || g->document.transactionBefore)
+    if (EditorController_IsEditing(&g->controller) || g->document.transactionBefore)
         reset_interaction(g);
 
     switch (command) {
     case CAD_COMMAND_FILE_NEW:
         if (confirm_replace_document(g, "creating a new document")) {
             CadDocument_New(&g->document);
-            EditorTool_BindDocument(&g->edit_tool, &g->document);
+            EditorController_BindDocument(&g->controller, &g->document);
             g->cad = &g->document.core;
+            animation_invalidate(g);
             reset_interaction(g);
             for (int i = 0; i < 4; ++i) CadView_Reset(&g->views[i]);
             gui_set_status(g, "New document");
@@ -669,18 +895,28 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
             CadDocument_Init(temp);
             CadResult result = CadDocument_Load(temp, filename);
             if (!CadResult_IsSuccess(&result)) {
-                gui_set_status(g, "Could not open %s; current document was not changed", filename);
+                gui_set_status(g, "Could not open %s: %s; current document unchanged",
+                               filename, cad_result_message(&result));
             } else if (confirm_replace_document(g, "opening another document")) {
                 CadDocument_Destroy(&g->document);
                 g->document = *temp;
                 memset(temp, 0, sizeof(*temp));
-                EditorTool_BindDocument(&g->edit_tool, &g->document);
+                EditorController_BindDocument(&g->controller, &g->document);
                 g->cad = &g->document.core;
+                animation_invalidate(g);
                 reset_interaction(g);
                 for (int i = 0; i < 4; ++i) CadView_Reset(&g->views[i]);
                 apply_document_palette(g);
-                gui_set_status(g, result.format == CAD_FORMAT_LEGACY_PACKED
-                    ? "Imported legacy CAD %s; use Save As" : "Opened %s", filename);
+                if (result.warningCount) {
+                    gui_set_status(g, "%s %s with %u warning(s): %s",
+                                   result.format == CAD_FORMAT_LEGACY_PACKED
+                                       ? "Imported legacy CAD" : "Opened",
+                                   filename, result.warningCount,
+                                   cad_result_message(&result));
+                } else {
+                    gui_set_status(g, result.format == CAD_FORMAT_LEGACY_PACKED
+                        ? "Imported legacy CAD %s; use Save As" : "Opened %s", filename);
+                }
             }
             CadDocument_Destroy(temp);
             free(temp);
@@ -688,6 +924,48 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
         break;
     case CAD_COMMAND_FILE_SAVE: save_document(g); break;
     case CAD_COMMAND_FILE_SAVE_AS: save_document_as(g); break;
+    case CAD_COMMAND_FILE_IMPORT_ANM:
+        if (FileDialog_Open(filename, sizeof(filename),
+                            "ANM Files\0*.anm\0All Files\0*.*\0",
+                            "Import 3DAN / 3DGI Animation")) {
+            CadDocument* temp = (CadDocument*)malloc(sizeof(*temp));
+            if (!temp) {
+                gui_set_status(g, "Not enough memory to import ANM");
+                break;
+            }
+            CadDocument_Init(temp);
+            CadResult result = CadDocument_ImportAnm(temp, filename);
+            if (!CadResult_IsSuccess(&result)) {
+                gui_set_status(g, "ANM import failed: %s; current document unchanged",
+                               cad_result_message(&result));
+            } else if (confirm_replace_document(g, "importing an animation")) {
+                CadDocument_Destroy(&g->document);
+                g->document = *temp;
+                memset(temp, 0, sizeof(*temp));
+                EditorController_BindDocument(&g->controller, &g->document);
+                g->cad = &g->document.core;
+                animation_invalidate(g);
+                reset_interaction(g);
+                for (int i = 0; i < 4; ++i) CadView_Reset(&g->views[i]);
+                g->animation_visible = 1;
+                g->animation_docked = 1;
+                raise_aux(g, GUI_AUX_ANIMATION);
+                g->auto_layout = 1;
+                if (result.warningCount) {
+                    gui_set_status(g,
+                                   "Imported %s ANM; Save As required; warning: %s",
+                                   result.format == CAD_FORMAT_ANM_3DGI ? "3DGI" : "3DAN",
+                                   cad_result_message(&result));
+                } else {
+                    gui_set_status(g,
+                                   "Imported %s ANM; native CAD Save As is required",
+                                   result.format == CAD_FORMAT_ANM_3DGI ? "3DGI" : "3DAN");
+                }
+            }
+            CadDocument_Destroy(temp);
+            free(temp);
+        }
+        break;
     case CAD_COMMAND_FILE_IMPORT_3DG1:
     case CAD_COMMAND_FILE_IMPORT_OBJ: {
         const int is_obj = command == CAD_COMMAND_FILE_IMPORT_OBJ;
@@ -720,9 +998,69 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
                             is_obj ? "OBJ Files\0*.obj\0All Files\0*.*\0"
                                    : "3DG1 Files\0*.3dg1\0All Files\0*.*\0",
                             is_obj ? "Export OBJ" : "Export 3DG1")) {
-            int ok = is_obj ? CadExport_OBJ(g->cad, filename) : CadExport_3DG1(g->cad, filename);
+            int ok;
+            if (g->document.lastImportPath &&
+                CadPlatform_PathsEqual(filename,
+                                       g->document.lastImportPath)) {
+                gui_set_status(
+                    g, "Export cancelled: imported source files are never overwritten");
+                break;
+            }
+            ok = is_obj ? CadExport_OBJ(g->cad, filename)
+                        : CadExport_3DG1(g->cad, filename);
             if (ok) CadDocument_SetLastExportPath(&g->document, filename);
             gui_set_status(g, ok ? "Exported %s" : "Export failed: %s", filename);
+        }
+        break;
+    }
+    case CAD_COMMAND_FILE_EXPORT_ANM_3DAN:
+    case CAD_COMMAND_FILE_EXPORT_ANM_3DGI: {
+        CadFormat format = command == CAD_COMMAND_FILE_EXPORT_ANM_3DGI
+                               ? CAD_FORMAT_ANM_3DGI : CAD_FORMAT_ANM_3DAN;
+        CadResult validation = CadAnmCodec_Validate(&g->cad->data);
+        if (!CadResult_IsSuccess(&validation)) {
+            gui_set_status(g, "ANM export is unavailable: %s",
+                           cad_result_message(&validation));
+            break;
+        }
+        if (validation.warningCount) {
+            char warning[512];
+            char details[384];
+            format_warning_diagnostics(&validation, details, sizeof(details));
+            snprintf(warning, sizeof(warning),
+                     "ANM export reported %u compatibility warning(s).\n\n%s\n\nContinue?",
+                     validation.warningCount,
+                     details[0] ? details : cad_result_message(&validation));
+#ifdef _WIN32
+            if (MessageBoxA(GetActiveWindow(), warning,
+                            "3DCad - ANM export warning",
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                gui_set_status(g, "ANM export cancelled after validation warnings");
+                break;
+            }
+#else
+            gui_set_status(g, "%s", warning);
+#endif
+        }
+        if (FileDialog_Save(filename, sizeof(filename),
+                            "ANM Files\0*.anm\0All Files\0*.*\0",
+                            format == CAD_FORMAT_ANM_3DGI
+                                ? "Export 3DGI Animation"
+                                : "Export 3DAN Animation")) {
+            CadResult result = CadDocument_ExportAnm(&g->document, filename,
+                                                     format);
+            if (!CadResult_IsSuccess(&result)) {
+                gui_set_status(g, "ANM export failed: %s",
+                               cad_result_message(&result));
+            } else if (result.warningCount) {
+                gui_set_status(g, "Exported %s with %u warning(s): %s",
+                               filename, result.warningCount,
+                               cad_result_message(&result));
+            } else {
+                gui_set_status(g, "Exported %s deterministically as %s",
+                               filename,
+                               format == CAD_FORMAT_ANM_3DGI ? "3DGI" : "3DAN");
+            }
         }
         break;
     }
@@ -732,43 +1070,70 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
         if (FileDialog_Open(filename, sizeof(filename),
                             palette ? "Palette Files\0*.pal\0All Files\0*.*\0"
                                     : "Color Files\0*.col\0All Files\0*.*\0",
-                            palette ? "Load Palette" : "Load Color")) {
-            void* target = palette ? (void*)g->document.paletteData : (void*)g->document.colorData;
-            size_t capacity = palette ? sizeof(g->document.paletteData) : sizeof(g->document.colorData);
-            int ignored_trailing_data = 0;
-            if (!history_push(g)) break;
-            size_t size = palette
-                          ? read_binary_file_utf8(filename, target, capacity)
-                          : read_binary_prefix_utf8(filename, target, capacity,
-                                                    &ignored_trailing_data);
-            if (size != capacity) {
-                history_cancel(g);
+                             palette ? "Load Palette" : "Load Color")) {
+            uint8_t* bytes = NULL;
+            size_t size = 0;
+            size_t required = palette ? sizeof(g->document.paletteData)
+                                      : sizeof(g->document.colorData);
+            CadResult read_result = CadPlatform_ReadFile(
+                filename, CAD_PALETTE_DATA_SIZE, &bytes, &size);
+            if (!CadResult_IsSuccess(&read_result)) {
+                gui_set_status(g, "Could not load %s: %s", filename,
+                               cad_result_message(&read_result));
+            } else if ((palette && size != required) ||
+                       (!palette && size < required)) {
                 gui_set_status(g, palette
                     ? "%s must be exactly 0x%zX bytes"
                     : "%s must contain at least 0x%zX bytes",
-                    filename, capacity);
+                    filename, required);
             } else {
-                if (palette) g->document.paletteDataSize = size;
-                else g->document.colorDataSize = size;
-                if (!history_commit(g)) break;
-                apply_document_palette(g);
-                if (ignored_trailing_data) {
-                    gui_set_status(g, "Loaded first %zu color bytes from %s; trailing data ignored",
-                                   size, filename);
-                } else {
-                    gui_set_status(g, "Loaded %zu bytes from %s", size, filename);
+                CadRgba entries[256];
+                for (int i = 0; i < 256; ++i) {
+                    unsigned word = (unsigned)bytes[i * 2] |
+                                    ((unsigned)bytes[i * 2 + 1] << 8);
+                    entries[i].r = (uint8_t)(((word >> 0) & 31u) * 255u / 31u);
+                    entries[i].g = (uint8_t)(((word >> 5) & 31u) * 255u / 31u);
+                    entries[i].b = (uint8_t)(((word >> 10) & 31u) * 255u / 31u);
+                    entries[i].a = 255;
+                }
+                if (history_push_named(g, palette ? "Load Palette" : "Load Color")) {
+                    if (palette) {
+                        memcpy(g->document.paletteData, bytes, required);
+                        g->document.paletteDataSize = required;
+                    } else {
+                        memcpy(g->document.colorData, bytes, required);
+                        g->document.colorDataSize = required;
+                    }
+                    if (!CadDocument_SetPalette(&g->document, entries,
+                                                filename)) {
+                        history_cancel(g);
+                        gui_set_status(g,
+                                       "Could not retain the palette source path");
+                    } else if (history_commit(g)) {
+                        apply_document_palette(g);
+                        if (!palette && size > required) {
+                            gui_set_status(g,
+                                "Loaded first %zu color bytes from %s; %zu trailing byte(s) ignored",
+                                required, filename, size - required);
+                        } else {
+                            gui_set_status(g, "Loaded %zu bytes from %s",
+                                           required, filename);
+                        }
+                    }
                 }
             }
+            CadPlatform_Free(bytes);
         }
         break;
     }
     case CAD_COMMAND_FILE_ANIMATION:
-        if (g->animationWindow.r.w > 0) {
-            g->animationWindow.r.w = g->animationWindow.r.h = 0;
-        } else {
-            g->animationWindow.r = (Rect){ 420, 180, 430, 150 };
-        }
-        gui_set_status(g, "Animation records are preserved; editing is deferred");
+        g->animation_visible = !g->animation_visible;
+        if (g->animation_visible && g->animationWindow.r.w <= 0)
+            g->animationWindow.r = (Rect){ 180, 680, 900, 126 };
+        if (g->animation_visible) raise_aux(g, GUI_AUX_ANIMATION);
+        g->auto_layout = 1;
+        gui_set_status(g, "Animation timeline %s",
+                       g->animation_visible ? "shown" : "hidden");
         break;
     case CAD_COMMAND_FILE_OPEN_SHAPE_FOLDER:
         if (FileDialog_SelectFolder(filename, sizeof(filename))) scan_asm_folder_for_shapes(g, filename);
@@ -782,8 +1147,16 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
     case CAD_COMMAND_WINDOW_3D: g->view_visible[1] = !g->view_visible[1]; g->auto_layout = 1; break;
     case CAD_COMMAND_WINDOW_FRONT: g->view_visible[2] = !g->view_visible[2]; g->auto_layout = 1; break;
     case CAD_COMMAND_WINDOW_RIGHT: g->view_visible[3] = !g->view_visible[3]; g->auto_layout = 1; break;
-    case CAD_COMMAND_WINDOW_COORDINATES: g->coordinates_visible = !g->coordinates_visible; g->auto_layout = 1; break;
-    case CAD_COMMAND_WINDOW_TOOL_PALETTE: g->tool_palette_visible = !g->tool_palette_visible; g->auto_layout = 1; break;
+    case CAD_COMMAND_WINDOW_COORDINATES:
+        g->coordinates_visible = !g->coordinates_visible;
+        if (g->coordinates_visible) raise_aux(g, GUI_AUX_COORDINATES);
+        g->auto_layout = 1;
+        break;
+    case CAD_COMMAND_WINDOW_TOOL_PALETTE:
+        g->tool_palette_visible = !g->tool_palette_visible;
+        if (g->tool_palette_visible) raise_aux(g, GUI_AUX_TOOL_PALETTE);
+        g->auto_layout = 1;
+        break;
     case CAD_COMMAND_WINDOW_TEN_KEY:
         if (g->state_visible) state_panel_close(g);
         else state_panel_open(g);
@@ -794,9 +1167,11 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
         gui_set_status(g, "Windows cleaned up to fit the client area");
         break;
     case CAD_COMMAND_WINDOW_HOME:
-        for (int i = 0; i < 4; ++i) CadView_Reset(&g->views[i]);
+        if (!frame_document_views(g, 0)) {
+            for (int i = 0; i < 4; ++i) CadView_Reset(&g->views[i]);
+        }
         apply_document_palette(g);
-        gui_set_status(g, "View cameras returned home");
+        gui_set_status(g, "Home: framed the document in all views");
         break;
     case CAD_COMMAND_WINDOW_RESET_SCALES:
         for (int i = 0; i < 4; ++i) {
@@ -827,7 +1202,7 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
     case CAD_COMMAND_MERGE_GRID: editor_grid_merge(g); break;
     case CAD_COMMAND_MERGE_POINTS: editor_point_merge(g); break;
     case CAD_COMMAND_MERGE_POLYGONS: editor_polygon_merge(g); break;
-    case CAD_COMMAND_MERGE_ALL: editor_grid_merge(g); editor_point_merge(g); editor_polygon_merge(g); break;
+    case CAD_COMMAND_MERGE_ALL: editor_merge_all(g); break;
     case CAD_COMMAND_POLYGON_SORT: editor_polygon_sort(g); break;
     default: break;
     }
@@ -839,7 +1214,8 @@ GuiState* gui_create(void) {
 
     CadDocument_Init(&g->document);
     g->cad = &g->document.core;
-    EditorTool_Init(&g->edit_tool, &g->document);
+    EditorController_Init(&g->controller, &g->document);
+    CadAnimationSession_Init(&g->animation);
     
     /* Initialize views - match window titles */
     CadView_Init(&g->views[0], CAD_VIEW_TOP);    /* "Top" */
@@ -876,7 +1252,13 @@ GuiState* gui_create(void) {
     g->auto_layout = 1;
     g->tool_palette_visible = 1;
     g->coordinates_visible = 1;
-    for (int i = 0; i < 4; ++i) g->view_visible[i] = 1;
+    g->animation_visible = 1;
+    g->animation_docked = 1;
+    for (int i = 0; i < 4; ++i) {
+        g->view_visible[i] = 1;
+        g->view_z_order[i] = i;
+    }
+    for (int i = 0; i < GUI_AUX_COUNT; ++i) g->aux_z_order[i] = i;
     snprintf(g->status_text, sizeof(g->status_text),
              "Ready - select a tool or use the views to inspect the model");
 
@@ -929,11 +1311,9 @@ GuiState* gui_create(void) {
     g->view[3] = (GuiWin){ "Right", { baseX + winW0,  baseY + winH0,  winW3, winH3 }, 1 };
 
     g->coordBox = (GuiWin){ "COORDINATES", { 20, 860, 425, 80 }, 1 };
-    g->animationWindow = (GuiWin){ "ANIMATION", { 500, 200, 430, 150 }, 1 };
-    g->animationWindow.r.w = 0; /* Start hidden (width 0) */
-    g->animationWindow.r.h = 0; /* Start hidden (height 0) */
+    g->animationWindow = (GuiWin){ "ANIMATION", { 180, 680, 900, 126 }, 1 };
     g->stateWindow = (GuiWin){ "STATE / TENKEY", { 260, 90, 620, 350 }, 1 };
-    
+
     g->shapeBrowserWindow = (GuiWin){ "SHAPE BROWSER", { 600, 300, 400, 500 }, 1 };
     g->shapeBrowserWindow.r.w = 0; /* Start hidden */
     g->shapeBrowserWindow.r.h = 0;
@@ -943,19 +1323,17 @@ GuiState* gui_create(void) {
     g->shape_scroll_offset = 0;
     g->shape_search[0] = '\0';
     g->shape_folder_path[0] = '\0';
-    
-    /* Initialize animation state */
-    g->anim_current_frame = 0;
-    g->anim_total_frames = 0;
-    g->anim_playing = 0;
-    g->anim_loop = 0;
+
+    g->anim_copy_source = -1;
+    animation_invalidate(g);
 
     return g;
 }
 
 void gui_destroy(GuiState* g) {
     if (!g) return;
-    EditorTool_Cancel(&g->edit_tool);
+    free_asm_browser_sources(g);
+    EditorController_CancelEdit(&g->controller);
     CadDocument_Destroy(&g->document);
     CadCore_Destroy(g->clipboard);
     free(g->clipboard);
@@ -973,7 +1351,7 @@ void gui_destroy(GuiState* g) {
             rg_free_texture(g->anim_icons[i]);
         }
     }
-    
+
     /* Free shape names */
     if (g->shape_names) {
         for (int i = 0; i < g->shape_count; i++) {
@@ -988,1726 +1366,357 @@ void gui_destroy(GuiState* g) {
     free(g);
 }
 
-/* Scan ASM files in a folder for shape definitions */
-static void scan_asm_folder_for_shapes(GuiState* g, const char* folder_path) {
-    if (!g || !folder_path) return;
-    
-    /* Free existing shape names */
-    if (g->shape_names) {
-        for (int i = 0; i < g->shape_count; i++) {
-            if (g->shape_names[i]) {
-                free(g->shape_names[i]);
-            }
+static int asm_ascii_compare_ci(const char* left, const char* right) {
+    unsigned char a;
+    unsigned char b;
+    if (!left) left = "";
+    if (!right) right = "";
+    do {
+        a = (unsigned char)*left++;
+        b = (unsigned char)*right++;
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+        if (a != b) return a < b ? -1 : 1;
+    } while (a != 0);
+    return 0;
+}
+
+static char* asm_copy_string(const char* source) {
+    size_t size;
+    char* copy;
+    if (!source) source = "";
+    size = strlen(source) + 1;
+    copy = (char*)malloc(size);
+    if (copy) memcpy(copy, source, size);
+    return copy;
+}
+
+static void free_asm_source_array(CadAsmTextSource** sources,
+                                  size_t* source_count) {
+    size_t index;
+    if (!sources || !source_count) return;
+    if (*sources) {
+        for (index = 0; index < *source_count; ++index) {
+            free((void*)(*sources)[index].name);
+            CadPlatform_Free((void*)(*sources)[index].bytes);
         }
-        free(g->shape_names);
-        g->shape_names = NULL;
+        free(*sources);
     }
-    g->shape_count = 0;
+    *sources = NULL;
+    *source_count = 0;
+}
+
+static void free_asm_browser_sources(GuiState* g) {
+    if (!g) return;
+    free_asm_source_array(&g->shape_asm_sources,
+                          &g->shape_asm_source_count);
+    free_asm_source_array(&g->shape_constant_sources,
+                          &g->shape_constant_source_count);
+    free(g->shape_catalog);
+    g->shape_catalog = NULL;
+}
+
+static void free_shape_name_array(char*** names, int* count) {
+    int index;
+    if (!names || !count) return;
+    if (*names) {
+        for (index = 0; index < *count; ++index) free((*names)[index]);
+        free(*names);
+    }
+    *names = NULL;
+    *count = 0;
+}
+
+static int append_asm_source(CadAsmTextSource** sources, size_t* count,
+                             size_t* capacity, const char* display_name,
+                             const char* path, CadResult* failure) {
+    CadResult result;
+    uint8_t* bytes = NULL;
+    size_t size = 0;
+    char* copied_name;
+    CadAsmTextSource* expanded;
+    if (!sources || !count || !capacity || !display_name || !path) return 0;
+    result = CadPlatform_ReadFile(path, CAD_ASM_MAX_INPUT_BYTES, &bytes, &size);
+    if (!CadResult_IsSuccess(&result)) {
+        if (failure) *failure = result;
+        return 0;
+    }
+    if (size == 0) {
+        CadPlatform_Free(bytes);
+        return 1;
+    }
+    copied_name = asm_copy_string(display_name);
+    if (!copied_name) {
+        CadPlatform_Free(bytes);
+        return 0;
+    }
+    if (*count == *capacity) {
+        size_t next_capacity = *capacity ? *capacity * 2 : 16;
+        expanded = (CadAsmTextSource*)realloc(
+            *sources, next_capacity * sizeof(**sources));
+        if (!expanded) {
+            free(copied_name);
+            CadPlatform_Free(bytes);
+            return 0;
+        }
+        *sources = expanded;
+        *capacity = next_capacity;
+    }
+    (*sources)[*count].name = copied_name;
+    (*sources)[*count].bytes = bytes;
+    (*sources)[*count].size = size;
+    ++*count;
+    return 1;
+}
+
+static int compare_asm_source(const void* left_value,
+                              const void* right_value) {
+    const CadAsmTextSource* left = (const CadAsmTextSource*)left_value;
+    const CadAsmTextSource* right = (const CadAsmTextSource*)right_value;
+    int comparison = asm_ascii_compare_ci(left->name, right->name);
+    return comparison ? comparison : strcmp(left->name, right->name);
+}
+
+static const char* asm_result_message(const CadResult* result) {
+    if (result && result->diagnosticCount &&
+        result->diagnostics[0].message[0])
+        return result->diagnostics[0].message;
+    return "Unknown ASM import failure";
+}
+
+#ifdef _WIN32
+static int collect_asm_folder(const char* folder_path,
+                              CadAsmTextSource** sources,
+                              size_t* source_count, size_t* source_capacity,
+                              CadResult* failure) {
+    wchar_t wide_folder[GUI_PATH_CAPACITY * 2];
+    wchar_t search_path[GUI_PATH_CAPACITY * 2];
+    WIN32_FIND_DATAW find_data;
+    HANDLE find_handle;
+    if (!gui_utf8_to_wide(folder_path, wide_folder,
+                          ARRAY_COUNT(wide_folder)) ||
+        _snwprintf_s(search_path, ARRAY_COUNT(search_path), _TRUNCATE,
+                     L"%ls\\*.asm", wide_folder) < 0)
+        return 0;
+    find_handle = FindFirstFileW(search_path, &find_data);
+    if (find_handle == INVALID_HANDLE_VALUE) return 0;
+    do {
+        char file_name[GUI_PATH_CAPACITY];
+        char full_path[GUI_PATH_CAPACITY * 2];
+        int written;
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!gui_wide_to_utf8(find_data.cFileName, file_name,
+                              ARRAY_COUNT(file_name))) {
+            FindClose(find_handle);
+            return 0;
+        }
+        written = snprintf(full_path, sizeof(full_path), "%s\\%s",
+                           folder_path, file_name);
+        if (written < 0 || (size_t)written >= sizeof(full_path) ||
+            !append_asm_source(sources, source_count, source_capacity,
+                               file_name, full_path, failure)) {
+            FindClose(find_handle);
+            return 0;
+        }
+    } while (FindNextFileW(find_handle, &find_data));
+    FindClose(find_handle);
+    return *source_count != 0;
+}
+#endif
+
+static void collect_optional_constant_sources(
+    const char* shapes_folder, CadAsmTextSource** sources,
+    size_t* source_count, size_t* source_capacity) {
+    static const char* const files[] = {
+        "STRATEQU.INC", "VARS.INC", "STRUCTS.INC", "MACROS.INC"
+    };
+    char inc_folder[GUI_PATH_CAPACITY * 2];
+    size_t length;
+    char* separator;
+    size_t index;
+    if (!shapes_folder || !sources || !source_count || !source_capacity)
+        return;
+    if (snprintf(inc_folder, sizeof(inc_folder), "%s", shapes_folder) < 0)
+        return;
+    length = strlen(inc_folder);
+    while (length && (inc_folder[length - 1] == '\\' ||
+                      inc_folder[length - 1] == '/'))
+        inc_folder[--length] = '\0';
+    separator = strrchr(inc_folder, '\\');
+    if (!separator) separator = strrchr(inc_folder, '/');
+    if (separator) *separator = '\0';
+    length = strlen(inc_folder);
+    if (length + strlen("\\INC") + 1 >= sizeof(inc_folder)) return;
+    memcpy(inc_folder + length, "\\INC", strlen("\\INC") + 1);
+    for (index = 0; index < (size_t)ARRAY_COUNT(files); ++index) {
+        char full_path[GUI_PATH_CAPACITY * 2];
+        CadResult ignored;
+        size_t before = *source_count;
+        int written = snprintf(full_path, sizeof(full_path), "%s\\%s",
+                               shapes_folder, files[index]);
+        if (written < 0 || (size_t)written >= sizeof(full_path)) continue;
+        (void)append_asm_source(sources, source_count, source_capacity,
+                                files[index], full_path, &ignored);
+        if (*source_count != before) continue;
+        written = snprintf(full_path, sizeof(full_path), "%s\\%s",
+                           inc_folder, files[index]);
+        if (written < 0 || (size_t)written >= sizeof(full_path)) continue;
+        (void)append_asm_source(sources, source_count, source_capacity,
+                                files[index], full_path, &ignored);
+    }
+}
+
+static void scan_asm_folder_for_shapes(GuiState* g,
+                                       const char* folder_path) {
+    CadAsmTextSource* asm_sources = NULL;
+    CadAsmTextSource* constant_sources = NULL;
+    size_t asm_count = 0;
+    size_t asm_capacity = 0;
+    size_t constant_count = 0;
+    size_t constant_capacity = 0;
+    CadAsmCatalog* catalog = NULL;
+    char** names = NULL;
+    int name_count = 0;
+    CadResult result = CadResult_Ok(CAD_FORMAT_AUTO);
+    size_t index;
+    if (!g || !folder_path || !folder_path[0]) return;
+    if (strlen(folder_path) >= sizeof(g->shape_folder_path)) {
+        gui_set_status(g, "ASM folder path is too long");
+        return;
+    }
+#ifdef _WIN32
+    if (!collect_asm_folder(folder_path, &asm_sources, &asm_count,
+                            &asm_capacity, &result)) {
+        gui_set_status(g, "Could not read ASM folder: %s",
+                       result.errorCount ? asm_result_message(&result)
+                                         : "no .asm files found");
+        free_asm_source_array(&asm_sources, &asm_count);
+        return;
+    }
+#else
+    (void)asm_capacity;
+    gui_set_status(g, "ASM shape browsing is currently Windows-only");
+    return;
+#endif
+    qsort(asm_sources, asm_count, sizeof(*asm_sources), compare_asm_source);
+    collect_optional_constant_sources(folder_path, &constant_sources,
+                                      &constant_count, &constant_capacity);
+    catalog = (CadAsmCatalog*)malloc(sizeof(*catalog));
+    if (!catalog) {
+        gui_set_status(g, "Could not allocate the ASM shape catalog");
+        goto fail;
+    }
+    result = CadImportAsm_BuildCatalog(asm_sources, asm_count, catalog);
+    if (!CadResult_IsSuccess(&result)) {
+        gui_set_status(g, "ASM catalog rejected: %s",
+                       asm_result_message(&result));
+        goto fail;
+    }
+    names = (char**)calloc(catalog->shapeCount ? catalog->shapeCount : 1,
+                           sizeof(*names));
+    if (!names) {
+        gui_set_status(g, "Could not allocate the ASM shape list");
+        goto fail;
+    }
+    for (index = 0; index < catalog->shapeCount; ++index) {
+        if (name_count > 0 &&
+            asm_ascii_compare_ci(names[name_count - 1],
+                                 catalog->shapes[index].name) == 0)
+            continue;
+        names[name_count] = asm_copy_string(catalog->shapes[index].name);
+        if (!names[name_count]) {
+            gui_set_status(g, "Could not allocate an ASM shape name");
+            goto fail;
+        }
+        ++name_count;
+    }
+    if (name_count == 0) {
+        gui_set_status(g, "No recovered shape definitions were found");
+        goto fail;
+    }
+
+    free_asm_browser_sources(g);
+    free_shape_name_array(&g->shape_names, &g->shape_count);
+    g->shape_asm_sources = asm_sources;
+    g->shape_asm_source_count = asm_count;
+    g->shape_constant_sources = constant_sources;
+    g->shape_constant_source_count = constant_count;
+    g->shape_catalog = catalog;
+    g->shape_names = names;
+    g->shape_count = name_count;
     g->shape_selected = -1;
     g->shape_scroll_offset = 0;
     g->shape_search_active = 0;
     g->shape_search[0] = '\0';
     g->shape_preview_valid = 0;
     CadCore_Clear(g->shape_preview);
-    strncpy(g->shape_folder_path, folder_path, sizeof(g->shape_folder_path) - 1);
-    g->shape_folder_path[sizeof(g->shape_folder_path) - 1] = '\0';
-    
-    /* Load constants from INC files for resolving symbolic values */
-    load_all_constants(folder_path);
-    
-#ifdef _WIN32
-    wchar_t wide_folder[GUI_PATH_CAPACITY * 2];
-    wchar_t search_path[GUI_PATH_CAPACITY * 2];
-    if (!gui_utf8_to_wide(folder_path, wide_folder, ARRAY_COUNT(wide_folder))) {
-        gui_set_status(g, "Shape folder path is not valid UTF-8");
-        return;
-    }
-    if (_snwprintf_s(search_path, ARRAY_COUNT(search_path), _TRUNCATE,
-                     L"%ls\\*.asm", wide_folder) < 0) {
-        gui_set_status(g, "Shape folder path is too long");
-        return;
-    }
-    WIN32_FIND_DATAW find_data;
-    HANDLE hFind = FindFirstFileW(search_path, &find_data);
-    
-    if (hFind == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "No ASM files found in: %s\n", folder_path);
-        return;
-    }
-    
-    /* First pass: count shapes */
-    int shape_capacity = 256;
-    g->shape_names = (char**)calloc(shape_capacity, sizeof(char*));
-    if (!g->shape_names) {
-        FindClose(hFind);
-        return;
-    }
-    
-    do {
-        if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            wchar_t file_path[GUI_PATH_CAPACITY * 2];
-            if (_snwprintf_s(file_path, ARRAY_COUNT(file_path), _TRUNCATE,
-                             L"%ls\\%ls", wide_folder, find_data.cFileName) < 0) continue;
-            
-            /* Read file and extract shape names */
-            FILE* f = _wfopen(file_path, L"rb");
-            if (f) {
-                char line[1024];
-                while (fgets(line, sizeof(line), f)) {
-                    /* Look for shape_P pattern (points section indicates a shape)
-                       Pattern: shape_name_p (case insensitive, can have whitespace before) */
-                    char line_lower[1024];
-                    strncpy(line_lower, line, sizeof(line_lower) - 1);
-                    line_lower[sizeof(line_lower) - 1] = '\0';
-                    for (int k = 0; line_lower[k]; k++) {
-                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                    }
-                    
-                    char* p_pos = strstr(line_lower, "_p");
-                    if (p_pos) {
-                        /* Check that after _p there's whitespace or end of line (not _p1, _p2, etc.) */
-                        char after_p = p_pos[2];
-                        if (after_p == '\0' || after_p == '\n' || after_p == '\r' || isspace((unsigned char)after_p)) {
-                            /* Extract shape name (everything before _p) */
-                            char* start = line;
-                            while (*start && isspace((unsigned char)*start)) start++;
-                            char* p_pos_orig = line + (p_pos - line_lower);
-                            if (start < p_pos_orig) {
-                                char shape_name[128];
-                                const size_t name_len = (size_t)(p_pos_orig - start);
-                                if (name_len > 0 && name_len < sizeof(shape_name)) {
-                                    memcpy(shape_name, start, name_len);
-                                    shape_name[name_len] = '\0';
-                                
-                                /* Check if we already have this shape */
-                                int found = 0;
-                                for (int i = 0; i < g->shape_count; i++) {
-                                    if (g->shape_names[i] && strcmp(g->shape_names[i], shape_name) == 0) {
-                                        found = 1;
-                                        break;
-                                    }
-                                }
-                                
-                                if (!found) {
-                                    /* Add shape name */
-                                    if (g->shape_count >= shape_capacity) {
-                                        shape_capacity *= 2;
-                                        char** expanded = (char**)realloc(
-                                            g->shape_names, shape_capacity * sizeof(char*));
-                                        if (!expanded) {
-                                            fclose(f);
-                                            FindClose(hFind);
-                                            return;
-                                        }
-                                        g->shape_names = expanded;
-                                    }
-                                    g->shape_names[g->shape_count] = (char*)malloc(name_len + 1);
-                                    if (g->shape_names[g->shape_count]) {
-                                        strcpy(g->shape_names[g->shape_count], shape_name);
-                                        g->shape_count++;
-                                    }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                fclose(f);
-            }
-        }
-    } while (FindNextFileW(hFind, &find_data));
-    
-    
-    FindClose(hFind);
-#else
-    /* Non-Windows: Use dirent */
-    DIR* dir = opendir(folder_path);
-    if (!dir) {
-        fprintf(stderr, "Cannot open folder: %s\n", folder_path);
-        return;
-    }
-    
-    int shape_capacity = 256;
-    g->shape_names = (char**)calloc(shape_capacity, sizeof(char*));
-    if (!g->shape_names) {
-        closedir(dir);
-        return;
-    }
-    
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_REG) {
-            const char* name = entry->d_name;
-            int len = strlen(name);
-            if (len > 4 && strcasecmp(name + len - 4, ".asm") == 0) {
-                char file_path[GUI_PATH_CAPACITY * 2];
-                snprintf(file_path, sizeof(file_path), "%s/%s", folder_path, name);
-                
-                FILE* f = fopen(file_path, "r");
-                if (f) {
-                    char line[1024];
-                    while (fgets(line, sizeof(line), f)) {
-                        char line_lower[1024];
-                        strncpy(line_lower, line, sizeof(line_lower) - 1);
-                        line_lower[sizeof(line_lower) - 1] = '\0';
-                        for (int k = 0; line_lower[k]; k++) {
-                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                        }
-                        
-                        char* p_pos = strstr(line_lower, "_p");
-                        if (p_pos) {
-                            /* Check that after _p there's whitespace or end of line */
-                            char after_p = p_pos[2];
-                            if (after_p == '\0' || after_p == '\n' || after_p == '\r' || isspace((unsigned char)after_p)) {
-                                char* start = line;
-                                while (*start && isspace((unsigned char)*start)) start++;
-                                char* p_pos_orig = line + (p_pos - line_lower);
-                                if (start < p_pos_orig) {
-                                    int name_len = p_pos_orig - start;
-                                    if (name_len > 0 && name_len < 128) {
-                                        char shape_name[128];
-                                        strncpy(shape_name, start, name_len);
-                                        shape_name[name_len] = '\0';
-                                        
-                                        int found = 0;
-                                        for (int i = 0; i < g->shape_count; i++) {
-                                            if (g->shape_names[i] && strcmp(g->shape_names[i], shape_name) == 0) {
-                                                found = 1;
-                                                break;
-                                            }
-                                        }
-                                        
-                                        if (!found) {
-                                            if (g->shape_count >= shape_capacity) {
-                                                shape_capacity *= 2;
-                                                char** expanded = (char**)realloc(
-                                                    g->shape_names, shape_capacity * sizeof(char*));
-                                                if (!expanded) {
-                                                    fclose(f);
-                                                    closedir(dir);
-                                                    return;
-                                                }
-                                                g->shape_names = expanded;
-                                            }
-                                            g->shape_names[g->shape_count] = (char*)malloc(name_len + 1);
-                                            if (g->shape_names[g->shape_count]) {
-                                                strcpy(g->shape_names[g->shape_count], shape_name);
-                                                g->shape_count++;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    fclose(f);
-                }
-            }
-        }
-    }
-    closedir(dir);
-#endif
-    
-    /* Sort shape names alphabetically */
-    for (int i = 0; i < g->shape_count - 1; i++) {
-        for (int j = i + 1; j < g->shape_count; j++) {
-            if (g->shape_names[i] && g->shape_names[j] && 
-                strcmp(g->shape_names[i], g->shape_names[j]) > 0) {
-                char* temp = g->shape_names[i];
-                g->shape_names[i] = g->shape_names[j];
-                g->shape_names[j] = temp;
-            }
-        }
-    }
-    
-    fprintf(stdout, "Found %d shapes in folder: %s\n", g->shape_count, folder_path);
-    
-    /* Show shape browser window */
-    if (g->shape_count > 0) {
+    snprintf(g->shape_folder_path, sizeof(g->shape_folder_path), "%s",
+             folder_path);
+    {
         int width = g->layout_width > 20 && g->layout_width - 20 < 640
-                    ? g->layout_width - 20 : 640;
+                        ? g->layout_width - 20 : 640;
         int height = g->layout_height > 70 && g->layout_height - 50 < 520
-                     ? g->layout_height - 50 : 520;
+                         ? g->layout_height - 50 : 520;
+        int x;
+        int y;
         if (width < 420) width = 420;
         if (height < 360) height = 360;
-        int x = g->layout_width > width ? (g->layout_width - width) / 2 : 8;
-        int y = g->layout_height > height ? (g->layout_height - height) / 2
-                                          : MenuBarHeight() + 4;
+        x = g->layout_width > width ? (g->layout_width - width) / 2 : 8;
+        y = g->layout_height > height ? (g->layout_height - height) / 2
+                                      : MenuBarHeight() + 4;
         if (y < MenuBarHeight() + 4) y = MenuBarHeight() + 4;
         g->shapeBrowserWindow.r = (Rect){ x, y, width, height };
-        gui_set_status(g, "Found %d ASM shapes; search and select one to preview",
-                       g->shape_count);
+        raise_aux(g, GUI_AUX_SHAPE_BROWSER);
     }
+    gui_set_status(g, "Found %d ASM shapes%s; select one to preview",
+                   name_count, result.warningCount ? " (with diagnostics)" : "");
+    return;
+
+fail:
+    free_shape_name_array(&names, &name_count);
+    free(catalog);
+    free_asm_source_array(&constant_sources, &constant_count);
+    free_asm_source_array(&asm_sources, &asm_count);
 }
 
-/* Simple JSON parser to extract shape-to-file mapping from Shapes.SFEOPTIM */
-static char* find_shape_file_in_json(const char* json_content, const char* shape_name) {
-    if (!json_content || !shape_name) return NULL;
-    
-    /* Build search pattern: "SHAPE_NAME":" */
-    char pattern[512];
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", shape_name);
-    
-    /* Find the pattern in JSON */
-    char* pos = strstr(json_content, pattern);
-    if (!pos) return NULL;
-    
-    /* Skip past the pattern to get to the filename */
-    pos += strlen(pattern);
-    
-    /* Extract filename until closing quote */
-    static char filename[GUI_PATH_CAPACITY];
-    size_t filename_length = 0;
-    while (*pos && *pos != '"' && filename_length + 1 < sizeof(filename)) {
-        filename[filename_length++] = *pos++;
-    }
-    filename[filename_length] = '\0';
-    
-    if (filename_length == 0) return NULL;
-    
-    return filename;
-}
-
-/* ========== Constant Resolver for ASM symbolic constants ========== */
-
-#define MAX_CONSTANTS 4096
-#define MAX_CONST_NAME 64
-
-typedef struct {
-    char name[MAX_CONST_NAME];
-    int value;
-    int resolved;  /* 1 if value is final, 0 if needs resolution */
-} AsmConstant;
-
-typedef struct {
-    AsmConstant constants[MAX_CONSTANTS];
-    int count;
-} ConstantTable;
-
-static ConstantTable g_constants = { .count = 0 };
-static ConstantTable g_constant_baseline = { .count = 0 };
-
-static void constants_clear(void) {
-    g_constants.count = 0;
-}
-
-static int constants_find(const char* name) {
-    for (int i = 0; i < g_constants.count; i++) {
-        if (_stricmp(g_constants.constants[i].name, name) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static void constants_add(const char* name, int value) {
-    if (g_constants.count >= MAX_CONSTANTS) return;
-    
-    /* Check if already exists */
-    int idx = constants_find(name);
-    if (idx >= 0) {
-        g_constants.constants[idx].value = value;
-        g_constants.constants[idx].resolved = 1;
-        return;
-    }
-    
-    strncpy(g_constants.constants[g_constants.count].name, name, MAX_CONST_NAME - 1);
-    g_constants.constants[g_constants.count].name[MAX_CONST_NAME - 1] = '\0';
-    g_constants.constants[g_constants.count].value = value;
-    g_constants.constants[g_constants.count].resolved = 1;
-    g_constants.count++;
-}
-
-static int constants_get(const char* name, int* out_value) {
-    int idx = constants_find(name);
-    if (idx >= 0 && g_constants.constants[idx].resolved) {
-        *out_value = g_constants.constants[idx].value;
-        return 1;
-    }
-    return 0;
-}
-
-/* Parse a value that may be a number, constant name, or expression */
-static int parse_const_value(const char* str, int* out_value) {
-    if (!str || !out_value) return 0;
-    
-    /* Skip leading whitespace */
-    while (*str == ' ' || *str == '\t') str++;
-    
-    /* Check for negated constant: -constantname */
-    if (*str == '-' && isalpha((unsigned char)str[1])) {
-        /* It's a negated constant like -size */
-        str++; /* skip the minus */
-        char const_name[MAX_CONST_NAME];
-        int name_len = 0;
-        while (isalnum((unsigned char)*str) || *str == '_') {
-            if (name_len < MAX_CONST_NAME - 1) {
-                const_name[name_len++] = *str;
-            }
-            str++;
-        }
-        const_name[name_len] = '\0';
-        
-        int val;
-        if (!constants_get(const_name, &val)) {
-            return 0; /* Can't resolve */
-        }
-        *out_value = -val;
-        return 1;
-    }
-    
-    /* If it starts with a digit or minus followed by digit, it's a number */
-    if (isdigit((unsigned char)*str) || (*str == '-' && isdigit((unsigned char)str[1]))) {
-        char* end;
-        long val = strtol(str, &end, 10);
-        
-        /* Check for operators in the expression */
-        while (*end == '+' || *end == '-' || *end == '*') {
-            char op = *end++;
-            while (*end == ' ' || *end == '\t') end++;
-            
-            /* Next part could be a number or constant */
-            long next_val;
-            if (isdigit((unsigned char)*end) || (*end == '-' && isdigit((unsigned char)end[1]))) {
-                next_val = strtol(end, &end, 10);
-            } else {
-                /* It's a constant name - extract it */
-                char const_name[MAX_CONST_NAME];
-                int name_len = 0;
-                while (isalnum((unsigned char)*end) || *end == '_') {
-                    if (name_len < MAX_CONST_NAME - 1) {
-                        const_name[name_len++] = *end;
-                    }
-                    end++;
-                }
-                const_name[name_len] = '\0';
-                
-                int const_val;
-                if (!constants_get(const_name, &const_val)) {
-                    return 0; /* Can't resolve */
-                }
-                next_val = const_val;
-            }
-            
-            if (op == '+') val += next_val;
-            else if (op == '-') val -= next_val;
-            else if (op == '*') val *= next_val;
-        }
-        
-        *out_value = (int)val;
-        return 1;
-    }
-    
-    /* It starts with a letter - it's a constant name or expression starting with constant */
-    char const_name[MAX_CONST_NAME];
-    int name_len = 0;
-    const char* p = str;
-    while (isalnum((unsigned char)*p) || *p == '_') {
-        if (name_len < MAX_CONST_NAME - 1) {
-            const_name[name_len++] = *p;
-        }
-        p++;
-    }
-    const_name[name_len] = '\0';
-    
-    int val;
-    if (!constants_get(const_name, &val)) {
-        return 0; /* Can't resolve */
-    }
-    
-    /* Check for operators after the constant */
-    while (*p == ' ' || *p == '\t') p++;
-    while (*p == '+' || *p == '-' || *p == '*') {
-        char op = *p++;
-        while (*p == ' ' || *p == '\t') p++;
-        
-        long next_val;
-        if (isdigit((unsigned char)*p) || (*p == '-' && isdigit((unsigned char)p[1]))) {
-            char* end;
-            next_val = strtol(p, &end, 10);
-            p = end;
-        } else {
-            /* Another constant */
-            name_len = 0;
-            while (isalnum((unsigned char)*p) || *p == '_') {
-                if (name_len < MAX_CONST_NAME - 1) {
-                    const_name[name_len++] = *p;
-                }
-                p++;
-            }
-            const_name[name_len] = '\0';
-            
-            int const_val;
-            if (!constants_get(const_name, &const_val)) {
-                return 0;
-            }
-            next_val = const_val;
-        }
-        
-        if (op == '+') val += (int)next_val;
-        else if (op == '-') val -= (int)next_val;
-        else if (op == '*') val *= (int)next_val;
-    }
-    
-    *out_value = val;
-    return 1;
-}
-
-/* Parse a single line for constant definition */
-static void parse_constant_line(const char* line) {
-    /* Format: name equ value  OR  name = value */
-    char line_copy[512];
-    strncpy(line_copy, line, sizeof(line_copy) - 1);
-    line_copy[sizeof(line_copy) - 1] = '\0';
-    
-    /* Skip leading whitespace */
-    char* p = line_copy;
-    while (*p == ' ' || *p == '\t') p++;
-    
-    /* Skip comments */
-    if (*p == ';' || *p == '\0' || *p == '\n' || *p == '\r') return;
-    
-    /* Extract name */
-    char name[MAX_CONST_NAME];
-    int name_len = 0;
-    while (isalnum((unsigned char)*p) || *p == '_') {
-        if (name_len < MAX_CONST_NAME - 1) {
-            name[name_len++] = *p;
-        }
-        p++;
-    }
-    name[name_len] = '\0';
-    if (name_len == 0) return;
-    
-    /* Skip whitespace */
-    while (*p == ' ' || *p == '\t') p++;
-    
-    /* Check for 'equ' or '=' */
-    int is_equ = 0;
-    if (_strnicmp(p, "equ", 3) == 0 && (p[3] == ' ' || p[3] == '\t')) {
-        p += 3;
-        is_equ = 1;
-    } else if (*p == '=') {
-        p++;
-        is_equ = 1;
-    }
-    
-    if (!is_equ) return;
-    
-    /* Skip whitespace */
-    while (*p == ' ' || *p == '\t') p++;
-    
-    /* Remove trailing comment */
-    char* comment = strchr(p, ';');
-    if (comment) *comment = '\0';
-    
-    /* Remove trailing whitespace */
-    int len = (int)strlen(p);
-    while (len > 0 && (p[len-1] == ' ' || p[len-1] == '\t' || p[len-1] == '\n' || p[len-1] == '\r')) {
-        p[--len] = '\0';
-    }
-    
-    /* Try to parse the value */
-    int value;
-    if (parse_const_value(p, &value)) {
-        constants_add(name, value);
-    }
-}
-
-/* Load constants from an INC file */
-static void load_constants_from_file(const char* filepath) {
-    FILE* f = gui_fopen_utf8(filepath, "rb");
-    if (!f) return;
-    
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    char* content = (char*)malloc(size + 1);
-    if (!content) {
-        fclose(f);
-        return;
-    }
-    
-    size_t read = fread(content, 1, size, f);
-    fclose(f);
-    content[read] = '\0';
-    
-    /* Parse line by line - do multiple passes to resolve dependencies */
-    for (int pass = 0; pass < 3; pass++) {
-        char* line = content;
-        while (*line) {
-            char* next = strchr(line, '\n');
-            if (next) {
-                *next = '\0';
-                parse_constant_line(line);
-                line = next + 1;
-            } else {
-                parse_constant_line(line);
-                break;
-            }
-        }
-        
-        /* Reset for next pass */
-        /* Reread line breaks */
-        for (size_t i = 0; i < read; i++) {
-            if (content[i] == '\0' && i + 1 < read) content[i] = '\n';
-        }
-    }
-    
-    free(content);
-}
-
-/* Load all constants from INC folder */
-static void load_all_constants(const char* shapes_folder) {
-    constants_clear();
-    
-    /* Build path to INC folder - go up one level from SHAPES */
-    char inc_path[GUI_PATH_CAPACITY * 2];
-    strncpy(inc_path, shapes_folder, sizeof(inc_path) - 1);
-    inc_path[sizeof(inc_path) - 1] = '\0';
-    
-    /* Remove trailing slash if present */
-    int len = (int)strlen(inc_path);
-    while (len > 0 && (inc_path[len-1] == '/' || inc_path[len-1] == '\\')) {
-        inc_path[--len] = '\0';
-    }
-    
-    /* Go up one directory (from SHAPES to SF) */
-    char* last_sep = strrchr(inc_path, '\\');
-    if (!last_sep) last_sep = strrchr(inc_path, '/');
-    if (last_sep) {
-        *last_sep = '\0';
-        strncat(inc_path, "\\INC", sizeof(inc_path) - strlen(inc_path) - 1);
-    } else {
-        strncat(inc_path, "\\..\\INC", sizeof(inc_path) - strlen(inc_path) - 1);
-    }
-    
-    fprintf(stdout, "load_all_constants: Looking for INC folder at '%s'\n", inc_path);
-    
-    char filepath[GUI_PATH_CAPACITY * 2];
-    
-    /* Load INC files in order of dependency (most basic first) */
-    const char* inc_files[] = {
-        "STRATEQU.INC",  /* Shape-related constants */
-        "VARS.INC",      /* Variables */
-        "STRUCTS.INC",   /* Structure definitions */
-        "MACROS.INC",    /* Macros */
-        NULL
-    };
-    
-    for (int f = 0; inc_files[f] != NULL; f++) {
-        snprintf(filepath, sizeof(filepath), "%s\\%s", inc_path, inc_files[f]);
-        load_constants_from_file(filepath);
-    }
-    
-    /* Shape ASM assignments are intentionally not added here: many are local
-       to one ShapeHdr and reusing them globally can silently corrupt a later
-       preview.  Each selected shape overlays its locals on this INC baseline. */
-    g_constant_baseline = g_constants;
-    fprintf(stdout, "load_all_constants: Loaded %d constants\n", g_constants.count);
-}
-
-/* ========== End Constant Resolver ========== */
-
-/* Helper: Create a polygon with its own point chain (points are copied, not shared) */
-/* max_vertices: maximum valid vertex index (for bounds checking) */
-static int16_t create_polygon_with_points_safe(CadCore* core, double vertices[][3],
-                                                int vertex_indices[], int num_vertices,
-                                                uint8_t color, int max_vertices,
-                                                int* hard_error) {
-    if (!core || num_vertices < CAD_MIN_FACE_POINTS ||
-        num_vertices > CAD_MAX_FACE_POINTS) {
-        if (hard_error) *hard_error = 1;
-        return INVALID_INDEX;
-    }
-    int16_t added[CAD_MAX_FACE_POINTS];
-    int added_count = 0;
-    int previous_dirty = core->isDirty;
-    int16_t previous_new_point = core->newPoint;
-    
-    /* Create new points for this polygon and link them */
-    int16_t first_point = INVALID_INDEX;
-    int16_t prev_point = INVALID_INDEX;
-    
-    for (int i = 0; i < num_vertices; i++) {
-        int v_idx = vertex_indices[i];
-        /* Bounds check to prevent crashes */
-        if (v_idx < 0 || v_idx >= max_vertices) {
-            fprintf(stderr, "create_polygon_with_points: vertex index %d out of bounds (max %d)\n", v_idx, max_vertices);
-            if (hard_error) *hard_error = 1;
-            for (int rollback = 0; rollback < added_count; ++rollback) {
-                memset(&core->data.points[added[rollback]], 0, sizeof(CadPoint));
-                core->data.points[added[rollback]].nextPoint = INVALID_INDEX;
-            }
-            CadCore_RebuildDerivedState(core);
-            core->isDirty = previous_dirty;
-            core->newPoint = previous_new_point;
-            return INVALID_INDEX;
-        }
-        int16_t new_pt = CadCore_AddPoint(core, vertices[v_idx][0], vertices[v_idx][1], vertices[v_idx][2]);
-        if (new_pt == INVALID_INDEX) {
-            if (hard_error) *hard_error = 1;
-            for (int rollback = 0; rollback < added_count; ++rollback) {
-                memset(&core->data.points[added[rollback]], 0, sizeof(CadPoint));
-                core->data.points[added[rollback]].nextPoint = INVALID_INDEX;
-            }
-            CadCore_RebuildDerivedState(core);
-            core->isDirty = previous_dirty;
-            core->newPoint = previous_new_point;
-            return INVALID_INDEX;
-        }
-        added[added_count++] = new_pt;
-        
-        if (first_point == INVALID_INDEX) {
-            first_point = new_pt;
-        }
-        
-        if (prev_point != INVALID_INDEX) {
-            CadPoint* prev = CadCore_GetPoint(core, prev_point);
-            if (prev) prev->nextPoint = new_pt;
-        }
-        
-        prev_point = new_pt;
-    }
-    
-    /* Mark last point as end of chain */
-    if (prev_point != INVALID_INDEX) {
-        CadPoint* last = CadCore_GetPoint(core, prev_point);
-        if (last) last->nextPoint = -1;
-    }
-    
-    /* Create the polygon */
-    int16_t polygon = CadCore_AddPolygon(core, first_point, color, (uint8_t)num_vertices);
-    if (polygon == INVALID_INDEX) {
-        if (hard_error) *hard_error = 1;
-        for (int rollback = 0; rollback < added_count; ++rollback) {
-            memset(&core->data.points[added[rollback]], 0, sizeof(CadPoint));
-            core->data.points[added[rollback]].nextPoint = INVALID_INDEX;
-        }
-        CadCore_RebuildDerivedState(core);
-        core->isDirty = previous_dirty;
-        core->newPoint = previous_new_point;
-    }
-    return polygon;
-}
-
-/* Load a shape from an ASM file into the CAD system */
-static int load_shape_from_asm(CadCore* core, const char* shape_name, const char* folder_path) {
-    if (!core || !shape_name || !folder_path) {
-        fprintf(stderr, "load_shape_from_asm: Invalid parameters\n");
+static int load_shape_from_asm(GuiState* g, CadCore* core,
+                               const char* shape_name) {
+    const CadAsmShapeInfo* shape;
+    CadFileData* decoded;
+    CadAsmImportInfo info;
+    CadResult result;
+    if (!g || !core || !shape_name || !g->shape_catalog ||
+        !g->shape_asm_sources) return 0;
+    shape = CadImportAsm_FindShape(g->shape_catalog, shape_name);
+    if (!shape) {
+        gui_set_status(g, "ASM shape '%s' is no longer in the catalog",
+                       shape_name);
         return 0;
     }
-
-    fprintf(stdout, "load_shape_from_asm: Looking for shape '%s' in folder '%s'\n", shape_name, folder_path);
-
-    /* Clear existing CAD data */
+    decoded = (CadFileData*)malloc(sizeof(*decoded));
+    if (!decoded) {
+        gui_set_status(g, "Could not allocate an ASM preview document");
+        return 0;
+    }
+    result = CadImportAsm_DecodeCatalogShape(
+        g->shape_asm_sources, g->shape_asm_source_count,
+        g->shape_constant_sources, g->shape_constant_source_count,
+        shape, NULL, decoded, &info);
+    if (!CadResult_IsSuccess(&result)) {
+        const CadDiagnostic* diagnostic = result.diagnosticCount
+                                              ? &result.diagnostics[0] : NULL;
+        gui_set_status(g, "%s:%d: %s", shape->sourceName,
+                       diagnostic ? diagnostic->recordIndex : 0,
+                       asm_result_message(&result));
+        free(decoded);
+        return 0;
+    }
     CadCore_Clear(core);
-    g_constants = g_constant_baseline;
-
-    /* Try to load the JSON mapping file first */
-    char json_path[GUI_PATH_CAPACITY * 2];
-    snprintf(json_path, sizeof(json_path), "%s\\Shapes.SFEOPTIM", folder_path);
-    
-    FILE* json_file = gui_fopen_utf8(json_path, "rb");
-    char* target_filename = NULL;
-    
-    if (json_file) {
-        fseek(json_file, 0, SEEK_END);
-        long json_size = ftell(json_file);
-        fseek(json_file, 0, SEEK_SET);
-        
-        char* json_content = (char*)malloc(json_size + 1);
-        if (json_content) {
-            size_t bytes_read = fread(json_content, 1, json_size, json_file);
-            json_content[bytes_read] = '\0';
-            
-            target_filename = find_shape_file_in_json(json_content, shape_name);
-            if (target_filename) {
-                fprintf(stdout, "load_shape_from_asm: Found shape '%s' in file '%s' (from JSON mapping)\n", 
-                        shape_name, target_filename);
-            }
-            
-            free(json_content);
-        }
-        fclose(json_file);
-    }
-    
-    /* Find the ASM file containing this shape */
-    int found = 0;
-#ifdef _WIN32
-    wchar_t wide_folder[GUI_PATH_CAPACITY * 2];
-    wchar_t search_path[GUI_PATH_CAPACITY * 2];
-    if (!gui_utf8_to_wide(folder_path, wide_folder, ARRAY_COUNT(wide_folder)) ||
-        _snwprintf_s(search_path, ARRAY_COUNT(search_path), _TRUNCATE,
-                     L"%ls\\*.asm", wide_folder) < 0) {
-        fprintf(stderr, "load_shape_from_asm: Invalid or overlong UTF-8 folder path\n");
-        return 0;
-    }
-
-    WIN32_FIND_DATAW find_data;
-    HANDLE hFind = FindFirstFileW(search_path, &find_data);
-
-    if (hFind == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "load_shape_from_asm: No ASM files found in folder '%s'\n", folder_path);
-        return 0;
-    }
-
-    do {
-        if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            char filename_utf8[GUI_PATH_CAPACITY];
-            if (!gui_wide_to_utf8(find_data.cFileName, filename_utf8,
-                                  ARRAY_COUNT(filename_utf8))) continue;
-            /* If we have a target filename from JSON, skip files that don't match */
-            if (target_filename && _stricmp(filename_utf8, target_filename) != 0) {
-                continue;
-            }
-            
-            wchar_t file_path[GUI_PATH_CAPACITY * 2];
-            if (_snwprintf_s(file_path, ARRAY_COUNT(file_path), _TRUNCATE,
-                             L"%ls\\%ls", wide_folder, find_data.cFileName) < 0) continue;
-            fprintf(stdout, "load_shape_from_asm: Checking file '%s'\n", filename_utf8);
-
-            /* Open in binary mode to avoid text translation issues on Windows */
-            FILE* f = _wfopen(file_path, L"rb");
-            if (f) {
-                fprintf(stdout, "load_shape_from_asm: Opened file '%s'\n", filename_utf8);
-                /* Read entire file into memory for easier parsing */
-                fseek(f, 0, SEEK_END);
-                long file_size = ftell(f);
-                fseek(f, 0, SEEK_SET);
-                fprintf(stdout, "load_shape_from_asm: File size: %ld bytes\n", file_size);
-
-                if (file_size <= 0) {
-                    fprintf(stderr, "load_shape_from_asm: File '%s' is empty\n", filename_utf8);
-                    fclose(f);
-                    continue;
-                }
-
-                char* content = (char*)malloc(file_size + 1);
-                if (!content) {
-                    fprintf(stderr, "load_shape_from_asm: Failed to allocate memory for file '%s'\n", filename_utf8);
-                    fclose(f);
-                    continue;
-                }
-                size_t bytes_read = fread(content, 1, file_size, f);
-                fclose(f);
-                
-                /* On Windows, text mode can cause fewer bytes to be read due to \r\n translation
-                   Accept if we read at least 95% of the file (usually just a few bytes difference) */
-                if (bytes_read < (size_t)(file_size * 0.95)) {
-                    fprintf(stderr, "load_shape_from_asm: Failed to read file '%s' (read %zu of %ld bytes, less than 95%%)\n", 
-                            filename_utf8, bytes_read, file_size);
-                    free(content);
-                    continue;
-                }
-                
-                /* Null-terminate at the actual bytes read */
-                content[bytes_read] = '\0';
-                fprintf(stdout, "load_shape_from_asm: Successfully read %zu bytes from '%s' (file size: %ld)\n", 
-                        bytes_read, filename_utf8, file_size);
-
-                /* Normalize line endings - handle both \r\n and \n */
-                /* Use bytes_read instead of file_size since we might have read fewer bytes */
-                for (size_t i = 0; i < bytes_read; i++) {
-                    if (content[i] == '\r') {
-                        if (i + 1 < bytes_read && content[i + 1] == '\n') {
-                            /* \r\n -> \n, shift remaining content left by 1 */
-                            memmove(&content[i], &content[i + 1], bytes_read - i - 1);
-                            bytes_read--;
-                            content[bytes_read] = '\0';
-                        } else {
-                            /* Standalone \r -> \n */
-                            content[i] = '\n';
-                        }
-                    }
-                }
-
-                /* Split into lines */
-                char** lines = NULL;
-                int line_count = 0;
-                int line_capacity = 1000;
-                lines = (char**)malloc(line_capacity * sizeof(char*));
-                if (!lines) {
-                    fprintf(stderr, "load_shape_from_asm: Failed to allocate memory for lines\n");
-                    free(content);
-                    continue;
-                }
-
-                char* line_start = content;
-                for (size_t i = 0; i <= bytes_read; i++) {
-                    if (content[i] == '\n' || content[i] == '\0') {
-                        if (line_count >= line_capacity) {
-                            line_capacity *= 2;
-                            char** expanded = (char**)realloc(
-                                lines, line_capacity * sizeof(char*));
-                            if (!expanded) {
-                                fprintf(stderr, "load_shape_from_asm: Failed to reallocate memory for lines\n");
-                                free(lines);
-                                free(content);
-                                lines = NULL;
-                                break;
-                            }
-                            lines = expanded;
-                        }
-                        content[i] = '\0';
-                        lines[line_count++] = line_start;
-                        line_start = &content[i + 1];
-                    }
-                }
-                if (!lines) continue;
-                fprintf(stdout, "load_shape_from_asm: Split file into %d lines\n", line_count);
-
-                /* Find points_start and faces_start by parsing ShapeHdr */
-                int points_start = -1;
-                int faces_start = -1;
-                char shape_name_lower[256];
-                strncpy(shape_name_lower, shape_name, sizeof(shape_name_lower) - 1);
-                shape_name_lower[sizeof(shape_name_lower) - 1] = '\0';
-                for (int k = 0; shape_name_lower[k]; k++) {
-                    shape_name_lower[k] = (char)tolower((unsigned char)shape_name_lower[k]);
-                }
-
-                /* First, find the ShapeHdr line to extract actual _P and _F section names */
-                char actual_points_section[256] = {0};
-                char actual_faces_section[256] = {0};
-                int shapehdr_line = -1;
-                
-                for (int i = 0; i < line_count; i++) {
-                    char line_lower[1024];
-                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                    line_lower[sizeof(line_lower) - 1] = '\0';
-                    for (int k = 0; line_lower[k]; k++) {
-                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                    }
-                    
-                    /* Look for shapehdr with this shape name */
-                    /* Format: shapename<whitespace>shapehdr<whitespace>points_section,0,faces_section,... */
-                    char* stripped = line_lower;
-                    while (*stripped && (*stripped == ' ' || *stripped == '\t')) stripped++;
-                    
-                    /* Check if line starts with shape name */
-                    size_t name_len = strlen(shape_name_lower);
-                    if (strncmp(stripped, shape_name_lower, name_len) == 0) {
-                        char* after_name = stripped + name_len;
-                        /* Must be followed by whitespace or tab, then shapehdr */
-                        if (*after_name == ' ' || *after_name == '\t') {
-                            while (*after_name == ' ' || *after_name == '\t') after_name++;
-                            if (_strnicmp(after_name, "shapehdr", 8) == 0) {
-                                shapehdr_line = i;
-                                /* Parse the ShapeHdr parameters */
-                                char* params = after_name + 8;
-                                while (*params == ' ' || *params == '\t') params++;
-                                
-                                /* Extract points section name (first parameter before comma) */
-                                char* comma1 = strchr(params, ',');
-                                if (comma1) {
-                                    int len = (int)(comma1 - params);
-                                    if (len > 0 && len < 256) {
-                                        strncpy(actual_points_section, params, len);
-                                        actual_points_section[len] = '\0';
-                                        /* Trim whitespace */
-                                        while (len > 0 && (actual_points_section[len-1] == ' ' || actual_points_section[len-1] == '\t')) {
-                                            actual_points_section[--len] = '\0';
-                                        }
-                                    }
-                                    
-                                    /* Skip to third parameter (faces section) */
-                                    /* Format: points,0,faces,... */
-                                    char* comma2 = strchr(comma1 + 1, ',');
-                                    if (comma2) {
-                                        char* faces_param = comma2 + 1;
-                                        while (*faces_param == ' ' || *faces_param == '\t') faces_param++;
-                                        char* comma3 = strchr(faces_param, ',');
-                                        if (comma3) {
-                                            int flen = (int)(comma3 - faces_param);
-                                            if (flen > 0 && flen < 256) {
-                                                strncpy(actual_faces_section, faces_param, flen);
-                                                actual_faces_section[flen] = '\0';
-                                                while (flen > 0 && (actual_faces_section[flen-1] == ' ' || actual_faces_section[flen-1] == '\t')) {
-                                                    actual_faces_section[--flen] = '\0';
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                fprintf(stdout, "Found ShapeHdr for %s at line %d: points='%s', faces='%s'\n", 
-                                        shape_name, i, actual_points_section, actual_faces_section);
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                /* If no ShapeHdr found, fall back to default naming */
-                char shape_p[256];
-                char shape_f[256];
-                if (actual_points_section[0]) {
-                    strncpy(shape_p, actual_points_section, sizeof(shape_p) - 1);
-                    shape_p[sizeof(shape_p) - 1] = '\0';
-                    for (int k = 0; shape_p[k]; k++) shape_p[k] = (char)tolower((unsigned char)shape_p[k]);
-                } else {
-                    snprintf(shape_p, sizeof(shape_p), "%s_p", shape_name_lower);
-                }
-                
-                if (actual_faces_section[0]) {
-                    strncpy(shape_f, actual_faces_section, sizeof(shape_f) - 1);
-                    shape_f[sizeof(shape_f) - 1] = '\0';
-                    for (int k = 0; shape_f[k]; k++) shape_f[k] = (char)tolower((unsigned char)shape_f[k]);
-                } else {
-                    snprintf(shape_f, sizeof(shape_f), "%s_f", shape_name_lower);
-                }
-
-                /* Now find the actual sections */
-                for (int i = 0; i < line_count; i++) {
-                    char line_lower[1024];
-                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                    line_lower[sizeof(line_lower) - 1] = '\0';
-                    for (int k = 0; line_lower[k]; k++) {
-                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                    }
-                    char* stripped = line_lower;
-                    while (*stripped && (*stripped == ' ' || *stripped == '\t')) stripped++;
-                    
-                    char* end = stripped + strlen(stripped) - 1;
-                    while (end > stripped && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
-                        *end = '\0';
-                        end--;
-                    }
-
-                    /* Look for points section */
-                    if (points_start == -1) {
-                        size_t shape_p_len = strlen(shape_p);
-                        if (strncmp(stripped, shape_p, shape_p_len) == 0) {
-                            char after_p = stripped[shape_p_len];
-                            if (!after_p || after_p == '\0' || after_p == '\n' || after_p == '\r' ||
-                                after_p == ' ' || after_p == '\t') {
-                                points_start = i;
-                                fprintf(stdout, "Found points section for %s at line %d: %s\n", shape_name, i, stripped);
-                            }
-                        }
-                    }
-                    /* Look for faces section */
-                    if (faces_start == -1) {
-                        size_t shape_f_len = strlen(shape_f);
-                        if (strncmp(stripped, shape_f, shape_f_len) == 0) {
-                            char after_f = stripped[shape_f_len];
-                            if (!after_f || !isdigit((unsigned char)after_f)) {
-                                faces_start = i;
-                                fprintf(stdout, "Found faces section for %s at line %d: %s\n", shape_name, i, stripped);
-                            }
-                        }
-                    }
-                }
-
-                fprintf(stdout, "load_shape_from_asm: Searching for '%s' and '%s' in file '%s' (%d lines)\n", 
-                        shape_p, shape_f, filename_utf8, line_count);
-                
-                if (points_start == -1) {
-                    /* Shape not in this file, continue to next file (this is normal) */
-                    free(lines);
-                    free(content);
-                    continue;
-                }
-                
-                if (faces_start == -1) {
-                    fprintf(stderr, "WARNING: Could not find faces section '%s' for shape: %s in file: %s (will continue without faces)\n", shape_f, shape_name, filename_utf8);
-                }
-
-                /* Parse points - build vertex array first */
-                double (*vertices)[3] = (double (*)[3])calloc(8192, sizeof(*vertices));
-                if (!vertices) {
-                    fprintf(stderr, "load_shape_from_asm: Failed to allocate vertex workspace\n");
-                    free(lines);
-                    free(content);
-                    continue;
-                }
-                int vertex_count = 0;
-                int in_mirrored_section = 0;
-                int parse_error = 0;
-
-                /* First, parse local constants from between ShapeHdr and the first Points directive */
-                /* Local constants can appear BEFORE the points section label (e.g., d = 5 before Lcube_P) */
-                int const_scan_start = (shapehdr_line >= 0) ? shapehdr_line : (points_start > 10 ? points_start - 10 : 0);
-                fprintf(stdout, "load_shape_from_asm: Scanning for local constants from line %d to %d\n", const_scan_start, points_start + 20);
-                for (int i = const_scan_start; i < line_count && i < points_start + 20; i++) {
-                    const char* line = lines[i];
-                    
-                    /* Check if we hit a Points directive - stop scanning for constants */
-                    char line_lower[1024];
-                    strncpy(line_lower, line, sizeof(line_lower) - 1);
-                    line_lower[sizeof(line_lower) - 1] = '\0';
-                    for (int k = 0; line_lower[k]; k++) {
-                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                    }
-                    if (strstr(line_lower, "pointsb") || strstr(line_lower, "pointsw") ||
-                        strstr(line_lower, "pointsxb") || strstr(line_lower, "pointsxw")) {
-                        break;
-                    }
-                    
-                    /* Look for local constant definition: name = expression */
-                    const char* eq = strchr(line, '=');
-                    if (eq) {
-                        /* Extract name (before =) */
-                        char name[MAX_CONST_NAME];
-                        int name_len = 0;
-                        const char* p = line;
-                        while (*p == ' ' || *p == '\t') p++;
-                        while (p < eq && (isalnum((unsigned char)*p) || *p == '_')) {
-                            if (name_len < MAX_CONST_NAME - 1) {
-                                name[name_len++] = *p;
-                            }
-                            p++;
-                        }
-                        name[name_len] = '\0';
-                        
-                        /* Skip if name is empty or starts with a directive */
-                        if (name_len > 0 && name[0] != '\0' && 
-                            _stricmp(name, "equ") != 0 && _stricmp(name, "set") != 0) {
-                            /* Parse value (after =) */
-                            p = eq + 1;
-                            while (*p == ' ' || *p == '\t') p++;
-                            
-                            int value;
-                            if (parse_const_value(p, &value)) {
-                                constants_add(name, value);
-                                fprintf(stdout, "load_shape_from_asm: Added local constant %s = %d\n", name, value);
-                            }
-                        }
-                    }
-                }
-
-                fprintf(stdout, "load_shape_from_asm: Starting point parsing from line %d\n", points_start);
-                for (int i = points_start; i < line_count; i++) {
-                    char line_lower[1024];
-                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                    line_lower[sizeof(line_lower) - 1] = '\0';
-                    for (int k = 0; line_lower[k]; k++) {
-                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                    }
-
-                    /* Check for EndPoints - stop parsing points */
-                    if (strstr(line_lower, "endpoints")) {
-                        fprintf(stdout, "load_shape_from_asm: Found EndPoints at line %d\n", i);
-                        break;
-                    }
-
-                    /* Check for Pointsb (non-mirrored) - comes first */
-                    if (strstr(line_lower, "pointsb") && !strstr(line_lower, "pointsxb")) {
-                        in_mirrored_section = 0;
-                        fprintf(stdout, "load_shape_from_asm: Found Pointsb at line %d\n", i);
-                        continue;
-                    }
-
-                    /* Check for PointsXb (mirrored) - comes after Pointsb */
-                    if (strstr(line_lower, "pointsxb")) {
-                        in_mirrored_section = 1;
-                        fprintf(stdout, "load_shape_from_asm: Found PointsXb at line %d\n", i);
-                        continue;
-                    }
-
-                    /* Check for Pointsw (non-mirrored word) - comes first */
-                    if (strstr(line_lower, "pointsw") && !strstr(line_lower, "pointsxw")) {
-                        in_mirrored_section = 0;
-                        fprintf(stdout, "load_shape_from_asm: Found Pointsw at line %d\n", i);
-                        continue;
-                    }
-
-                    /* Check for PointsXw (mirrored word) - comes after Pointsw */
-                    if (strstr(line_lower, "pointsxw")) {
-                        in_mirrored_section = 1;
-                        fprintf(stdout, "load_shape_from_asm: Found PointsXw at line %d\n", i);
-                        continue;
-                    }
-
-                    /* Parse point: pb x,y,z, pw x,y,z, pbd2 x,y,z, pwd2 x,y,z
-                       Regex pattern: r'p[wb]d?2?\s+(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)'
-                       pbd2/pwd2 divide coordinates by 2
-                    */
-                    char* pbd2_pos = strstr(line_lower, "pbd2");
-                    char* pwd2_pos = strstr(line_lower, "pwd2");
-                    char* pb_pos = strstr(line_lower, "pb");
-                    char* pw_pos = strstr(line_lower, "pw");
-                    char* point_pos = NULL;
-                    int is_pw = 0;
-                    int divide_by_2 = 0;
-                    int skip_len = 2; /* Default: pb/pw are 2 chars */
-                    
-                    /* Check for pbd2/pwd2 first (they also contain pb/pw) */
-                    if (pbd2_pos && (pbd2_pos == line_lower || pbd2_pos[-1] == ' ' || pbd2_pos[-1] == '\t')) {
-                        point_pos = pbd2_pos;
-                        is_pw = 0;
-                        divide_by_2 = 1;
-                        skip_len = 4;
-                    } else if (pwd2_pos && (pwd2_pos == line_lower || pwd2_pos[-1] == ' ' || pwd2_pos[-1] == '\t')) {
-                        point_pos = pwd2_pos;
-                        is_pw = 1;
-                        divide_by_2 = 1;
-                        skip_len = 4;
-                    } else if (pb_pos && (!pw_pos || pb_pos < pw_pos)) {
-                        /* Make sure it's pb, not pbd2 */
-                        if (pb_pos[2] != 'd') {
-                            point_pos = pb_pos;
-                            is_pw = 0;
-                        }
-                    } else if (pw_pos) {
-                        /* Make sure it's pw, not pwd2 */
-                        if (pw_pos[2] != 'd') {
-                            point_pos = pw_pos;
-                            is_pw = 1;
-                        }
-                    }
-                    
-                    if (point_pos) {
-                        /* Make sure point directive is at start of a word */
-                        if (point_pos == line_lower ||
-                            point_pos[-1] == ' ' || point_pos[-1] == '\t' || point_pos[-1] == '\n' || point_pos[-1] == '\r') {
-                            /* Skip directive and any whitespace after it - use original line for parsing */
-                            int offset = (int)(point_pos - line_lower);
-                            char* orig_coord_start = (char*)lines[i] + offset + skip_len;
-                            while (*orig_coord_start == ' ' || *orig_coord_start == '\t') orig_coord_start++;
-                            
-                            /* Split into three comma-separated parts */
-                            char coord_buf[256];
-                            strncpy(coord_buf, orig_coord_start, sizeof(coord_buf) - 1);
-                            coord_buf[sizeof(coord_buf) - 1] = '\0';
-                            
-                            /* Remove trailing comment */
-                            char* comment = strchr(coord_buf, ';');
-                            if (comment) *comment = '\0';
-                            
-                            /* Split by comma */
-                            char* x_str = coord_buf;
-                            char* y_str = strchr(x_str, ',');
-                            char* z_str = NULL;
-                            
-                            if (y_str) {
-                                *y_str++ = '\0';
-                                while (*y_str == ' ' || *y_str == '\t') y_str++;
-                                z_str = strchr(y_str, ',');
-                                if (z_str) {
-                                    *z_str++ = '\0';
-                                    while (*z_str == ' ' || *z_str == '\t') z_str++;
-                                }
-                            }
-                            
-                            if (x_str && y_str && z_str) {
-                                /* Try to parse each coordinate using constant resolver */
-                                int x, y, z;
-                                int x_ok = parse_const_value(x_str, &x);
-                                int y_ok = parse_const_value(y_str, &y);
-                                int z_ok = parse_const_value(z_str, &z);
-                                
-                                if (x_ok && y_ok && z_ok) {
-                                    /* Apply divide by 2 for pbd2/pwd2 */
-                                    if (divide_by_2) {
-                                        x /= 2;
-                                        y /= 2;
-                                        z /= 2;
-                                    }
-                                    /* Negate Y to convert from SNES coordinate system (Y down) to OpenGL (Y up) */
-                                    y = -y;
-                                    fprintf(stdout, "load_shape_from_asm: Parsed point: p%c%s %d,%d,%d (line %d)\n", 
-                                            is_pw ? 'w' : 'b', divide_by_2 ? "d2" : "", x, y, z, i);
-                                    if (in_mirrored_section) {
-                                        /* Mirrored point - add both +x and -x versions */
-                                        if (vertex_count < 8190) {
-                                            vertices[vertex_count][0] = x;
-                                            vertices[vertex_count][1] = y;
-                                            vertices[vertex_count][2] = z;
-                                            vertex_count++;
-                                            vertices[vertex_count][0] = -x;
-                                            vertices[vertex_count][1] = y;
-                                            vertices[vertex_count][2] = z;
-                                            vertex_count++;
-                                        } else {
-                                            parse_error = 1;
-                                            fprintf(stderr, "load_shape_from_asm: Source vertex capacity exceeded at line %d\n", i);
-                                        }
-                                    }
-                                    else {
-                                        /* Non-mirrored point */
-                                        if (vertex_count < 8191) {
-                                            vertices[vertex_count][0] = x;
-                                            vertices[vertex_count][1] = y;
-                                            vertices[vertex_count][2] = z;
-                                            vertex_count++;
-                                        } else {
-                                            parse_error = 1;
-                                            fprintf(stderr, "load_shape_from_asm: Source vertex capacity exceeded at line %d\n", i);
-                                        }
-                                    }
-                                } else {
-                                    /* Failed to parse - log which coordinate failed */
-                                    fprintf(stderr, "load_shape_from_asm: Could not resolve point (line %d): x=%s(%s) y=%s(%s) z=%s(%s)\n",
-                                        i, x_str, x_ok ? "ok" : "FAIL", y_str, y_ok ? "ok" : "FAIL", z_str, z_ok ? "ok" : "FAIL");
-                                    parse_error = 1;
-                                }
-                            } else {
-                                fprintf(stderr, "load_shape_from_asm: Malformed point directive at line %d\n", i);
-                                parse_error = 1;
-                            }
-                        }
-                    }
-
-                    /* Check for EndPoints */
-                    if (strstr(line_lower, "endpoints")) {
-                        break;
-                    }
-                }
-
-                /* Note: We don't add vertices to CAD system here anymore.
-                   Points are created per-polygon by create_polygon_with_points_safe() */
-                fprintf(stdout, "Loaded %d vertices for shape: %s\n", vertex_count, shape_name);
-
-                /* Parse faces - scan from faces_start until EndShape
-                   Also need to check for shape_f1, shape_f2, etc. sections */
-                int face_count = 0;
-                
-                /* Find all face sections (shape_f, shape_f1, shape_f2, etc.) */
-                int face_sections[32];
-                int face_section_count = 0;
-                
-                /* Only process faces if we found a valid faces section */
-                if (faces_start < 0) {
-                    fprintf(stderr, "WARNING: No faces section found for shape '%s', loading points only\n", shape_name);
-                    faces_start = line_count; /* Prevent any face parsing loops */
-                }
-                
-                /* Find where this shape ends (EndShape) to limit our search */
-                int shape_end = line_count;
-                for (int i = faces_start; i < line_count; i++) {
-                    char line_lower[1024];
-                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                    line_lower[sizeof(line_lower) - 1] = '\0';
-                    for (int k = 0; line_lower[k]; k++) {
-                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                    }
-                    if (strstr(line_lower, "endshape")) {
-                        shape_end = i + 1;
-                        break;
-                    }
-                }
-                
-                /* Look for ALL face sections (shape_f, shape_f1, shape_f2, etc.) WITHIN this shape only */
-                /* Use the actual face section name from ShapeHdr (shape_f already set above) */
-                char shape_f_base[256];
-                strncpy(shape_f_base, shape_f, sizeof(shape_f_base) - 1);
-                shape_f_base[sizeof(shape_f_base) - 1] = '\0';
-                size_t base_len = strlen(shape_f_base);
-                
-                for (int i = faces_start; i < shape_end && face_section_count < 32; i++) {
-                    char line_lower[1024];
-                    strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                    line_lower[sizeof(line_lower) - 1] = '\0';
-                    for (int k = 0; line_lower[k]; k++) {
-                        line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                    }
-                    char* stripped = line_lower;
-                    while (*stripped && (*stripped == ' ' || *stripped == '\t')) stripped++;
-                    char* end = stripped + strlen(stripped) - 1;
-                    while (end > stripped && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
-                        *end = '\0';
-                        end--;
-                    }
-                    
-                    /* Check if this line starts with shape_f (could be shape_f, shape_f1, shape_f2, etc.) */
-                    if (strncmp(stripped, shape_f_base, base_len) == 0) {
-                        /* Check what comes after _f */
-                        char after_f = stripped[base_len];
-                        /* Accept if: end of string, whitespace, or a digit (for f1, f2, etc.) */
-                        if (!after_f || after_f == '\0' || after_f == ' ' || after_f == '\t' || 
-                            isdigit((unsigned char)after_f)) {
-                            /* Make sure it's not already in our list */
-                            int already_found = 0;
-                            for (int j = 0; j < face_section_count; j++) {
-                                if (face_sections[j] == i) {
-                                    already_found = 1;
-                                    break;
-                                }
-                            }
-                            if (!already_found) {
-                                face_sections[face_section_count++] = i;
-                                fprintf(stdout, "Found face section for %s at line %d: %s\n", shape_name, i, stripped);
-                            }
-                        }
-                    }
-                }
-                
-                fprintf(stdout, "load_shape_from_asm: Found %d face section(s) for %s\n", face_section_count, shape_name);
-                
-                /* Parse faces from all face sections */
-                for (int section_idx = 0; section_idx < face_section_count; section_idx++) {
-                    int section_start = face_sections[section_idx];
-                    fprintf(stdout, "load_shape_from_asm: Parsing face section %d starting at line %d\n", section_idx, section_start);
-                    
-                    /* Determine where this section ends - either at Fend/EndShape, or at the start of the next face section */
-                    int section_end = line_count;
-                    if (section_idx + 1 < face_section_count) {
-                        section_end = face_sections[section_idx + 1];
-                    }
-                    
-                    /* Find the actual end of this section (Fend or EndShape) */
-                    for (int i = section_start; i < section_end && i < line_count; i++) {
-                        char line_lower[1024];
-                        strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                        line_lower[sizeof(line_lower) - 1] = '\0';
-                        for (int k = 0; line_lower[k]; k++) {
-                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                        }
-                        if (strstr(line_lower, "endshape") || strstr(line_lower, "fend")) {
-                            section_end = i + 1; /* Stop after this line */
-                            break;
-                        }
-                    }
-                    
-                    /* Skip the label line and look for "Faces" keyword or actual face definitions */
-                    int actual_start = section_start;
-                    for (int i = section_start; i < section_end && i < line_count; i++) {
-                        char line_lower[1024];
-                        strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                        line_lower[sizeof(line_lower) - 1] = '\0';
-                        for (int k = 0; line_lower[k]; k++) {
-                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                        }
-                        /* If we find "faces" keyword or a face definition, start parsing from here */
-                        if (strstr(line_lower, "faces") || strstr(line_lower, "face3") || 
-                            strstr(line_lower, "face4") || strstr(line_lower, "face5")) {
-                            actual_start = i;
-                            break;
-                        }
-                    }
-                    
-                    fprintf(stdout, "load_shape_from_asm: Face section %d: parsing from line %d to %d\n", section_idx, actual_start, section_end);
-                    
-                    for (int i = actual_start; i < section_end && i < line_count; i++) {
-                        char line_lower[1024];
-                        strncpy(line_lower, lines[i], sizeof(line_lower) - 1);
-                        line_lower[sizeof(line_lower) - 1] = '\0';
-                        for (int k = 0; line_lower[k]; k++) {
-                            line_lower[k] = (char)tolower((unsigned char)line_lower[k]);
-                        }
-                        
-                        /* Check for EndShape or Fend - stop parsing this section */
-                        if (strstr(line_lower, "endshape") || strstr(line_lower, "fend")) {
-                            fprintf(stdout, "load_shape_from_asm: Found end of face section at line %d\n", i);
-                            break;
-                        }
-
-                        /* Parse Face2: line (2 vertices)
-                           Format: Face2 color, viz, nx, ny, nz, v0, v1 */
-                        char* face2_pos = strstr(line_lower, "face2");
-                        if (face2_pos) {
-                            char* num_start = face2_pos + 5;
-                            while (*num_start == ' ' || *num_start == '\t') num_start++;
-                            
-                            char* parse_pos = num_start;
-                            int color = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
-                            
-                            if (parse_pos > num_start) {
-                                if (v0 >= 0 && v0 < vertex_count &&
-                                    v1 >= 0 && v1 < vertex_count) {
-                                    /* Create Face2 (line) with its own point chain */
-                                    int line_verts[2] = { v0, v1 };
-                                    if (create_polygon_with_points_safe(core, vertices, line_verts, 2,
-                                            (uint8_t)color, vertex_count, &parse_error) != INVALID_INDEX) {
-                                        face_count++;
-                                    }
-                                }
-                            }
-                        }
-
-                        /* Parse Face3: triangle
-                           Regex: r'face3\s+(\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)'
-                           Format: Face3<whitespace>color<optional ws>,<optional ws>viz<optional ws>,<optional ws>nx<optional ws>,<optional ws>ny<optional ws>,<optional ws>nz<optional ws>,<optional ws>v0<optional ws>,<optional ws>v1<optional ws>,<optional ws>v2 */
-                        char* face3_pos = strstr(line_lower, "face3");
-                        if (face3_pos) {
-                            /* Skip 'face3' and any whitespace after it */
-                            char* num_start = face3_pos + 5;
-                            while (*num_start == ' ' || *num_start == '\t') num_start++;
-                            
-                            /* Parse using strtol to handle flexible whitespace */
-                            char* parse_pos = num_start;
-                            int color = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v2 = (int)strtol(parse_pos, &parse_pos, 10);
-                            
-                            /* Check if we successfully parsed all 8 values */
-                            if (parse_pos > num_start) {
-                                if (v0 >= 0 && v0 < vertex_count &&
-                                    v1 >= 0 && v1 < vertex_count &&
-                                    v2 >= 0 && v2 < vertex_count) {
-                                    /* Create Face3 (triangle) with its own point chain */
-                                    int tri_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points_safe(core, vertices, tri_verts, 3,
-                                            (uint8_t)color, vertex_count, &parse_error) != INVALID_INDEX) {
-                                        face_count++;
-                                    }
-                                }
-                            }
-                        }
-
-                        /* Parse Face4: quad
-                           Regex: r'face4\s+(\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)' */
-                        char* face4_pos = strstr(line_lower, "face4");
-                        if (face4_pos) {
-                            char* num_start = face4_pos + 5;
-                            while (*num_start == ' ' || *num_start == '\t') num_start++;
-                            
-                            char* parse_pos = num_start;
-                            int color = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v2 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v3 = (int)strtol(parse_pos, &parse_pos, 10);
-                            
-                            if (parse_pos > num_start) {
-                                if (v0 >= 0 && v0 < vertex_count &&
-                                    v1 >= 0 && v1 < vertex_count &&
-                                    v2 >= 0 && v2 < vertex_count &&
-                                    v3 >= 0 && v3 < vertex_count) {
-                                    /* Split quad into 2 triangles: v0,v1,v2 and v0,v2,v3 */
-                                    /* Each triangle gets its own point chain */
-                                    int tri1_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points_safe(core, vertices, tri1_verts, 3,
-                                            (uint8_t)color, vertex_count, &parse_error) != INVALID_INDEX) {
-                                        face_count++;
-                                    }
-                                    
-                                    int tri2_verts[3] = { v0, v2, v3 };
-                                    if (create_polygon_with_points_safe(core, vertices, tri2_verts, 3,
-                                            (uint8_t)color, vertex_count, &parse_error) != INVALID_INDEX) {
-                                        face_count++;
-                                    }
-                                }
-                            }
-                        }
-
-                        /* Parse Face5: pentagon
-                           Regex: r'face5\s+(\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)' */
-                        char* face5_pos = strstr(line_lower, "face5");
-                        if (face5_pos) {
-                            char* num_start = face5_pos + 5;
-                            while (*num_start == ' ' || *num_start == '\t') num_start++;
-                            
-                            char* parse_pos = num_start;
-                            int color = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v0 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v1 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v2 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v3 = (int)strtol(parse_pos, &parse_pos, 10);
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            if (*parse_pos == ',') parse_pos++;
-                            while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
-                            
-                            int v4 = (int)strtol(parse_pos, &parse_pos, 10);
-                            
-                            if (parse_pos > num_start) {
-                                if (v0 >= 0 && v0 < vertex_count &&
-                                    v1 >= 0 && v1 < vertex_count &&
-                                    v2 >= 0 && v2 < vertex_count &&
-                                    v3 >= 0 && v3 < vertex_count &&
-                                    v4 >= 0 && v4 < vertex_count) {
-                                    /* Split pentagon into 3 triangles: v0,v1,v2, v0,v2,v3, and v0,v3,v4 */
-                                    /* Each triangle gets its own point chain */
-                                    int tri1_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points_safe(core, vertices, tri1_verts, 3,
-                                            (uint8_t)color, vertex_count, &parse_error) != INVALID_INDEX) {
-                                        face_count++;
-                                    }
-                                    
-                                    int tri2_verts[3] = { v0, v2, v3 };
-                                    if (create_polygon_with_points_safe(core, vertices, tri2_verts, 3,
-                                            (uint8_t)color, vertex_count, &parse_error) != INVALID_INDEX) {
-                                        face_count++;
-                                    }
-                                    
-                                    int tri3_verts[3] = { v0, v3, v4 };
-                                    if (create_polygon_with_points_safe(core, vertices, tri3_verts, 3,
-                                            (uint8_t)color, vertex_count, &parse_error) != INVALID_INDEX) {
-                                        face_count++;
-                                    }
-                                }
-                            }
-                        }
-
-                        /* Check for EndShape */
-                        if (strstr(line_lower, "endshape")) {
-                            found = 1;
-                            break;
-                        }
-                    }
-                }
-
-                fprintf(stdout, "Loaded %d faces for shape: %s\n", face_count, shape_name);
-
-                /* Capacity or malformed-index failures invalidate the whole
-                   temporary parse.  Never expose a truncated preview that
-                   could later replace the user's document. */
-                if (parse_error || vertex_count <= 0 || face_count <= 0) {
-                    fprintf(stderr,
-                            "load_shape_from_asm: Rejected partial shape %s "
-                            "(vertices=%d faces=%d capacity/error=%d)\n",
-                            shape_name, vertex_count, face_count, parse_error);
-                    CadCore_Clear(core);
-                    found = 0;
-                } else {
-                    found = 1;
-                    fprintf(stdout, "Successfully parsed shape: %s (vertices: %d, polygons: %d)\n",
-                        shape_name, vertex_count, core->data.polygonCount);
-                }
-
-                free(vertices);
-                free(lines);
-                free(content);
-                if (found) break;
-            }
-        }
-    } while (FindNextFileW(hFind, &find_data));
-
-    FindClose(hFind);
-#else
-    /* Non-Windows implementation would go here */
-    (void)folder_path;
-    (void)shape_name;
-#endif
-
-    return found ? 1 : 0;
+    core->data = *decoded;
+    CadCore_RebuildDerivedState(core);
+    core->isDirty = 1;
+    free(decoded);
+    return 1;
 }
 
 typedef struct ShapeBrowserLayout {
@@ -2791,12 +1800,9 @@ static void select_shape_preview(GuiState* g, int index) {
     if (!g || !g->shape_preview || index < 0 || index >= g->shape_count ||
         !g->shape_names[index]) return;
     g->shape_selected = index;
-    CadCore_Clear(g->shape_preview);
     g->shape_preview_valid = load_shape_from_asm(
-        g->shape_preview, g->shape_names[index], g->shape_folder_path);
+        g, g->shape_preview, g->shape_names[index]);
     if (!g->shape_preview_valid) {
-        gui_set_status(g, "Could not preview shape %s; document unchanged",
-                       g->shape_names[index]);
         return;
     }
     fit_shape_preview(g);
@@ -2842,11 +1848,24 @@ GuiCommand gui_take_command(GuiState* g) {
 
 int gui_request_quit(GuiState* g) {
     if (!g) return 0;
-    if (EditorTool_IsActive(&g->edit_tool) || g->document.transactionBefore)
+    if (EditorController_IsEditing(&g->controller) || g->document.transactionBefore)
         reset_interaction(g);
     if (!confirm_replace_document(g, "quitting")) return 0;
     g->pending_command = GUI_COMMAND_QUIT;
     return 1;
+}
+
+void gui_cancel_input(GuiState* g) {
+    if (!g) return;
+    if (g->anim_scrubbing) CadAnimationSession_EndScrub(&g->animation);
+    g->anim_scrubbing = 0;
+    g->anim_copy_mode = 0;
+    reset_interaction(g);
+    g->menu_open = -1;
+    g->menu_hover_item = -1;
+    g->submenu_open = 0;
+    g->submenu_hover_item = -1;
+    g->shape_search_active = 0;
 }
 
 void gui_handle_key(GuiState* g, int key, unsigned modifiers, int pressed) {
@@ -2892,6 +1911,33 @@ void gui_handle_key(GuiState* g, int key, unsigned modifiers, int pressed) {
         case 'q': gui_request_quit(g); return;
         default: break;
         }
+    }
+
+    if (g->selected_tool == CAD_TOOL_FACE_CREATE) {
+        if (key == GUI_KEY_BACKSPACE) {
+            if (g->cad->selection.pointCount > 0) {
+                int16_t last = g->cad->selection.selectedPoints[
+                    g->cad->selection.pointCount - 1];
+                CadCore_DeselectPoint(g->cad, last);
+                update_face_creation_status(g, -1);
+            } else {
+                gui_set_status(g, "Face preview is already empty");
+            }
+            return;
+        }
+        if (key == GUI_KEY_ENTER) {
+            create_face_from_selection(g);
+            return;
+        }
+    }
+
+    if (key == 'f' && !(modifiers & (GUI_MOD_CTRL | GUI_MOD_ALT))) {
+        if (frame_document_views(g, 1)) {
+            gui_set_status(g, "Framed the current selection (F)");
+        } else {
+            gui_set_status(g, "Select points or faces before using Frame Selection");
+        }
+        return;
     }
 
     if (key == GUI_KEY_DELETE || key == GUI_KEY_BACKSPACE) {
@@ -3090,49 +2136,67 @@ static void view_scrollbar_geometry(Rect client, const CadView* view,
 }
 
 static void layout_cleanup(GuiState* g, int win_w, int win_h) {
+    CadDesktopLayoutInput input;
+    CadDesktopLayout layout;
     if (!g || win_w <= 0 || win_h <= 0) return;
-    const int margin = 4;
-    const int menu_bottom = MenuBarHeight() + margin;
-    const int status_h = 22;
-    const int palette_w = g->tool_palette_visible ? 86 : 0;
-    const int content_x = margin + (palette_w ? palette_w + margin : 0);
-    const int coord_h = g->coordinates_visible ? 54 : 0;
-    int view_bottom = win_h - status_h - margin - (coord_h ? coord_h + margin : 0);
-    if (view_bottom < menu_bottom + 100) view_bottom = menu_bottom + 100;
+    CadDesktopLayoutInput_Init(&input, win_w, win_h);
+    for (int i = 0; i < CAD_DESKTOP_VIEW_COUNT; ++i)
+        input.viewVisible[i] = (unsigned char)(g->view_visible[i] != 0);
+    input.toolPaletteVisible = (unsigned char)(g->tool_palette_visible != 0);
+    input.coordinatesVisible = (unsigned char)(g->coordinates_visible != 0);
+    input.animationVisible = (unsigned char)(g->animation_visible != 0);
+    input.animationDocked = (unsigned char)(g->animation_docked != 0);
+    if (!CadDesktopLayout_Compute(&input, &layout)) return;
 
-    if (g->tool_palette_visible) {
-        g->toolPalette.r = (Rect){ margin, menu_bottom, palette_w,
-                                  win_h - menu_bottom - status_h - margin };
-    }
-    if (g->coordinates_visible) {
-        g->coordBox.r = (Rect){ content_x, view_bottom + margin,
-                               win_w - content_x - margin, coord_h };
-    }
-
-    int visible_count = 0;
-    for (int i = 0; i < 4; ++i) visible_count += g->view_visible[i] != 0;
-    if (visible_count > 0) {
-        int cols = visible_count == 1 ? 1 : 2;
-        int rows = (visible_count + cols - 1) / cols;
-        int available_w = win_w - content_x - margin;
-        int available_h = view_bottom - menu_bottom;
-        int cell_w = (available_w - margin * (cols - 1)) / cols;
-        int cell_h = (available_h - margin * (rows - 1)) / rows;
-        if (cell_w < 100) cell_w = 100;
-        if (cell_h < 80) cell_h = 80;
-        int slot = 0;
-        for (int i = 0; i < 4; ++i) {
-            if (!g->view_visible[i]) continue;
-            int col = slot % cols;
-            int row = slot / cols;
-            g->view[i].r = (Rect){ content_x + col * (cell_w + margin),
-                                  menu_bottom + row * (cell_h + margin),
-                                  cell_w, cell_h };
-            ++slot;
-        }
-    }
+#define GUI_RECT_FROM_UI(rect) \
+    (Rect){ (rect).x, (rect).y, (rect).width, (rect).height }
+    if (g->tool_palette_visible)
+        g->toolPalette.r = GUI_RECT_FROM_UI(layout.toolPalette);
+    if (g->coordinates_visible)
+        g->coordBox.r = GUI_RECT_FROM_UI(layout.coordinatesPanel);
+    if (g->animation_visible && g->animation_docked)
+        g->animationWindow.r = GUI_RECT_FROM_UI(layout.animationPanel);
+    else if (g->animation_visible &&
+             (g->animationWindow.r.w <= 0 || g->animationWindow.r.h <= 0))
+        g->animationWindow.r = GUI_RECT_FROM_UI(layout.floatingAnimationDefault);
+    for (int i = 0; i < CAD_DESKTOP_VIEW_COUNT; ++i)
+        if (g->view_visible[i]) g->view[i].r = GUI_RECT_FROM_UI(layout.views[i]);
+#undef GUI_RECT_FROM_UI
     g->layout_width = win_w;
     g->layout_height = win_h;
+}
+
+static void clamp_window_reachable(GuiWin* window, int win_w, int win_h) {
+    CadUiRect work;
+    CadUiRect current;
+    CadUiRect clamped;
+    int work_height;
+    if (!window || window->r.w <= 0 || window->r.h <= 0 ||
+        win_w <= 0 || win_h <= 0) return;
+    work_height = win_h - MenuBarHeight() - 22;
+    if (work_height < 1) work_height = 1;
+    work = (CadUiRect){0, MenuBarHeight(), win_w, work_height};
+    current = (CadUiRect){window->r.x, window->r.y,
+                          window->r.w, window->r.h};
+    clamped = CadUiRect_ClampReachable(current, work, 20, 80);
+    window->r.x = clamped.x;
+    window->r.y = clamped.y;
+}
+
+static void clamp_manual_layout(GuiState* g, int win_w, int win_h) {
+    if (!g) return;
+    for (int i = 0; i < 4; ++i)
+        if (g->view_visible[i]) clamp_window_reachable(&g->view[i], win_w, win_h);
+    if (g->tool_palette_visible)
+        clamp_window_reachable(&g->toolPalette, win_w, win_h);
+    if (g->coordinates_visible)
+        clamp_window_reachable(&g->coordBox, win_w, win_h);
+    if (g->animation_visible && !g->animation_docked)
+        clamp_window_reachable(&g->animationWindow, win_w, win_h);
+    if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0)
+        clamp_window_reachable(&g->shapeBrowserWindow, win_w, win_h);
+    if (g->state_visible)
+        clamp_window_reachable(&g->stateWindow, win_w, win_h);
 }
 
 typedef struct ToolMetrics {
@@ -3191,6 +2255,71 @@ static int polygon_point_indices(const CadCore* core, int16_t polygon_index,
         current = core->data.points[current].nextPoint;
     }
     return count;
+}
+
+static int include_point_in_bounds(const GuiState* g, int16_t point_index,
+                                   double* min_x, double* min_y, double* min_z,
+                                   double* max_x, double* max_y, double* max_z,
+                                   int* count) {
+    CadPosition point;
+    if (!g || !count || !gui_scene_point(g, point_index, &point)) return 0;
+    if (*count == 0) {
+        *min_x = *max_x = point.x;
+        *min_y = *max_y = point.y;
+        *min_z = *max_z = point.z;
+    } else {
+        if (point.x < *min_x) *min_x = point.x;
+        if (point.x > *max_x) *max_x = point.x;
+        if (point.y < *min_y) *min_y = point.y;
+        if (point.y > *max_y) *max_y = point.y;
+        if (point.z < *min_z) *min_z = point.z;
+        if (point.z > *max_z) *max_z = point.z;
+    }
+    ++*count;
+    return 1;
+}
+
+static int frame_document_views(GuiState* g, int selection_only) {
+    double min_x = 0.0, min_y = 0.0, min_z = 0.0;
+    double max_x = 0.0, max_y = 0.0, max_z = 0.0;
+    int count = 0;
+    int16_t chain[CAD_MAX_FACE_POINTS];
+    if (!g || !g->cad) return 0;
+
+    if (selection_only) {
+        for (int i = 0; i < g->cad->selection.pointCount; ++i) {
+            include_point_in_bounds(g, g->cad->selection.selectedPoints[i],
+                                    &min_x, &min_y, &min_z, &max_x, &max_y, &max_z, &count);
+        }
+        for (int i = 0; i < g->cad->selection.polygonCount; ++i) {
+            int chain_count = polygon_point_indices(
+                g->cad, g->cad->selection.selectedPolygons[i], chain, ARRAY_COUNT(chain));
+            for (int point = 0; point < chain_count; ++point) {
+                include_point_in_bounds(g, chain[point],
+                                        &min_x, &min_y, &min_z,
+                                        &max_x, &max_y, &max_z, &count);
+            }
+        }
+    } else {
+        for (int i = 0; i < g->cad->data.pointCount; ++i) {
+            include_point_in_bounds(g, (int16_t)i,
+                                    &min_x, &min_y, &min_z, &max_x, &max_y, &max_z, &count);
+        }
+    }
+    if (!count) return 0;
+
+    for (int i = 0; i < 4; ++i) {
+        Rect content = view_content_rect(g, i);
+        if (selection_only) {
+            CadView_FrameBoundsPreserveOrientation(
+                &g->views[i], min_x, min_y, min_z,
+                max_x, max_y, max_z, content.w, content.h);
+        } else {
+            CadView_FrameBounds(&g->views[i], min_x, min_y, min_z,
+                                max_x, max_y, max_z, content.w, content.h);
+        }
+    }
+    return 1;
 }
 
 static int point_in_other_polygon(const CadCore* core, int16_t point_index,
@@ -3327,104 +2456,30 @@ static int collect_transform_points(GuiState* g, int face_tool,
     return count;
 }
 
-static int collect_transform_animation_points(GuiState* g,
-                                              const int16_t* base_points,
-                                              int base_count,
-                                              int16_t* result,
-                                              int capacity) {
-    int result_count = 0;
-    if (!g || !base_points || !result || base_count <= 0) return 0;
-    for (int polygon_index = 0; polygon_index < g->cad->data.polygonCount; ++polygon_index) {
-        CadPolygon* polygon = &g->cad->data.polygons[polygon_index];
-        if (!polygon->flags || polygon->animation < 0 ||
-            polygon->animation >= CAD_MAX_ANIMATION_INDICES ||
-            !g->cad->data.animationIndices[polygon->animation].flags) continue;
-        int16_t base_chain[CAD_MAX_FACE_POINTS];
-        int count = polygon_point_indices(g->cad, (int16_t)polygon_index,
-                                          base_chain, ARRAY_COUNT(base_chain));
-        for (int ordinal = 0; ordinal < count; ++ordinal) {
-            int selected = 0;
-            for (int b = 0; b < base_count; ++b) selected |= base_chain[ordinal] == base_points[b];
-            if (!selected) continue;
-            CadAnimationIndex* animation = &g->cad->data.animationIndices[polygon->animation];
-            for (int frame = 0; frame < CAD_ANIMATION_FRAMES; ++frame) {
-                int16_t current = animation->frame[frame];
-                for (int step = 0; step < ordinal && current >= 0 &&
-                     current < CAD_MAX_ANIMATION_POINTS; ++step) {
-                    current = g->cad->data.animationPoints[current].nextPoint;
-                }
-                if (current < 0 || current >= CAD_MAX_ANIMATION_POINTS ||
-                    !g->cad->data.animationPoints[current].flags) continue;
-                int duplicate = 0;
-                for (int i = 0; i < result_count; ++i) duplicate |= result[i] == current;
-                if (!duplicate && result_count < capacity) result[result_count++] = current;
-            }
-        }
-    }
-    return result_count;
-}
-
 static int ensure_static_topology(GuiState* g, const char* action) {
     if (!g || !CadDocument_HasAnimation(&g->document)) return 1;
-#ifdef _WIN32
-    char message[512];
-    snprintf(message, sizeof(message),
-             "%s changes model topology and cannot preserve animation links.\n\n"
-             "Create an unnamed static copy and discard animation data?",
-             action ? action : "This operation");
-    if (MessageBoxA(GetActiveWindow(), message, "3DCad - Animated document",
-                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
-        gui_set_status(g, "%s cancelled; animation data remains intact", action ? action : "Operation");
-        return 0;
-    }
-    CadCore* static_core = (CadCore*)malloc(sizeof(*static_core));
-    uint8_t* palette_copy = (uint8_t*)malloc(CAD_COLOR_DATA_SIZE + CAD_PALETTE_DATA_SIZE);
-    if (!static_core || !palette_copy) {
-        free(static_core);
-        free(palette_copy);
-        gui_set_status(g, "Not enough memory to create a static copy");
-        return 0;
-    }
-    size_t color_size = g->document.colorDataSize;
-    size_t palette_size = g->document.paletteDataSize;
-    memcpy(palette_copy, g->document.colorData, CAD_COLOR_DATA_SIZE);
-    memcpy(palette_copy + CAD_COLOR_DATA_SIZE, g->document.paletteData,
-           CAD_PALETTE_DATA_SIZE);
-    *static_core = *g->cad;
-    memset(static_core->data.animationIndices, 0, sizeof(static_core->data.animationIndices));
-    memset(static_core->data.animationPoints, 0, sizeof(static_core->data.animationPoints));
-    static_core->data.animationIndexCount = 0;
-    static_core->data.animationPointCount = 0;
-    for (int i = 0; i < static_core->data.polygonCount; ++i) {
-        if (static_core->data.polygons[i].flags) static_core->data.polygons[i].animation = INVALID_INDEX;
-    }
-    replace_document(g, static_core, NULL, 1);
-    memcpy(g->document.colorData, palette_copy, CAD_COLOR_DATA_SIZE);
-    memcpy(g->document.paletteData, palette_copy + CAD_COLOR_DATA_SIZE,
-           CAD_PALETTE_DATA_SIZE);
-    g->document.colorDataSize = color_size;
-    g->document.paletteDataSize = palette_size;
-    apply_document_palette(g);
-    free(palette_copy);
-    free(static_core);
-    gui_set_status(g, "Created unnamed static copy; animation data removed");
-    return 1;
-#else
-    gui_set_status(g, "%s blocked: create a static copy before changing topology", action ? action : "Operation");
+    gui_set_status(g,
+                   "%s disabled while animation exists; use Make Static Copy from the timeline",
+                   action ? action : "Topology change");
     return 0;
-#endif
 }
 
-static void selection_center(CadCore* core, const int16_t* points, int count,
+static void selection_center(const GuiState* g, const int16_t* points, int count,
                              double* x, double* y, double* z) {
+    int valid = 0;
     *x = *y = *z = 0.0;
-    if (!core || !points || count <= 0) return;
+    if (!g || !points || count <= 0) return;
     for (int i = 0; i < count; ++i) {
-        *x += core->data.points[points[i]].pointx;
-        *y += core->data.points[points[i]].pointy;
-        *z += core->data.points[points[i]].pointz;
+        CadPosition point;
+        if (!gui_scene_point(g, points[i], &point)) continue;
+        *x += point.x;
+        *y += point.y;
+        *z += point.z;
+        ++valid;
     }
-    *x /= count; *y /= count; *z /= count;
+    if (valid > 0) {
+        *x /= valid; *y /= valid; *z /= valid;
+    }
 }
 
 static const char* const state_field_labels[15] = {
@@ -3488,7 +2543,7 @@ static void state_panel_defaults(GuiState* g) {
     int count = collect_transform_points(g, g->state_face_target,
                                          points, ARRAY_COUNT(points));
     double x = 0.0, y = 0.0, z = 0.0;
-    selection_center(g->cad, points, count, &x, &y, &z);
+    selection_center(g, points, count, &x, &y, &z);
     state_set_value(g, 0, 0.0); state_set_value(g, 1, 0.0); state_set_value(g, 2, 0.0);
     state_set_value(g, 3, x); state_set_value(g, 4, y); state_set_value(g, 5, z);
     state_set_value(g, 6, 0.0); state_set_value(g, 7, 0.0); state_set_value(g, 8, 0.0);
@@ -3498,6 +2553,11 @@ static void state_panel_defaults(GuiState* g) {
 
 static void state_panel_open(GuiState* g) {
     if (!g) return;
+    /* Numeric transform defaults and pivots must come from a stored pose.
+       Opening the modal panel is the beginning of that editing workflow, so
+       pause playback and snap a fractional preview before sampling it. */
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    animation_update_scene(g, g->animation_now);
     g->state_face_target = g->cad->selection.polygonCount > 0 &&
                            (!g->cad->selectModeFlag || !g->cad->selection.pointCount);
     int selected = g->state_face_target ? g->cad->selection.polygonCount
@@ -3552,7 +2612,9 @@ static void state_transform_point(CadPoint* point, const double v[15]) {
 static int state_panel_apply(GuiState* g) {
     double values[15];
     int16_t points[CAD_MAX_POINTS];
-    int16_t animation_points[CAD_MAX_ANIMATION_POINTS];
+    CadPoint samples[4];
+    CadAffineTransform transform;
+    CadResult result;
     if (!g || !state_parse_values(g, values)) return 0;
     int point_count = collect_transform_points(g, g->state_face_target,
                                                points, ARRAY_COUNT(points));
@@ -3560,19 +2622,41 @@ static int state_panel_apply(GuiState* g) {
         gui_set_status(g, "The STATE target selection is no longer available");
         return 0;
     }
-    int animation_count = collect_transform_animation_points(g, points, point_count,
-        animation_points, ARRAY_COUNT(animation_points));
-    if (!history_push(g)) return 0;
-    for (int i = 0; i < point_count; ++i) {
-        state_transform_point(&g->cad->data.points[points[i]], values);
-    }
-    for (int i = 0; i < animation_count; ++i) {
-        state_transform_point(&g->cad->data.animationPoints[animation_points[i]], values);
+    memset(samples, 0, sizeof(samples));
+    samples[1].pointx = 1.0;
+    samples[2].pointy = 1.0;
+    samples[3].pointz = 1.0;
+    for (int i = 0; i < 4; ++i) state_transform_point(&samples[i], values);
+    memset(&transform, 0, sizeof(transform));
+    transform.translation.x = samples[0].pointx;
+    transform.translation.y = samples[0].pointy;
+    transform.translation.z = samples[0].pointz;
+    transform.matrix[0][0] = samples[1].pointx - samples[0].pointx;
+    transform.matrix[1][0] = samples[1].pointy - samples[0].pointy;
+    transform.matrix[2][0] = samples[1].pointz - samples[0].pointz;
+    transform.matrix[0][1] = samples[2].pointx - samples[0].pointx;
+    transform.matrix[1][1] = samples[2].pointy - samples[0].pointy;
+    transform.matrix[2][1] = samples[2].pointz - samples[0].pointz;
+    transform.matrix[0][2] = samples[3].pointx - samples[0].pointx;
+    transform.matrix[1][2] = samples[3].pointy - samples[0].pointy;
+    transform.matrix[2][2] = samples[3].pointz - samples[0].pointz;
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    if (!history_push_named(g, "State Transform")) return 0;
+    result = CadAnimation_Transform(
+        &g->cad->data, g->animation.currentFrame,
+        g->animation.allFrames ? CAD_ANIMATION_ALL_FRAMES
+                               : CAD_ANIMATION_CURRENT_FRAME,
+        points, (size_t)point_count, &transform);
+    if (!CadResult_IsSuccess(&result)) {
+        history_cancel(g);
+        gui_set_status(g, "STATE transform failed: %s",
+                       cad_result_message(&result));
+        return 0;
     }
     if (!history_commit(g)) return 0;
-    gui_set_status(g, "Applied numeric transform to %d point(s)%s%s", point_count,
-                   animation_count ? " and " : "",
-                   animation_count ? "corresponding animation frames" : "");
+    gui_set_status(g, "Applied numeric transform to %d point(s) in %s",
+                   point_count, g->animation.allFrames ? "all frames"
+                                                       : "the current frame");
     state_panel_defaults(g);
     g->state_active_field = 0;
     g->state_replace_on_input = 1;
@@ -3652,7 +2736,7 @@ static void editor_paste(GuiState* g) {
         return;
     }
     if (!ensure_static_topology(g, "Paste")) return;
-    if (!history_push(g)) return;
+    if (!history_push_named(g, "Paste")) return;
     CadCore_ClearSelection(g->cad);
     int made = 0;
     int failed = 0;
@@ -3690,7 +2774,7 @@ static void editor_change_first_point(GuiState* g) {
         return;
     }
     if (!ensure_static_topology(g, "Change First Point")) return;
-    if (!history_push(g)) return;
+    if (!history_push_named(g, "Change First Point")) return;
     int changed = 0;
     int16_t chain[CAD_MAX_FACE_POINTS];
     for (int i = 0; i < g->cad->selection.polygonCount; ++i) {
@@ -3710,24 +2794,17 @@ static void editor_change_first_point(GuiState* g) {
 
 static int polygon_is_flat(const CadCore* core, int16_t polygon_index) {
     int16_t chain[CAD_MAX_FACE_POINTS];
+    double coordinates[CAD_MAX_FACE_POINTS][3];
     int count = polygon_point_indices(core, polygon_index, chain, ARRAY_COUNT(chain));
-    if (count <= 3) return 1;
-    const CadPoint* a = &core->data.points[chain[0]];
-    const CadPoint* b = &core->data.points[chain[1]];
-    const CadPoint* c = &core->data.points[chain[2]];
-    double ux = b->pointx - a->pointx, uy = b->pointy - a->pointy, uz = b->pointz - a->pointz;
-    double vx = c->pointx - a->pointx, vy = c->pointy - a->pointy, vz = c->pointz - a->pointz;
-    double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    double length = sqrt(nx * nx + ny * ny + nz * nz);
-    if (length < 1e-9) return 0;
-    for (int i = 3; i < count; ++i) {
+    if (count < 2) return 0;
+    for (int i = 0; i < count; ++i) {
         const CadPoint* p = &core->data.points[chain[i]];
-        double distance = fabs(nx * (p->pointx - a->pointx) +
-                               ny * (p->pointy - a->pointy) +
-                               nz * (p->pointz - a->pointz)) / length;
-        if (distance > 0.01) return 0;
+        coordinates[i][0] = p->pointx;
+        coordinates[i][1] = p->pointy;
+        coordinates[i][2] = p->pointz;
     }
-    return 1;
+    return CadGeometry_ClassifyPointChain(coordinates, count, 0.01) ==
+           CAD_POINT_CHAIN_COPLANAR;
 }
 
 static void editor_flat_check(GuiState* g) {
@@ -3786,7 +2863,7 @@ static void editor_grid_merge(GuiState* g) {
         changed += x != p->pointx || y != p->pointy || z != p->pointz;
     }
     if (!changed) { gui_set_status(g, "Grid Merge: coordinates already integral"); return; }
-    if (!history_push(g)) return;
+    if (!history_push_named(g, "Grid Merge")) return;
     for (int i = 0; i < g->cad->data.pointCount; ++i) {
         CadPoint* p = &g->cad->data.points[i];
         if (!p->flags) continue;
@@ -3801,41 +2878,30 @@ static void editor_grid_merge(GuiState* g) {
 
 static void editor_point_merge(GuiState* g) {
     if (!ensure_static_topology(g, "Point Merge")) return;
-    int pairs = 0;
-    for (int i = 0; i < g->cad->data.pointCount; ++i) {
-        CadPoint* a = &g->cad->data.points[i];
-        if (!a->flags) continue;
-        for (int j = i + 1; j < g->cad->data.pointCount; ++j) {
-            CadPoint* b = &g->cad->data.points[j];
-            if (!b->flags) continue;
-            double dx = a->pointx - b->pointx, dy = a->pointy - b->pointy, dz = a->pointz - b->pointz;
-            if (dx * dx + dy * dy + dz * dz <= 0.0001 &&
-                (dx != 0.0 || dy != 0.0 || dz != 0.0)) ++pairs;
-        }
+    if (CadCore_ArePointsMerged(g->cad)) {
+        gui_set_status(g, "Point Merge: polygon chains are already merged");
+        return;
     }
-    if (!pairs) { gui_set_status(g, "Point Merge: no near-duplicate coordinates"); return; }
-    if (!history_push(g)) return;
-    int merged = 0;
-    for (int i = 0; i < g->cad->data.pointCount; ++i) {
-        CadPoint* a = &g->cad->data.points[i];
-        if (!a->flags) continue;
-        for (int j = i + 1; j < g->cad->data.pointCount; ++j) {
-            CadPoint* b = &g->cad->data.points[j];
-            if (!b->flags) continue;
-            double dx = a->pointx - b->pointx, dy = a->pointy - b->pointy, dz = a->pointz - b->pointz;
-            if (dx * dx + dy * dy + dz * dz <= 0.0001) {
-                b->pointx = a->pointx; b->pointy = a->pointy; b->pointz = a->pointz;
-                ++merged;
-            }
-        }
+    if (!history_push_named(g, "Point Merge")) return;
+    int merged = CadCore_MergePolygonPoints(g->cad);
+    if (!merged) {
+        history_cancel(g);
+        gui_set_status(g, "Point Merge: no mergeable linked-chain vertices");
+        return;
     }
-    g->cad->isDirty = 1;
     if (!history_commit(g)) return;
-    gui_set_status(g, "Point Merge: aligned %d near-duplicate point(s)", merged);
+    gui_set_status(g, "Point Merge: removed %d redundant chain point(s)", merged);
 }
 
 static int polygons_equal(const CadCore* core, int16_t left, int16_t right) {
     int16_t a[CAD_MAX_FACE_POINTS], b[CAD_MAX_FACE_POINTS];
+    /* Reciprocal faces intentionally describe the same boundary in opposite
+       directions so each side can carry its own color.  They are a valid
+       pair, not duplicate geometry for Polygon/All Merge to discard. */
+    if (core->data.polygons[left].both == right &&
+        core->data.polygons[right].both == left) {
+        return 0;
+    }
     int ac = polygon_point_indices(core, left, a, ARRAY_COUNT(a));
     int bc = polygon_point_indices(core, right, b, ARRAY_COUNT(b));
     if (ac != bc || ac < 2) return 0;
@@ -3868,7 +2934,7 @@ static void editor_polygon_merge(GuiState* g) {
         }
     }
     if (!duplicates) { gui_set_status(g, "Polygon Merge: no duplicate faces"); return; }
-    if (!history_push(g)) return;
+    if (!history_push_named(g, "Polygon Merge")) return;
     int removed = 0;
     for (int i = 0; i < g->cad->data.polygonCount; ++i) {
         if (!CadCore_IsPolygonValid(g->cad, (int16_t)i)) continue;
@@ -3881,6 +2947,47 @@ static void editor_polygon_merge(GuiState* g) {
     }
     if (!history_commit(g)) return;
     gui_set_status(g, "Polygon Merge: removed %d duplicate face(s)", removed);
+}
+
+static void editor_merge_all(GuiState* g) {
+    int rounded = 0;
+    int merged = 0;
+    int removed = 0;
+    if (!g || !ensure_static_topology(g, "All Merge")) return;
+    if (!history_push_named(g, "All Merge")) return;
+
+    for (int i = 0; i < g->cad->data.pointCount; ++i) {
+        CadPoint* point = &g->cad->data.points[i];
+        double x, y, z;
+        if (!point->flags) continue;
+        x = (double)CadCore_ConvertCoordinate(point->pointx);
+        y = (double)CadCore_ConvertCoordinate(point->pointy);
+        z = (double)CadCore_ConvertCoordinate(point->pointz);
+        if (x != point->pointx || y != point->pointy || z != point->pointz)
+            ++rounded;
+        point->pointx = x; point->pointy = y; point->pointz = z;
+    }
+    merged = CadCore_MergePolygonPoints(g->cad);
+    for (int i = 0; i < g->cad->data.polygonCount; ++i) {
+        if (!CadCore_IsPolygonValid(g->cad, (int16_t)i)) continue;
+        for (int j = i + 1; j < g->cad->data.polygonCount; ++j) {
+            if (CadCore_IsPolygonValid(g->cad, (int16_t)j) &&
+                polygons_equal(g->cad, (int16_t)i, (int16_t)j)) {
+                delete_polygon_geometry(g->cad, (int16_t)j);
+                ++removed;
+            }
+        }
+    }
+    if (!rounded && !merged && !removed) {
+        history_cancel(g);
+        gui_set_status(g, "All Merge: model is already fully merged");
+        return;
+    }
+    g->cad->isDirty = 1;
+    if (!history_commit(g)) return;
+    gui_set_status(g,
+                   "All Merge: rounded %d point(s), merged %d chain point(s), removed %d face(s)",
+                   rounded, merged, removed);
 }
 
 static void editor_polygon_sort(GuiState* g) {
@@ -3898,7 +3005,7 @@ static void editor_polygon_sort(GuiState* g) {
         }
         ids[j + 1] = value;
     }
-    if (!history_push(g)) return;
+    if (!history_push_named(g, "Polygon Sort")) return;
     CadPolygon sorted[CAD_MAX_POLYGONS];
     int16_t map[CAD_MAX_POLYGONS];
     memset(sorted, 0, sizeof(sorted));
@@ -3932,63 +3039,94 @@ static double point_segment_distance(double px, double py, double ax, double ay,
     return sqrt(dx * dx + dy * dy);
 }
 
-static int screen_point_in_polygon(int x, int y, const int* px, const int* py, int count) {
-    int inside = 0;
-    for (int i = 0, j = count - 1; i < count; j = i++) {
-        if (((py[i] > y) != (py[j] > y)) &&
-            (x < (px[j] - px[i]) * (double)(y - py[i]) /
-                 (double)(py[j] - py[i] ? py[j] - py[i] : 1) + px[i])) inside = !inside;
-    }
-    return inside;
-}
-
 static int16_t find_polygon_at(GuiState* g, int view_index, int screen_x, int screen_y,
                                int* nearest_edge) {
-    if (nearest_edge) *nearest_edge = -1;
     Rect content = view_content_rect(g, view_index);
+    int16_t polygon = gui_find_nearest_polygon(g, view_index, screen_x,
+                                                screen_y, content, 8);
+    if (nearest_edge) *nearest_edge = -1;
+    if (polygon == INVALID_INDEX || !nearest_edge) return polygon;
+
     int16_t chain[CAD_MAX_FACE_POINTS];
-    for (int p = g->cad->data.polygonCount - 1; p >= 0; --p) {
-        if (!CadCore_IsPolygonValid(g->cad, (int16_t)p)) continue;
-        int count = polygon_point_indices(g->cad, (int16_t)p, chain, ARRAY_COUNT(chain));
-        if (count < 2) continue;
-        int px[CAD_MAX_FACE_POINTS], py[CAD_MAX_FACE_POINTS];
-        for (int i = 0; i < count; ++i) {
-            CadPoint* point = &g->cad->data.points[chain[i]];
-            CadView_ProjectPoint(&g->views[view_index], point->pointx, point->pointy, point->pointz,
-                                 &px[i], &py[i], content.w, content.h);
-            px[i] += content.x; py[i] += content.y;
-        }
-        double best_edge = 1e30;
-        int best_index = -1;
-        int edges = count == 2 ? 1 : count;
-        for (int i = 0; i < edges; ++i) {
-            int next = (i + 1) % count;
-            double distance = point_segment_distance(screen_x, screen_y,
-                                                     px[i], py[i], px[next], py[next]);
-            if (distance < best_edge) { best_edge = distance; best_index = i; }
-        }
-        if ((count >= 3 && screen_point_in_polygon(screen_x, screen_y, px, py, count)) || best_edge <= 8.0) {
-            if (nearest_edge) *nearest_edge = best_index;
-            return (int16_t)p;
+    int count = polygon_point_indices(g->cad, polygon, chain, ARRAY_COUNT(chain));
+    int px[CAD_MAX_FACE_POINTS], py[CAD_MAX_FACE_POINTS];
+    double best_edge = HUGE_VAL;
+    if (count < 2) return INVALID_INDEX;
+    for (int i = 0; i < count; ++i) {
+        CadPosition point;
+        if (!gui_scene_point(g, chain[i], &point)) return INVALID_INDEX;
+        CadView_ProjectPoint(&g->views[view_index], point.x, point.y, point.z,
+                             &px[i], &py[i], content.w, content.h);
+        px[i] += content.x;
+        py[i] += content.y;
+    }
+    for (int i = 0; i < (count == 2 ? 1 : count); ++i) {
+        int next = (i + 1) % count;
+        double distance = point_segment_distance(screen_x, screen_y,
+                                                 px[i], py[i], px[next], py[next]);
+        if (distance < best_edge) {
+            best_edge = distance;
+            *nearest_edge = i;
         }
     }
-    return INVALID_INDEX;
+    return polygon;
 }
 
-static int coordinates_are_flat(const double coords[][3], int count) {
-    if (count <= 3) return 1;
-    double ux = coords[1][0] - coords[0][0], uy = coords[1][1] - coords[0][1], uz = coords[1][2] - coords[0][2];
-    double vx = coords[2][0] - coords[0][0], vy = coords[2][1] - coords[0][1], vz = coords[2][2] - coords[0][2];
-    double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    double length = sqrt(nx * nx + ny * ny + nz * nz);
-    if (length < 1e-9) return 0;
-    for (int i = 3; i < count; ++i) {
-        double distance = fabs(nx * (coords[i][0] - coords[0][0]) +
-                               ny * (coords[i][1] - coords[0][1]) +
-                               nz * (coords[i][2] - coords[0][2])) / length;
-        if (distance > 0.01) return 0;
+static void update_face_creation_status(GuiState* g, int view_index) {
+    double coords[CAD_MAX_FACE_POINTS][3];
+    int count;
+    (void)view_index;
+    if (!g || !g->cad) return;
+    count = g->cad->selection.pointCount;
+    if (count <= 0) {
+        gui_set_status(g, "Face: choose 2-%d ordered points; Enter finishes, Escape cancels",
+                       CAD_MAX_FACE_POINTS);
+        return;
     }
-    return 1;
+    if (count > CAD_MAX_FACE_POINTS) count = CAD_MAX_FACE_POINTS;
+    for (int i = 0; i < count; ++i) {
+        int16_t index = g->cad->selection.selectedPoints[i];
+        const CadPoint* point = CadCore_IsPointValid(g->cad, index)
+                                ? &g->cad->data.points[index] : NULL;
+        if (!point) return;
+        coords[i][0] = point->pointx;
+        coords[i][1] = point->pointy;
+        coords[i][2] = point->pointz;
+    }
+    if (count == 1) {
+        gui_set_status(g, "Face: vertex 1 set; choose the next point (Backspace removes it)");
+    } else if (count == 2) {
+        CadPointChainPlanarity planarity =
+            CadGeometry_ClassifyPointChain(coords, count, 0.01);
+        if (planarity == CAD_POINT_CHAIN_COPLANAR)
+            gui_set_status(g, "Face: 2 vertices form a colored line; Enter/right-click finishes");
+        else
+            gui_set_status(g, "Face: degenerate line (coincident endpoints); choose a different point");
+    } else {
+        double nx = 0.0, ny = 0.0, nz = 0.0;
+        CadPointChainPlanarity planarity =
+            CadGeometry_ClassifyPointChain(coords, count, 0.01);
+        const char* normal_axis;
+        for (int i = 0; i < count; ++i) {
+            int next = (i + 1) % count;
+            nx += (coords[i][1] - coords[next][1]) * (coords[i][2] + coords[next][2]);
+            ny += (coords[i][2] - coords[next][2]) * (coords[i][0] + coords[next][0]);
+            nz += (coords[i][0] - coords[next][0]) * (coords[i][1] + coords[next][1]);
+        }
+        if (planarity == CAD_POINT_CHAIN_DEGENERATE) {
+            gui_set_status(g, "Face: %d/%d vertices, degenerate (coincident or collinear); Enter will reject",
+                           count, CAD_MAX_FACE_POINTS);
+            return;
+        }
+        if (fabs(nx) >= fabs(ny) && fabs(nx) >= fabs(nz)) normal_axis = nx < 0.0 ? "-X" : "+X";
+        else if (fabs(ny) >= fabs(nz)) normal_axis = ny < 0.0 ? "-Y" : "+Y";
+        else normal_axis = nz < 0.0 ? "-Z" : "+Z";
+        gui_set_status(g, "Face: %d/%d vertices, %s, winding normal %s; Enter finishes",
+                       count, CAD_MAX_FACE_POINTS,
+                       planarity == CAD_POINT_CHAIN_COPLANAR
+                           ? "coplanar" : "NOT coplanar",
+                       normal_axis);
+    }
 }
 
 static int create_face_from_selection(GuiState* g) {
@@ -4005,7 +3143,15 @@ static int create_face_from_selection(GuiState* g) {
         CadPoint* point = &g->cad->data.points[index];
         coords[i][0] = point->pointx; coords[i][1] = point->pointy; coords[i][2] = point->pointz;
     }
-    if (!coordinates_are_flat(coords, count)) {
+    CadPointChainPlanarity planarity =
+        CadGeometry_ClassifyPointChain(coords, count, 0.01);
+    if (planarity == CAD_POINT_CHAIN_DEGENERATE) {
+        gui_set_status(g, count == 2
+                           ? "Face rejected: colored-line endpoints coincide"
+                           : "Face rejected: selected points are coincident or collinear");
+        return 0;
+    }
+    if (planarity != CAD_POINT_CHAIN_COPLANAR) {
         gui_set_status(g, "Face rejected: selected points are not coplanar");
         return 0;
     }
@@ -4101,23 +3247,36 @@ static void remove_selected_faces(GuiState* g) {
 
 static void flip_selected_points(GuiState* g) {
     int16_t points[CAD_MAX_POINTS];
+    CadAffineTransform transform;
+    CadResult result;
     int count = collect_transform_points(g, 0, points, ARRAY_COUNT(points));
     if (!count) { gui_set_status(g, "Select points to flip"); return; }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    animation_update_scene(g, g->animation_now);
     double cx, cy, cz;
-    selection_center(g->cad, points, count, &cx, &cy, &cz);
+    selection_center(g, points, count, &cx, &cy, &cz);
     (void)cy; (void)cz;
-    int16_t animation_points[CAD_MAX_ANIMATION_POINTS];
-    int animation_count = collect_transform_animation_points(g, points, count,
-        animation_points, ARRAY_COUNT(animation_points));
+    memset(&transform, 0, sizeof(transform));
+    transform.matrix[0][0] = -1.0;
+    transform.matrix[1][1] = 1.0;
+    transform.matrix[2][2] = 1.0;
+    transform.pivot.x = cx;
+    transform.pivot.y = cy;
+    transform.pivot.z = cz;
     if (!history_push(g)) return;
-    for (int i = 0; i < count; ++i) g->cad->data.points[points[i]].pointx = 2.0 * cx - g->cad->data.points[points[i]].pointx;
-    for (int i = 0; i < animation_count; ++i) {
-        CadAnimationPoint* p = &g->cad->data.animationPoints[animation_points[i]];
-        p->pointx = 2.0 * cx - p->pointx;
+    result = CadAnimation_Transform(
+        &g->cad->data, g->animation.currentFrame,
+        g->animation.allFrames ? CAD_ANIMATION_ALL_FRAMES
+                               : CAD_ANIMATION_CURRENT_FRAME,
+        points, (size_t)count, &transform);
+    if (!CadResult_IsSuccess(&result)) {
+        history_cancel(g);
+        gui_set_status(g, "Flip failed: %s", cad_result_message(&result));
+        return;
     }
-    g->cad->isDirty = 1;
     if (!history_commit(g)) return;
-    gui_set_status(g, "Flipped %d point(s) across X=%.2f", count, cx);
+    gui_set_status(g, "Flipped %d point(s) across X=%.2f in %s", count, cx,
+                   g->animation.allFrames ? "all frames" : "the current frame");
 }
 
 static void copy_selected_faces(GuiState* g, int mirror) {
@@ -4129,7 +3288,7 @@ static void copy_selected_faces(GuiState* g, int mirror) {
     double mirror_center = 0.0, cy = 0.0, cz = 0.0;
     int16_t points[CAD_MAX_POINTS];
     int point_count = collect_transform_points(g, 1, points, ARRAY_COUNT(points));
-    selection_center(g->cad, points, point_count, &mirror_center, &cy, &cz);
+    selection_center(g, points, point_count, &mirror_center, &cy, &cz);
     (void)cy; (void)cz;
     if (!history_push(g)) return;
     CadCore_ClearSelection(g->cad);
@@ -4252,10 +3411,14 @@ static int tool_is_transform(CadToolId tool) {
 static void activate_tool(GuiState* g, CadToolId tool) {
     if (!g || tool < 0 || tool >= CAD_TOOL_COUNT) return;
     const CadToolDescriptor* descriptor = &toolDescriptors[tool];
+    EditorCommandContext context = editor_command_context(g);
+    CadCommandState state = EditorController_GetToolState(
+        &g->controller, tool, &context);
     reset_interaction(g);
-    if (descriptor->flags & CAD_TOOL_FLAG_DISABLED) {
+    if (!state.enabled) {
         g->selected_tool = CAD_TOOL_NONE;
-        gui_set_status(g, "%s unavailable: %s", descriptor->name, descriptor->help);
+        gui_set_status(g, "%s unavailable: %s", descriptor->name,
+                       state.disabledReason[0] ? state.disabledReason : descriptor->help);
         return;
     }
     if (descriptor->flags & CAD_TOOL_FLAG_IMMEDIATE) {
@@ -4304,74 +3467,70 @@ static int apply_transform_drag(GuiState* g, int dx, int dy) {
     const int face_tool = tool_needs_faces(g->selected_tool);
     int16_t points[CAD_MAX_POINTS];
     int count = collect_transform_points(g, face_tool, points, ARRAY_COUNT(points));
+    CadAffineTransform transform;
+    CadAnimationScope scope;
+    CadResult result;
     if (!count || (dx == 0 && dy == 0)) return 1;
-    int16_t animation_points[CAD_MAX_ANIMATION_POINTS];
-    int animation_count = collect_transform_animation_points(g, points, count,
-        animation_points, ARRAY_COUNT(animation_points));
     if (!g->transform_history_pushed) {
+        CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
         if (!history_push(g)) return 0;
         g->transform_history_pushed = 1;
     }
+    memset(&transform, 0, sizeof(transform));
+    transform.matrix[0][0] = 1.0;
+    transform.matrix[1][1] = 1.0;
+    transform.matrix[2][2] = 1.0;
+    selection_center(g, points, count,
+                     &transform.pivot.x, &transform.pivot.y,
+                     &transform.pivot.z);
+    scope = g->animation.allFrames ? CAD_ANIMATION_ALL_FRAMES
+                                   : CAD_ANIMATION_CURRENT_FRAME;
     CadView* view = &g->views[g->point_move_view];
     if (g->selected_tool == CAD_TOOL_POINT_MOVE || g->selected_tool == CAD_TOOL_FACE_MOVE) {
         double tx, ty, tz;
         Rect content = view_content_rect(g, g->point_move_view);
         CadView_UnprojectDelta(view, dx, dy, content.w, content.h, &tx, &ty, &tz);
-        for (int i = 0; i < count; ++i) {
-            CadPoint* p = &g->cad->data.points[points[i]];
-            p->pointx += tx; p->pointy += ty; p->pointz += tz;
-        }
-        for (int i = 0; i < animation_count; ++i) {
-            CadAnimationPoint* p = &g->cad->data.animationPoints[animation_points[i]];
-            p->pointx += tx; p->pointy += ty; p->pointz += tz;
-        }
+        transform.translation.x = tx;
+        transform.translation.y = ty;
+        transform.translation.z = tz;
     } else {
-        double cx, cy, cz;
-        selection_center(g->cad, points, count, &cx, &cy, &cz);
         if (g->selected_tool == CAD_TOOL_POINT_SCALE || g->selected_tool == CAD_TOOL_FACE_SCALE) {
             double factor = exp((double)(dx - dy) * 0.01);
             if (factor < 0.25) factor = 0.25;
             if (factor > 4.0) factor = 4.0;
-            for (int i = 0; i < count; ++i) {
-                CadPoint* p = &g->cad->data.points[points[i]];
-                p->pointx = cx + (p->pointx - cx) * factor;
-                p->pointy = cy + (p->pointy - cy) * factor;
-                p->pointz = cz + (p->pointz - cz) * factor;
-            }
-            for (int i = 0; i < animation_count; ++i) {
-                CadAnimationPoint* p = &g->cad->data.animationPoints[animation_points[i]];
-                p->pointx = cx + (p->pointx - cx) * factor;
-                p->pointy = cy + (p->pointy - cy) * factor;
-                p->pointz = cz + (p->pointz - cz) * factor;
-            }
+            transform.matrix[0][0] = factor;
+            transform.matrix[1][1] = factor;
+            transform.matrix[2][2] = factor;
         } else {
             double angle = (double)(dx - dy) * 0.01;
             double s = sin(angle), c = cos(angle);
-            for (int i = 0; i < count; ++i) {
-                CadPoint* p = &g->cad->data.points[points[i]];
-                double x = p->pointx - cx, y = p->pointy - cy, z = p->pointz - cz;
-                if (view->type == CAD_VIEW_TOP || view->type == CAD_VIEW_3D) {
-                    p->pointx = cx + x * c - z * s; p->pointz = cz + x * s + z * c;
-                } else if (view->type == CAD_VIEW_FRONT) {
-                    p->pointx = cx + x * c - y * s; p->pointy = cy + x * s + y * c;
-                } else {
-                    p->pointy = cy + y * c - z * s; p->pointz = cz + y * s + z * c;
-                }
-            }
-            for (int i = 0; i < animation_count; ++i) {
-                CadAnimationPoint* p = &g->cad->data.animationPoints[animation_points[i]];
-                double x = p->pointx - cx, y = p->pointy - cy, z = p->pointz - cz;
-                if (view->type == CAD_VIEW_TOP || view->type == CAD_VIEW_3D) {
-                    p->pointx = cx + x * c - z * s; p->pointz = cz + x * s + z * c;
-                } else if (view->type == CAD_VIEW_FRONT) {
-                    p->pointx = cx + x * c - y * s; p->pointy = cy + x * s + y * c;
-                } else {
-                    p->pointy = cy + y * c - z * s; p->pointz = cz + y * s + z * c;
-                }
+            if (view->type == CAD_VIEW_TOP || view->type == CAD_VIEW_3D) {
+                transform.matrix[0][0] = c;
+                transform.matrix[0][2] = -s;
+                transform.matrix[2][0] = s;
+                transform.matrix[2][2] = c;
+            } else if (view->type == CAD_VIEW_FRONT) {
+                transform.matrix[0][0] = c;
+                transform.matrix[0][1] = -s;
+                transform.matrix[1][0] = s;
+                transform.matrix[1][1] = c;
+            } else {
+                transform.matrix[1][1] = c;
+                transform.matrix[1][2] = -s;
+                transform.matrix[2][1] = s;
+                transform.matrix[2][2] = c;
             }
         }
     }
-    g->cad->isDirty = 1;
+    result = CadAnimation_Transform(&g->cad->data,
+                                    g->animation.currentFrame, scope,
+                                    points, (size_t)count, &transform);
+    if (!CadResult_IsSuccess(&result)) {
+        history_cancel(g);
+        g->transform_history_pushed = 0;
+        gui_set_status(g, "Transform failed: %s", cad_result_message(&result));
+        return 0;
+    }
     return 1;
 }
 
@@ -4395,7 +3554,13 @@ static void guided_point_click(GuiState* g, int view_index, int mouse_x, int mou
         if (axes & 1u) g->point_pending_x = x;
         if (axes & 2u) g->point_pending_y = y;
         if (axes & 4u) g->point_pending_z = z;
-        gui_set_status(g, "Point pending: choose a different orthographic view to set the remaining axis");
+        if (!(axes & 1u)) {
+            gui_set_status(g, "Point preview: X is unknown; choose Top or Front (Escape cancels)");
+        } else if (!(axes & 2u)) {
+            gui_set_status(g, "Point preview: Y is unknown; choose Front or Right (Escape cancels)");
+        } else {
+            gui_set_status(g, "Point preview: Z is unknown; choose Top or Right (Escape cancels)");
+        }
         return;
     }
     unsigned missing = axes & ~g->point_known_axes;
@@ -4442,10 +3607,11 @@ static void complete_area_selection(GuiState* g) {
     CadCore_ClearSelection(g->cad);
     if (g->cad->selectModeFlag) {
         for (int i = 0; i < g->cad->data.pointCount; ++i) {
-            CadPoint* p = &g->cad->data.points[i];
-            if (!p->flags) continue;
+            CadPosition point;
+            if (!gui_scene_point(g, (int16_t)i, &point)) continue;
             int x, y;
-            CadView_ProjectPoint(&g->views[g->area_select_view], p->pointx, p->pointy, p->pointz,
+            CadView_ProjectPoint(&g->views[g->area_select_view],
+                                 point.x, point.y, point.z,
                                  &x, &y, content.w, content.h);
             x += content.x; y += content.y;
             if (x >= left && x <= right && y >= top && y <= bottom) CadCore_SelectPoint(g->cad, (int16_t)i);
@@ -4457,9 +3623,11 @@ static void complete_area_selection(GuiState* g) {
             int count = polygon_point_indices(g->cad, (int16_t)p, chain, ARRAY_COUNT(chain));
             int hit = 0;
             for (int i = 0; i < count && !hit; ++i) {
-                CadPoint* point = &g->cad->data.points[chain[i]];
+                CadPosition point;
                 int x, y;
-                CadView_ProjectPoint(&g->views[g->area_select_view], point->pointx, point->pointy, point->pointz,
+                if (!gui_scene_point(g, chain[i], &point)) continue;
+                CadView_ProjectPoint(&g->views[g->area_select_view],
+                                     point.x, point.y, point.z,
                                      &x, &y, content.w, content.h);
                 x += content.x; y += content.y;
                 hit = x >= left && x <= right && y >= top && y <= bottom;
@@ -4545,12 +3713,97 @@ static void update_scrollbar_pan(GuiState* g, int view_index, int axis,
     link_orthographic_pan(g, view_index);
 }
 
+static const GuiWin* aux_window(const GuiState* g, int aux_id) {
+    if (!g) return NULL;
+    switch ((GuiAuxWindowId)aux_id) {
+    case GUI_AUX_TOOL_PALETTE: return &g->toolPalette;
+    case GUI_AUX_COORDINATES: return &g->coordBox;
+    case GUI_AUX_ANIMATION: return &g->animationWindow;
+    case GUI_AUX_SHAPE_BROWSER: return &g->shapeBrowserWindow;
+    default: return NULL;
+    }
+}
+
+static int aux_window_visible(const GuiState* g, int aux_id) {
+    if (!g) return 0;
+    switch ((GuiAuxWindowId)aux_id) {
+    case GUI_AUX_TOOL_PALETTE:
+        return g->tool_palette_visible && g->toolPalette.r.w > 0 &&
+               g->toolPalette.r.h > 0;
+    case GUI_AUX_COORDINATES:
+        return g->coordinates_visible && g->coordBox.r.w > 0 &&
+               g->coordBox.r.h > 0;
+    case GUI_AUX_ANIMATION:
+        return g->animation_visible && g->animationWindow.r.w > 0 &&
+               g->animationWindow.r.h > 0;
+    case GUI_AUX_SHAPE_BROWSER:
+        return g->shapeBrowserWindow.r.w > 0 &&
+               g->shapeBrowserWindow.r.h > 0;
+    default:
+        return 0;
+    }
+}
+
+static int topmost_aux_at(const GuiState* g, int x, int y) {
+    CadUiRect rectangles[GUI_AUX_COUNT];
+    unsigned char visible[GUI_AUX_COUNT];
+    if (!g) return -1;
+    for (int id = 0; id < GUI_AUX_COUNT; ++id) {
+        const GuiWin* window = aux_window(g, id);
+        rectangles[id] = window
+            ? (CadUiRect){window->r.x, window->r.y, window->r.w, window->r.h}
+            : (CadUiRect){0, 0, 0, 0};
+        visible[id] = (unsigned char)aux_window_visible(g, id);
+    }
+    return CadUiZOrder_TopmostAt(g->aux_z_order, GUI_AUX_COUNT,
+                                 rectangles, visible, x, y);
+}
+
+static void raise_aux(GuiState* g, int aux_id) {
+    if (!g || aux_id < 0 || aux_id >= GUI_AUX_COUNT) return;
+    CadUiZOrder_Raise(g->aux_z_order, GUI_AUX_COUNT, aux_id);
+}
+
+static void raise_view(GuiState* g, int view_index) {
+    int position = -1;
+    if (!g || view_index < 0 || view_index >= 4) return;
+    for (int i = 0; i < 4; ++i) {
+        if (g->view_z_order[i] == view_index) { position = i; break; }
+    }
+    if (position < 0 || position == 3) return;
+    for (int i = position; i < 3; ++i) g->view_z_order[i] = g->view_z_order[i + 1];
+    g->view_z_order[3] = view_index;
+}
+
 static int topmost_view_at(const GuiState* g, int x, int y) {
     if (!g) return -1;
-    for (int i = 3; i >= 0; --i) {
-        if (g->view_visible[i] && pt_in_rect(x, y, g->view[i].r)) return i;
+    for (int slot = 3; slot >= 0; --slot) {
+        int i = g->view_z_order[slot];
+        if (i >= 0 && i < 4 && g->view_visible[i] &&
+            pt_in_rect(x, y, g->view[i].r)) return i;
     }
     return -1;
+}
+
+static void zoom_view_at(GuiState* g, int view_index, int screen_x, int screen_y,
+                         double factor) {
+    Rect content;
+    CadView* view;
+    double anchor_x, anchor_y, anchor_z;
+    double projected_x, projected_y, depth;
+    if (!g || view_index < 0 || view_index >= 4 || !isfinite(factor) || factor <= 0.0) return;
+    content = view_content_rect(g, view_index);
+    view = &g->views[view_index];
+    CadView_UnprojectPoint(view, screen_x - content.x, screen_y - content.y,
+                           content.w, content.h, &anchor_x, &anchor_y, &anchor_z);
+    CadView_SetZoom(view, view->zoom * factor);
+    if (CadView_ProjectPointDepth(view, anchor_x, anchor_y, anchor_z,
+                                  &projected_x, &projected_y, &depth,
+                                  content.w, content.h)) {
+        view->pan_x += (screen_x - content.x) - projected_x;
+        view->pan_y -= (screen_y - content.y) - projected_y;
+        link_orthographic_pan(g, view_index);
+    }
 }
 
 static int handle_view_scrollbar_input(GuiState* g, const GuiInput* in, int view_index) {
@@ -4594,16 +3847,9 @@ static void draw_grid(Rect inner) {
 
 static int menu_item_enabled(const GuiState* g, const CadMenuItemDescriptor* item) {
     if (!g || !item || (item->flags & (CAD_MENU_ITEM_SEPARATOR | CAD_MENU_ITEM_DISABLED))) return 0;
-    switch (item->command) {
-    case CAD_COMMAND_EDIT_UNDO: return CadDocument_CanUndo(&g->document);
-    case CAD_COMMAND_EDIT_REDO: return CadDocument_CanRedo(&g->document);
-    case CAD_COMMAND_EDIT_COPY: return g->cad->selection.pointCount || g->cad->selection.polygonCount;
-    case CAD_COMMAND_EDIT_PASTE: return g->clipboard_has_data;
-    case CAD_COMMAND_OPTION_CHANGE_FIRST_POINT:
-    case CAD_COMMAND_OPTION_FACE_SUPPORT:
-    case CAD_COMMAND_OPTION_FACE_INFORMATION: return g->cad->selection.polygonCount > 0;
-    default: return 1;
-    }
+    EditorCommandContext context = editor_command_context(g);
+    return EditorController_GetCommandState(
+        &g->controller, item->command, &context).enabled;
 }
 
 static Rect menu_popup_rect(const GuiState* g, int menu_index) {
@@ -4615,8 +3861,11 @@ static Rect menu_popup_rect(const GuiState* g, int menu_index) {
     }
     if (menu) {
         for (int i = 0; i < menu->count; ++i) {
-            int width = g->font ? font_measure(g->font, menu->items[i].label)
-                                : (int)strlen(menu->items[i].label) * 8;
+            char label[160];
+            const char* text = menu_item_display_text(
+                g, &menu->items[i], label, sizeof(label));
+            int width = g->font ? font_measure(g->font, text)
+                                : (int)strlen(text) * 8;
             if (width > max_width) max_width = width;
         }
     }
@@ -4625,14 +3874,16 @@ static Rect menu_popup_rect(const GuiState* g, int menu_index) {
 
 static void update_submenu_rect(GuiState* g, Rect popup, int row) {
     const CadMenuItemDescriptor* submenu = row == 4 ? importSubMenuItems : exportSubMenuItems;
+    int submenu_count = row == 4 ? ARRAY_COUNT(importSubMenuItems)
+                                  : ARRAY_COUNT(exportSubMenuItems);
     int max_width = 0;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < submenu_count; ++i) {
         int width = g->font ? font_measure(g->font, submenu[i].label)
                             : (int)strlen(submenu[i].label) * 8;
         if (width > max_width) max_width = width;
     }
     g->submenu_rect = (Rect){ popup.x + popup.w - 2, popup.y + row * 20,
-                              max_width + 24, 40 };
+                              max_width + 24, submenu_count * 20 };
 }
 
 static int update_menu_input(GuiState* g, const GuiInput* in) {
@@ -4679,12 +3930,17 @@ static int update_menu_input(GuiState* g, const GuiInput* in) {
         }
     } else if (in_submenu) {
         int row = (in->mouse_y - g->submenu_rect.y) / 20;
-        g->submenu_hover_item = row >= 0 && row < 2 ? row : -1;
+        int submenu_count = g->submenu_open == 5
+                                ? ARRAY_COUNT(importSubMenuItems)
+                                : ARRAY_COUNT(exportSubMenuItems);
+        g->submenu_hover_item = row >= 0 && row < submenu_count ? row : -1;
         if (in->mouse_pressed && g->submenu_hover_item >= 0) {
             const CadMenuItemDescriptor* submenu = g->submenu_open == 5 ? importSubMenuItems : exportSubMenuItems;
-            CadCommandId command = submenu[g->submenu_hover_item].command;
-            g->menu_open = -1; g->submenu_open = 0; g->submenu_hover_item = -1;
-            execute_editor_command(g, command);
+            if (menu_item_enabled(g, &submenu[g->submenu_hover_item])) {
+                CadCommandId command = submenu[g->submenu_hover_item].command;
+                g->menu_open = -1; g->submenu_open = 0; g->submenu_hover_item = -1;
+                execute_editor_command(g, command);
+            }
         }
     } else {
         g->menu_hover_item = -1;
@@ -4713,9 +3969,9 @@ static int begin_title_drag(GuiState* g, GuiWin* window, const GuiInput* in) {
 static void select_point_at(GuiState* g, int view_index, int mouse_x, int mouse_y) {
     Rect content = view_content_rect(g, view_index);
     int16_t points[64];
-    int count = CadView_FindPointsAtLocation(&g->views[view_index], g->cad,
-        mouse_x, mouse_y, content.x, content.y, content.w, content.h,
-        10, 0.01, points, ARRAY_COUNT(points));
+    int count = gui_find_points_at_location(g, view_index, mouse_x, mouse_y,
+                                            content, 10, 0.01, points,
+                                            ARRAY_COUNT(points));
     if (!count) { gui_set_status(g, "No point under cursor"); return; }
     int all_selected = 1;
     for (int i = 0; i < count; ++i) all_selected &= CadCore_IsPointSelected(g->cad, points[i]);
@@ -4750,16 +4006,57 @@ static void handle_shape_browser_click(GuiState* g, const GuiInput* in) {
     }
     if (in->mouse_pressed) g->shape_search_active = 0;
     if (pt_in_rect(in->mouse_x, in->mouse_y, layout.replace_button) && in->mouse_pressed) {
+        const CadAsmShapeInfo* shape;
+        const char* name;
+        const char* separator;
+        const char* source_name;
+        char* import_path_copy;
+        char import_path[GUI_PATH_CAPACITY * 2];
+        size_t folder_length;
+        int written;
         if (!g->shape_preview_valid || g->shape_selected < 0) {
             gui_set_status(g, "Select a valid ASM shape preview before Replace");
             return;
         }
-        if (confirm_replace_document(g, "replacing the document with the previewed ASM shape")) {
-            const char* name = g->shape_names[g->shape_selected];
-            replace_document(g, g->shape_preview, NULL, 1);
-            CadDocument_SetLastImportPath(&g->document, g->shape_folder_path);
-            gui_set_status(g, "Replaced document with %s; use Save As for native CAD", name);
+        name = g->shape_names[g->shape_selected];
+        shape = CadImportAsm_FindShape(g->shape_catalog, name);
+        if (!shape || shape->sourceIndex >= g->shape_asm_source_count ||
+            !g->shape_asm_sources[shape->sourceIndex].name ||
+            !g->shape_asm_sources[shape->sourceIndex].name[0]) {
+            gui_set_status(g, "The previewed ASM source is no longer available");
+            return;
         }
+        source_name = g->shape_asm_sources[shape->sourceIndex].name;
+        folder_length = strlen(g->shape_folder_path);
+        separator = folder_length &&
+                    (g->shape_folder_path[folder_length - 1] == '\\' ||
+                     g->shape_folder_path[folder_length - 1] == '/')
+                        ? "" : "\\";
+        written = snprintf(import_path, sizeof(import_path), "%s%s%s",
+                           g->shape_folder_path, separator,
+                           source_name);
+        if (written < 0 || (size_t)written >= sizeof(import_path)) {
+            gui_set_status(g, "The previewed ASM source path is too long");
+            return;
+        }
+        import_path_copy = asm_copy_string(import_path);
+        if (!import_path_copy) {
+            gui_set_status(g,
+                           "Not enough memory to preserve the ASM source path; current document unchanged");
+            return;
+        }
+        if (confirm_replace_document(g, "replacing the document with the previewed ASM shape")) {
+            replace_document(g, g->shape_preview, NULL, 1);
+            /* CadDocument_New cleared the previous origin; transfer the path
+               allocation so source-overwrite protection cannot fail after
+               the old document has been replaced. */
+            g->document.lastImportPath = import_path_copy;
+            import_path_copy = NULL;
+            gui_set_status(g,
+                           "Replaced document with %s from %s; use Save As for native CAD",
+                           name, source_name);
+        }
+        free(import_path_copy);
         return;
     }
     if (!pt_in_rect(in->mouse_x, in->mouse_y, layout.list)) return;
@@ -4782,14 +4079,412 @@ static void handle_shape_browser_click(GuiState* g, const GuiInput* in) {
     select_shape_preview(g, index);
 }
 
+typedef CadAnimationPanelLayout AnimationPanelLayout;
+
+static AnimationPanelLayout animation_panel_layout(const GuiState* g) {
+    AnimationPanelLayout layout;
+    CadAnimationPanel_ComputeLayout(
+        g ? g->animationWindow.r : (Rect){0, 0, 0, 0}, &layout);
+    return layout;
+}
+
+static void animation_set_frame(GuiState* g, int frame) {
+    if (!g) return;
+    g->anim_copy_mode = 0;
+    CadAnimationSession_SetFrame(&g->animation, frame);
+}
+
+static int animation_finish_edit(GuiState* g, const char* label,
+                                 CadResult result, int displayed_frame) {
+    if (!CadResult_IsSuccess(&result)) {
+        history_cancel(g);
+        gui_set_status(g, "%s failed: %s", label, cad_result_message(&result));
+        return 0;
+    }
+    if (!history_commit(g)) return 0;
+    if (displayed_frame >= 0) {
+        g->animation.currentFrame = displayed_frame;
+        g->animation.previewFrame = (double)displayed_frame;
+    }
+    gui_set_status(g, "%s", label);
+    return 1;
+}
+
+static int animation_selected_static_faces(GuiState* g,
+                                           int16_t output[CAD_MAX_POLYGONS]) {
+    int count = 0;
+    if (!g) return 0;
+    for (int i = 0; i < g->cad->selection.polygonCount; ++i) {
+        int16_t polygon = g->cad->selection.selectedPolygons[i];
+        if (polygon < 0 || polygon >= CAD_MAX_POLYGONS ||
+            !g->cad->data.polygons[polygon].flags ||
+            g->cad->data.polygons[polygon].animation != -1) continue;
+        if (output) output[count] = polygon;
+        ++count;
+    }
+    return count;
+}
+
+static CadAnimationPanelState animation_panel_state(GuiState* g) {
+    CadAnimationPanelState state;
+    memset(&state, 0, sizeof(state));
+    if (!g) return state;
+    state.informationValid = g->animation_info_valid;
+    state.editable = g->animation_info_valid && g->animation_info.editable;
+    state.frameCount = g->animation_info.frameCount;
+    state.maximumFrameCount = g->animation_info.maximumFrameCount;
+    state.staticFaceCount = g->animation_info.staticFaceCount;
+    state.selectedStaticFaceCount = animation_selected_static_faces(g, NULL);
+    state.selectedPointCount = g->cad ? g->cad->selection.pointCount : 0;
+    state.hasAnimation = g->cad && CadAnimation_HasAny(&g->cad->data);
+    return state;
+}
+
+static void animation_create(GuiState* g, int selected_only) {
+    const int16_t* faces = NULL;
+    size_t face_count = 0;
+    int16_t selected[CAD_MAX_POLYGONS];
+    CadResult result;
+    if (!g) return;
+    if (g->animation_info.editable) {
+        gui_set_status(g, "Animation already exists; use Add Faces for static faces");
+        return;
+    }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    if (selected_only) {
+        face_count = (size_t)animation_selected_static_faces(g, selected);
+        faces = selected;
+        if (!face_count) {
+            gui_set_status(g, "Select one or more static faces to animate");
+            return;
+        }
+    }
+    if (!history_push_named(g, selected_only ? "Create Selected Animation"
+                                             : "Create Animation")) return;
+    result = CadAnimation_Create(&g->cad->data, faces, face_count, 0);
+    animation_finish_edit(g, selected_only ? "Created animation for selected faces"
+                                           : "Created animation for all faces",
+                          result, 0);
+}
+
+static void animation_set_count_delta(GuiState* g, int delta) {
+    int target;
+    CadResult result;
+    if (!g || !g->animation_info.editable) {
+        gui_set_status(g, "Create an animation before changing frame count");
+        return;
+    }
+    target = g->animation_info.frameCount + delta;
+    if (target < 1 || target > g->animation_info.maximumFrameCount) {
+        gui_set_status(g, "Frame count must stay within 1..%d",
+                       g->animation_info.maximumFrameCount);
+        return;
+    }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    if (!history_push_named(g, "Set Frame Count")) return;
+    result = CadAnimation_SetFrameCount(&g->cad->data, target);
+    animation_finish_edit(g, "Set animation frame count", result,
+                          g->animation.currentFrame < target
+                              ? g->animation.currentFrame : target - 1);
+}
+
+static void animation_insert(GuiState* g, int duplicate) {
+    int current, inserted;
+    CadResult result;
+    if (!g || !g->animation_info.editable) {
+        gui_set_status(g, "Create an animation before inserting frames");
+        return;
+    }
+    if (g->animation_info.frameCount >= g->animation_info.maximumFrameCount) {
+        gui_set_status(g, "Animation capacity is full at %d frame(s)",
+                       g->animation_info.frameCount);
+        return;
+    }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    current = g->animation.currentFrame;
+    inserted = current + 1;
+    if (!history_push_named(g, duplicate ? "Duplicate Frame" : "Insert Frame")) return;
+    result = duplicate
+        ? CadAnimation_DuplicateFrame(&g->cad->data, current, inserted)
+        : CadAnimation_InsertFrame(&g->cad->data, inserted, -1);
+    animation_finish_edit(g, duplicate ? "Duplicated frame" : "Inserted frame",
+                          result, inserted);
+}
+
+static void animation_delete_current(GuiState* g) {
+    int current, next;
+    CadResult result;
+    if (!g || !g->animation_info.editable) {
+        gui_set_status(g, "There is no editable animation frame to delete");
+        return;
+    }
+    if (g->animation_info.frameCount <= 1) {
+        gui_set_status(g, "An animation must retain at least one frame");
+        return;
+    }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    current = g->animation.currentFrame;
+    next = current < g->animation_info.frameCount - 1 ? current
+                                                       : current - 1;
+    if (!history_push_named(g, "Delete Frame")) return;
+    result = CadAnimation_DeleteFrame(&g->cad->data, current);
+    animation_finish_edit(g, "Deleted frame", result, next < 0 ? 0 : next);
+}
+
+static void animation_arm_copy(GuiState* g, int selected_only) {
+    if (!g || !g->animation_info.editable) {
+        gui_set_status(g, "There is no editable animation pose to copy");
+        return;
+    }
+    if (selected_only && !g->cad->selection.pointCount) {
+        gui_set_status(g, "Select points before using Copy Selected");
+        return;
+    }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    g->anim_copy_mode = selected_only ? 2 : 1;
+    g->anim_copy_source = g->animation.currentFrame;
+    gui_set_status(g, "Copy %s armed from frame %d; click the target frame",
+                   selected_only ? "selected points" : "complete pose",
+                   g->anim_copy_source);
+}
+
+static void animation_copy_to(GuiState* g, int target) {
+    const int16_t* points = NULL;
+    size_t point_count = 0;
+    CadResult result;
+    const int mode = g ? g->anim_copy_mode : 0;
+    if (!g || !mode) return;
+    if (mode == 2) {
+        points = g->cad->selection.selectedPoints;
+        point_count = (size_t)g->cad->selection.pointCount;
+    }
+    if (!history_push_named(g, mode == 2 ? "Copy Selected Pose"
+                                         : "Copy Pose")) return;
+    result = CadAnimation_CopyFrame(&g->cad->data, g->anim_copy_source,
+                                    target, points, point_count);
+    g->anim_copy_mode = 0;
+    animation_finish_edit(g, mode == 2 ? "Copied selected points to frame"
+                                       : "Copied complete pose to frame",
+                          result, target);
+}
+
+static void animation_add_selected_faces(GuiState* g) {
+    int16_t selected[CAD_MAX_POLYGONS];
+    int count;
+    CadResult result;
+    if (!g || !g->animation_info.editable) {
+        gui_set_status(g, "Create an animation before adding faces");
+        return;
+    }
+    count = animation_selected_static_faces(g, selected);
+    if (!count) {
+        gui_set_status(g, "Select one or more previously static faces");
+        return;
+    }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    if (!history_push_named(g, "Add Faces to Animation")) return;
+    result = CadAnimation_AddFaces(&g->cad->data, selected, (size_t)count);
+    animation_finish_edit(g, "Added selected faces to animation", result,
+                          g->animation.currentFrame);
+}
+
+static void animation_make_static_copy(GuiState* g) {
+    CadFileData* baked;
+    CadResult result;
+    if (!g || !g->scene_valid || !CadAnimation_HasAny(&g->cad->data)) {
+        gui_set_status(g, "There is no displayed animation pose to make static");
+        return;
+    }
+    CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
+    baked = (CadFileData*)malloc(sizeof(*baked));
+    if (!baked) {
+        gui_set_status(g, "Not enough memory to create a static pose copy");
+        return;
+    }
+    result = CadAnimation_MakeStaticCopy(&g->cad->data, g->scene.pose, baked);
+    if (!CadResult_IsSuccess(&result)) {
+        gui_set_status(g, "Static copy failed: %s", cad_result_message(&result));
+        free(baked);
+        return;
+    }
+    if (!history_push_named(g, "Make Static Copy")) {
+        free(baked);
+        return;
+    }
+    g->cad->data = *baked;
+    free(baked);
+    CadCore_RebuildDerivedState(g->cad);
+    if (!history_commit(g)) return;
+    CadDocument_MakeUnnamed(&g->document);
+    g->animation.currentFrame = 0;
+    g->animation.previewFrame = 0.0;
+    gui_set_status(g, "Created unnamed static copy from the exact displayed pose");
+}
+
+static int animation_frame_from_pointer(const AnimationPanelLayout* layout,
+                                        const GuiState* g, int mouse_x,
+                                        int fractional, double* position) {
+    int frame = -1;
+    int count = g && g->animation_info.frameCount > 0
+                    ? g->animation_info.frameCount : 1;
+    return CadAnimationPanel_MapFrame(layout, mouse_x, count, fractional,
+                                      &frame, position) ? frame : -1;
+}
+
+static void handle_animation_panel(GuiState* g, const GuiInput* in) {
+    AnimationPanelLayout layout;
+    CadAnimationPanelState state;
+    CadAnimationPanelHit hit;
+    int count;
+    if (!g || !in) return;
+    layout = animation_panel_layout(g);
+    state = animation_panel_state(g);
+    count = g->animation_info.frameCount > 0 ? g->animation_info.frameCount : 1;
+    if (in->mouse_pressed && begin_title_drag(g, &g->animationWindow, in)) {
+        if (g->animation_docked) {
+            g->animation_docked = 0;
+            /* Reclaim dock space once, then preserve the newly manual floating
+               placement for the rest of this drag. */
+            layout_cleanup(g, g->layout_width, g->layout_height);
+            g->auto_layout = 0;
+        }
+        return;
+    }
+    if (!layout.usable) {
+        if (in->mouse_pressed)
+            gui_set_status(g, "Enlarge or float the animation timeline to use its controls");
+        return;
+    }
+    if (!in->mouse_pressed) return;
+    hit = CadAnimationPanel_HitTest(&layout, in->mouse_x, in->mouse_y,
+                                    count, g->anim_copy_mode == 0);
+    if (!CadAnimationPanel_IsActionEnabled(hit.action, &state)) {
+        if (hit.action != CAD_ANIMATION_PANEL_NONE)
+            gui_set_status(g, "That animation action is unavailable in the current document state");
+        return;
+    }
+    if (hit.action == CAD_ANIMATION_PANEL_STRIP) {
+        if (g->anim_copy_mode) {
+            animation_copy_to(g, hit.frameIndex);
+        } else {
+            CadAnimationSession_Seek(&g->animation, hit.framePosition);
+            g->anim_scrubbing = in->mouse_down && !in->mouse_released;
+            g->pointer_owner = g->anim_scrubbing ? GUI_POINTER_ANIMATION
+                                                 : GUI_POINTER_NONE;
+            if (!g->anim_scrubbing) CadAnimationSession_EndScrub(&g->animation);
+        }
+        return;
+    }
+    switch (hit.action) {
+    case CAD_ANIMATION_PANEL_FIRST:
+        animation_set_frame(g, 0);
+        break;
+    case CAD_ANIMATION_PANEL_PREVIOUS:
+        animation_set_frame(g, g->animation.currentFrame - 1);
+        break;
+    case CAD_ANIMATION_PANEL_PLAY_PAUSE:
+        if (g->animation.playing)
+            CadAnimationSession_Pause(&g->animation, g->animation_now);
+        else
+            CadAnimationSession_Play(&g->animation, g->animation_now);
+        break;
+    case CAD_ANIMATION_PANEL_STOP:
+        CadAnimationSession_Stop(&g->animation);
+        break;
+    case CAD_ANIMATION_PANEL_NEXT:
+        animation_set_frame(g, g->animation.currentFrame + 1);
+        break;
+    case CAD_ANIMATION_PANEL_LAST:
+        animation_set_frame(g, count - 1);
+        break;
+    case CAD_ANIMATION_PANEL_TOGGLE_LOOP:
+        g->animation.loop = !g->animation.loop;
+        break;
+    case CAD_ANIMATION_PANEL_TOGGLE_INTERPOLATION:
+        g->animation.interpolation = !g->animation.interpolation;
+        break;
+    case CAD_ANIMATION_PANEL_FPS_DOWN:
+        g->animation.fps -= 1.0;
+        if (g->animation.fps < 1.0) g->animation.fps = 1.0;
+        break;
+    case CAD_ANIMATION_PANEL_FPS_UP:
+        g->animation.fps += 1.0;
+        if (g->animation.fps > 60.0) g->animation.fps = 60.0;
+        break;
+    case CAD_ANIMATION_PANEL_TOGGLE_ALL_FRAMES:
+        g->animation.allFrames = !g->animation.allFrames;
+        break;
+    case CAD_ANIMATION_PANEL_TOGGLE_DOCK:
+        g->animation_docked = !g->animation_docked;
+        g->auto_layout = 1;
+        break;
+    case CAD_ANIMATION_PANEL_CREATE_ALL:
+        animation_create(g, 0);
+        break;
+    case CAD_ANIMATION_PANEL_CREATE_SELECTED:
+        animation_create(g, 1);
+        break;
+    case CAD_ANIMATION_PANEL_COUNT_DOWN:
+        animation_set_count_delta(g, -1);
+        break;
+    case CAD_ANIMATION_PANEL_COUNT_UP:
+        animation_set_count_delta(g, 1);
+        break;
+    case CAD_ANIMATION_PANEL_INSERT:
+        animation_insert(g, 0);
+        break;
+    case CAD_ANIMATION_PANEL_DUPLICATE:
+        animation_insert(g, 1);
+        break;
+    case CAD_ANIMATION_PANEL_DELETE:
+        animation_delete_current(g);
+        break;
+    case CAD_ANIMATION_PANEL_COPY_ALL:
+        animation_arm_copy(g, 0);
+        break;
+    case CAD_ANIMATION_PANEL_COPY_SELECTED:
+        animation_arm_copy(g, 1);
+        break;
+    case CAD_ANIMATION_PANEL_ADD_FACES:
+        animation_add_selected_faces(g);
+        break;
+    case CAD_ANIMATION_PANEL_MAKE_STATIC_COPY:
+        animation_make_static_copy(g);
+        break;
+    default:
+        break;
+    }
+}
+
 void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     if (!g || !in) return;
-    if (g->auto_layout && (g->layout_width != win_w || g->layout_height != win_h)) {
+    if (g->auto_layout) {
         layout_cleanup(g, win_w, win_h);
     } else {
         g->layout_width = win_w;
         g->layout_height = win_h;
+        clamp_manual_layout(g, win_w, win_h);
     }
+
+    g->animation_now = (double)SDL_GetTicksNS() / 1000000000.0;
+    if (in->mouse_pressed && g->shape_search_active &&
+        !pt_in_rect(in->mouse_x, in->mouse_y, g->shapeBrowserWindow.r)) {
+        g->shape_search_active = 0;
+    }
+    if (g->anim_scrubbing) {
+        AnimationPanelLayout layout = animation_panel_layout(g);
+        double position = 0.0;
+        animation_frame_from_pointer(&layout, g, in->mouse_x, 1, &position);
+        CadAnimationSession_Seek(&g->animation, position);
+        if (in->mouse_released || !in->mouse_down) {
+            CadAnimationSession_EndScrub(&g->animation);
+            g->anim_scrubbing = 0;
+            g->pointer_owner = GUI_POINTER_NONE;
+        }
+        animation_update_scene(g, g->animation_now);
+        return;
+    }
+    animation_update_scene(g, g->animation_now);
 
     if (update_menu_input(g, in)) return;
 
@@ -4840,13 +4535,27 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
         if (in->mouse_down) {
             int dx = in->mouse_x - g->resize_start_x, dy = in->mouse_y - g->resize_start_y;
             Rect* r = &g->resize_win->r;
-            int right = r->x + g->resize_start_w, bottom = r->y + g->resize_start_h;
-            if (g->resize_edge & 1) { r->x = in->mouse_x; r->w = right - r->x; }
+            int right = g->resize_window_x + g->resize_start_w;
+            int bottom = g->resize_window_y + g->resize_start_h;
+            int minimum_width = g->resize_win == &g->animationWindow ? 380 : 120;
+            int minimum_height = g->resize_win == &g->animationWindow ? 124 : 90;
+            r->x = g->resize_window_x;
+            r->y = g->resize_window_y;
+            r->w = g->resize_start_w;
+            r->h = g->resize_start_h;
+            if (g->resize_edge & 1) { r->x = g->resize_window_x + dx; r->w = right - r->x; }
             if (g->resize_edge & 2) r->w = g->resize_start_w + dx;
-            if (g->resize_edge & 4) { r->y = in->mouse_y; r->h = bottom - r->y; }
+            if (g->resize_edge & 4) { r->y = g->resize_window_y + dy; r->h = bottom - r->y; }
             if (g->resize_edge & 8) r->h = g->resize_start_h + dy;
-            if (r->w < 120) r->w = 120;
-            if (r->h < 90) r->h = 90;
+            if (r->w < minimum_width) {
+                r->w = minimum_width;
+                if (g->resize_edge & 1) r->x = right - minimum_width;
+            }
+            if (r->h < minimum_height) {
+                r->h = minimum_height;
+                if (g->resize_edge & 4) r->y = bottom - minimum_height;
+            }
+            clamp_window_reachable(g->resize_win, win_w, win_h);
         }
         if (in->mouse_released || !in->mouse_down) { g->resize_win = NULL; g->resize_edge = 0; g->pointer_owner = GUI_POINTER_NONE; }
         return;
@@ -4855,8 +4564,7 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
         if (in->mouse_down) {
             g->drag_win->r.x = in->mouse_x - g->drag_off_x;
             g->drag_win->r.y = in->mouse_y - g->drag_off_y;
-            if (g->drag_win->r.x < 0) g->drag_win->r.x = 0;
-            if (g->drag_win->r.y < MenuBarHeight()) g->drag_win->r.y = MenuBarHeight();
+            clamp_window_reachable(g->drag_win, win_w, win_h);
         }
         if (in->mouse_released || !in->mouse_down) { g->drag_win = NULL; g->pointer_owner = GUI_POINTER_NONE; }
         return;
@@ -4901,8 +4609,8 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     if (g->view_middle_interacting >= 0) {
         if (in->mouse_middle_down) {
             int dy = in->mouse_y - g->last_mouse_y;
-            CadView* view = &g->views[g->view_middle_interacting];
-            CadView_SetZoom(view, view->zoom * exp((double)-dy * 0.015));
+            zoom_view_at(g, g->view_middle_interacting, in->mouse_x, in->mouse_y,
+                         exp((double)-dy * 0.015));
             g->last_mouse_y = in->mouse_y;
         }
         if (in->mouse_middle_released || !in->mouse_middle_down) { g->view_middle_interacting = -1; g->pointer_owner = GUI_POINTER_NONE; }
@@ -4945,51 +4653,89 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     /* The persistent status band is a real top-level UI surface. */
     if (in->mouse_y >= win_h - 22) return;
 
-    /* Topmost auxiliary windows own their entire rectangles, not just their
-       controls. */
-    if (g->shapeBrowserWindow.r.w > 0 && pt_in_rect(in->mouse_x, in->mouse_y, g->shapeBrowserWindow.r)) {
-        if (in->mouse_pressed && begin_title_drag(g, &g->shapeBrowserWindow, in)) return;
-        handle_shape_browser_click(g, in);
-        if (in->mouse_pressed && in->mouse_down && !in->mouse_released) {
-            g->pointer_owner = GUI_POINTER_SHAPE_BROWSER;
-        } else if (in->mouse_released || !in->mouse_down) {
-            g->pointer_owner = GUI_POINTER_NONE;
+    /* Auxiliary windows form a single desktop stack above every modeling
+       view.  Resolve exactly one owner before looking at any child controls;
+       this keeps hit-testing and painting consistent when panels overlap. */
+    int topmost_aux = topmost_aux_at(g, in->mouse_x, in->mouse_y);
+    if (topmost_aux >= 0) {
+        if (in->mouse_pressed || in->mouse_right_pressed ||
+            in->mouse_middle_pressed) {
+            raise_aux(g, topmost_aux);
         }
-        return;
-    }
-    if (g->animationWindow.r.w > 0 && pt_in_rect(in->mouse_x, in->mouse_y, g->animationWindow.r)) {
-        if (in->mouse_pressed && begin_title_drag(g, &g->animationWindow, in)) return;
-        if (in->mouse_pressed) gui_set_status(g, "Animation controls are read-only in this release");
-        return;
-    }
-    if (g->coordinates_visible && pt_in_rect(in->mouse_x, in->mouse_y, g->coordBox.r)) {
-        if (in->mouse_pressed) begin_title_drag(g, &g->coordBox, in);
-        return;
-    }
-    if (g->tool_palette_visible && pt_in_rect(in->mouse_x, in->mouse_y, g->toolPalette.r)) {
-        if (in->mouse_pressed && begin_title_drag(g, &g->toolPalette, in)) return;
-        for (int slot = 0; slot < CAD_TOOL_COUNT; ++slot) {
-            if (!pt_in_rect(in->mouse_x, in->mouse_y, tool_button_rect(g, slot))) continue;
-            CadToolId tool = toolPaletteOrder[slot];
-            if (!in->mouse_pressed) {
-                snprintf(g->status_text, sizeof(g->status_text), "%s - %s%s",
-                         toolDescriptors[tool].name, toolDescriptors[tool].help,
-                         (toolDescriptors[tool].flags & CAD_TOOL_FLAG_DISABLED) ? " (unavailable)" : "");
-            } else {
-                if (g->selected_tool == tool && !(toolDescriptors[tool].flags & CAD_TOOL_FLAG_IMMEDIATE)) {
+        switch ((GuiAuxWindowId)topmost_aux) {
+        case GUI_AUX_SHAPE_BROWSER:
+            if (in->mouse_pressed &&
+                begin_title_drag(g, &g->shapeBrowserWindow, in)) return;
+            handle_shape_browser_click(g, in);
+            if (in->mouse_pressed && in->mouse_down && !in->mouse_released) {
+                g->pointer_owner = GUI_POINTER_SHAPE_BROWSER;
+            } else if (in->mouse_released || !in->mouse_down) {
+                g->pointer_owner = GUI_POINTER_NONE;
+            }
+            return;
+        case GUI_AUX_ANIMATION:
+            if (!g->animation_docked && in->mouse_pressed && in->mouse_down &&
+                !in->mouse_released) {
+                int edge = get_resize_edge(in->mouse_x, in->mouse_y,
+                                           g->animationWindow.r, 6);
+                if (edge) {
+                    g->resize_win = &g->animationWindow;
+                    g->resize_edge = edge;
+                    g->resize_start_x = in->mouse_x;
+                    g->resize_start_y = in->mouse_y;
+                    g->resize_window_x = g->animationWindow.r.x;
+                    g->resize_window_y = g->animationWindow.r.y;
+                    g->resize_start_w = g->animationWindow.r.w;
+                    g->resize_start_h = g->animationWindow.r.h;
+                    g->pointer_owner = GUI_POINTER_WINDOW;
+                    g->auto_layout = 0;
+                    return;
+                }
+            }
+            handle_animation_panel(g, in);
+            return;
+        case GUI_AUX_COORDINATES:
+            if (in->mouse_pressed) begin_title_drag(g, &g->coordBox, in);
+            return;
+        case GUI_AUX_TOOL_PALETTE:
+            if (in->mouse_pressed &&
+                begin_title_drag(g, &g->toolPalette, in)) return;
+            for (int slot = 0; slot < CAD_TOOL_COUNT; ++slot) {
+                if (!pt_in_rect(in->mouse_x, in->mouse_y,
+                                tool_button_rect(g, slot))) continue;
+                CadToolId tool = toolPaletteOrder[slot];
+                EditorCommandContext context = editor_command_context(g);
+                CadCommandState state = EditorController_GetToolState(
+                    &g->controller, tool, &context);
+                if (!in->mouse_pressed) {
+                    snprintf(g->status_text, sizeof(g->status_text),
+                             "%s - %s%s%s%s", toolDescriptors[tool].name,
+                             toolDescriptors[tool].help,
+                             state.enabled ? "" : " (unavailable: ",
+                             state.enabled ? "" : state.disabledReason,
+                             state.enabled ? "" : ")");
+                } else if (g->selected_tool == tool &&
+                           !(toolDescriptors[tool].flags &
+                             CAD_TOOL_FLAG_IMMEDIATE)) {
                     g->selected_tool = CAD_TOOL_NONE;
                     reset_interaction(g);
                     gui_set_status(g, "Tool cancelled");
-                } else activate_tool(g, tool);
+                } else {
+                    activate_tool(g, tool);
+                }
+                break;
             }
-            break;
+            return;
+        default:
+            return;
         }
-        return;
     }
 
     /* Resolve one complete desktop view before considering any of its child
        regions.  This preserves z-order when movable windows overlap. */
     int topmost_view = topmost_view_at(g, in->mouse_x, in->mouse_y);
+    if ((in->mouse_pressed || in->mouse_right_pressed || in->mouse_middle_pressed) &&
+        topmost_view >= 0) raise_view(g, topmost_view);
     if (handle_view_scrollbar_input(g, in, topmost_view)) return;
 
     /* View chrome sits above its content. */
@@ -5001,6 +4747,8 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             if (edge && in->mouse_down && !in->mouse_released) {
                 g->resize_win = &g->view[topmost_view]; g->resize_edge = edge;
                 g->resize_start_x = in->mouse_x; g->resize_start_y = in->mouse_y;
+                g->resize_window_x = g->view[topmost_view].r.x;
+                g->resize_window_y = g->view[topmost_view].r.y;
                 g->resize_start_w = g->view[topmost_view].r.w;
                 g->resize_start_h = g->view[topmost_view].r.h;
                 g->pointer_owner = GUI_POINTER_WINDOW; g->auto_layout = 0;
@@ -5016,13 +4764,14 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                                   view_content_rect(g, topmost_view))
                        ? topmost_view : -1;
     if (hovered_view >= 0 && in->wheel_delta) {
-        CadView* view = &g->views[hovered_view];
-        CadView_SetZoom(view, view->zoom * exp((double)in->wheel_delta * 0.10));
+        zoom_view_at(g, hovered_view, in->mouse_x, in->mouse_y,
+                     exp((double)in->wheel_delta * 0.10));
         return;
     }
     if (hovered_view >= 0 && in->mouse_middle_pressed) {
         if (in->mouse_middle_down && !in->mouse_middle_released) {
             g->view_middle_interacting = hovered_view;
+            g->last_mouse_x = in->mouse_x;
             g->last_mouse_y = in->mouse_y;
             g->pointer_owner = GUI_POINTER_VIEW;
         }
@@ -5031,8 +4780,9 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     if (hovered_view >= 0 && in->mouse_right_pressed) {
         if (g->selected_tool == CAD_TOOL_FACE_CREATE) {
             Rect content = view_content_rect(g, hovered_view);
-            int16_t point = CadView_FindNearestPoint(&g->views[hovered_view], g->cad,
-                in->mouse_x, in->mouse_y, content.x, content.y, content.w, content.h, 10);
+            int16_t point = gui_find_nearest_point(g, hovered_view,
+                                                   in->mouse_x, in->mouse_y,
+                                                   content, 10);
             if (point != INVALID_INDEX && !CadCore_IsPointSelected(g->cad, point) &&
                 g->cad->selection.pointCount < CAD_MAX_FACE_POINTS) CadCore_SelectPoint(g->cad, point);
             create_face_from_selection(g);
@@ -5065,13 +4815,13 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     case CAD_TOOL_POINT_CREATE: guided_point_click(g, hovered_view, in->mouse_x, in->mouse_y); break;
     case CAD_TOOL_FACE_CREATE: {
         Rect content = view_content_rect(g, hovered_view);
-        int16_t point = CadView_FindNearestPoint(&g->views[hovered_view], g->cad,
-            in->mouse_x, in->mouse_y, content.x, content.y, content.w, content.h, 10);
+        int16_t point = gui_find_nearest_point(g, hovered_view,
+                                               in->mouse_x, in->mouse_y,
+                                               content, 10);
         if (point != INVALID_INDEX && !CadCore_IsPointSelected(g->cad, point) &&
             g->cad->selection.pointCount < CAD_MAX_FACE_POINTS) {
             CadCore_SelectPoint(g->cad, point);
-            gui_set_status(g, "Face: %d/%d points; right-click final point",
-                           g->cad->selection.pointCount, CAD_MAX_FACE_POINTS);
+            update_face_creation_status(g, hovered_view);
         }
         break;
     }
@@ -5098,6 +4848,7 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             if (g->views[hovered_view].type == CAD_VIEW_3D) {
                 gui_set_status(g, "Use Top, Front, or Right for geometry transforms");
             } else if (in->mouse_down && !in->mouse_released) {
+                CadAnimationSession_BeginEdit(&g->animation, g->animation_now);
                 g->point_move_active = 1; g->point_move_view = hovered_view;
                 g->transform_history_pushed = 0;
                 g->last_mouse_x = in->mouse_x; g->last_mouse_y = in->mouse_y;
@@ -5118,14 +4869,10 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
    GUI ELEMENTS RENDERING (2D only - menu bar, tool palette, windows, etc.)
    ============================================================================ */
 
-static void gui_draw_gui_elements(GuiState* g, int win_w, int win_h) {
+static void draw_menu_bar(GuiState* g, int win_w) {
     if (!g) return;
-    
-    /* Viewport and projection already set in gui_draw */
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-
-    /* Menu bar */
     rg_fill_rect(0, 0, win_w, MenuBarHeight(), (RG_Color){230,230,230,255});
     rg_line(0, MenuBarHeight(), win_w, MenuBarHeight(), (RG_Color){0,0,0,255});
     if (g->font) {
@@ -5135,43 +4882,6 @@ static void gui_draw_gui_elements(GuiState* g, int win_w, int win_h) {
             x += font_measure(g->font, g->menus[i]) + 16;
         }
     }
-
-    if (g->tool_palette_visible) draw_window_chrome(g, &g->toolPalette, win_h, 1.0f, 1.0f);
-    /* Note: coordBox and animationWindow chrome drawn after CAD views so they appear on top */
-
-    /* Tool palette contents - draw tool icons in 2 columns */
-    RG_Color btn = { 245,245,245,255 };
-    RG_Color edge = { 120,120,120,255 };
-    if (g->tool_palette_visible) {
-        ToolMetrics metrics = tool_metrics(g);
-        for (int slot = 0; slot < CAD_TOOL_COUNT; ++slot) {
-            CadToolId tool = toolPaletteOrder[slot];
-            Rect button = tool_button_rect(g, slot);
-            int disabled = (toolDescriptors[tool].flags & CAD_TOOL_FLAG_DISABLED) != 0;
-            rg_fill_rect(button.x, button.y, button.w, button.h,
-                         disabled ? (RG_Color){220,220,220,255} : btn);
-            rg_stroke_rect(button.x, button.y, button.w, button.h, edge);
-            if (g->tool_icons[tool]) {
-                int icon_x = button.x + (button.w - metrics.icon_w) / 2;
-                int icon_y = button.y + (button.h - metrics.icon_h) / 2;
-                if (g->selected_tool == tool) {
-                    rg_fill_rect(button.x + 1, button.y + 1, button.w - 2, button.h - 2,
-                                 (RG_Color){190,210,235,255});
-                    rg_draw_texture(g->tool_icons[tool], icon_x, icon_y,
-                                    metrics.icon_w, metrics.icon_h);
-                } else {
-                    rg_draw_texture_inverted(g->tool_icons[tool], icon_x, icon_y,
-                                             metrics.icon_w, metrics.icon_h);
-                }
-            }
-            if (disabled) {
-                rg_line(button.x + 3, button.y + 3, button.x + button.w - 3,
-                        button.y + button.h - 3, (RG_Color){130,130,130,255});
-            }
-        }
-    }
-
-    /* Note: Coordinates box and Animation window content drawn after CAD views */
 }
 
 /* ============================================================================
@@ -5186,7 +4896,9 @@ static void draw_tool_palette_overlay(GuiState* g, int win_h) {
     for (int slot = 0; slot < CAD_TOOL_COUNT; ++slot) {
         CadToolId tool = toolPaletteOrder[slot];
         Rect button = tool_button_rect(g, slot);
-        int disabled = (toolDescriptors[tool].flags & CAD_TOOL_FLAG_DISABLED) != 0;
+        EditorCommandContext context = editor_command_context(g);
+        int disabled = !EditorController_GetToolState(
+            &g->controller, tool, &context).enabled;
         rg_fill_rect(button.x, button.y, button.w, button.h,
                      disabled ? (RG_Color){220,220,220,255} : (RG_Color){245,245,245,255});
         rg_stroke_rect(button.x, button.y, button.w, button.h, (RG_Color){120,120,120,255});
@@ -5205,19 +4917,89 @@ static void draw_tool_palette_overlay(GuiState* g, int win_h) {
     }
 }
 
-static int command_checked(const GuiState* g, CadCommandId command) {
-    switch (command) {
-    case CAD_COMMAND_WINDOW_TOP: return g->view_visible[0];
-    case CAD_COMMAND_WINDOW_3D: return g->view_visible[1];
-    case CAD_COMMAND_WINDOW_FRONT: return g->view_visible[2];
-    case CAD_COMMAND_WINDOW_RIGHT: return g->view_visible[3];
-    case CAD_COMMAND_WINDOW_COORDINATES: return g->coordinates_visible;
-    case CAD_COMMAND_WINDOW_TOOL_PALETTE: return g->tool_palette_visible;
-    case CAD_COMMAND_WINDOW_TEN_KEY: return g->state_visible;
-    case CAD_COMMAND_OPTION_WIREFRAME: return g->views[1].wireframe;
-    case CAD_COMMAND_OPTION_SOLID: return !g->views[1].wireframe;
-    default: return 0;
+static void draw_coordinates_window(GuiState* g, int win_h) {
+    Rect inner;
+    char coordinates[128];
+    char panel_text[256];
+    if (!g || !g->coordinates_visible) return;
+    draw_window_chrome(g, &g->coordBox, win_h, 1.0f, 1.0f);
+    inner = (Rect){g->coordBox.r.x + 6, g->coordBox.r.y + 26,
+                   g->coordBox.r.w - 12, g->coordBox.r.h - 32};
+    rg_fill_rect(inner.x, inner.y, inner.w, inner.h,
+                 (RG_Color){250,250,250,255});
+    rg_stroke_rect(inner.x, inner.y, inner.w, inner.h,
+                   (RG_Color){120,120,120,255});
+    if (!g->font || !g->cad) return;
+
+    if (g->cad->selection.pointCount > 0) {
+        double average_x = 0.0;
+        double average_y = 0.0;
+        double average_z = 0.0;
+        int valid_count = 0;
+        int all_same_location = 1;
+        const double location_threshold = 0.01;
+        for (int index = 0; index < g->cad->selection.pointCount; ++index) {
+            int16_t point_index = g->cad->selection.selectedPoints[index];
+            CadPosition point;
+            if (point_index < 0 || !gui_scene_point(g, point_index, &point))
+                continue;
+            average_x += point.x;
+            average_y += point.y;
+            average_z += point.z;
+            ++valid_count;
+        }
+        if (valid_count > 0) {
+            average_x /= valid_count;
+            average_y /= valid_count;
+            average_z /= valid_count;
+            if (valid_count > 1) {
+                for (int index = 0;
+                     index < g->cad->selection.pointCount; ++index) {
+                    int16_t point_index =
+                        g->cad->selection.selectedPoints[index];
+                    CadPosition point;
+                    double dx;
+                    double dy;
+                    double dz;
+                    if (point_index < 0 ||
+                        !gui_scene_point(g, point_index, &point)) continue;
+                    dx = point.x - average_x;
+                    dy = point.y - average_y;
+                    dz = point.z - average_z;
+                    if (dx * dx + dy * dy + dz * dz >
+                        location_threshold * location_threshold) {
+                        all_same_location = 0;
+                        break;
+                    }
+                }
+            }
+            if (valid_count == 1 || all_same_location) {
+                snprintf(coordinates, sizeof(coordinates),
+                         "X=%.2f   Y=%.2f   Z=%.2f", average_x, average_y,
+                         average_z);
+            } else {
+                snprintf(coordinates, sizeof(coordinates),
+                         "X=%.2f   Y=%.2f   Z=%.2f  (avg of %d)", average_x,
+                         average_y, average_z, valid_count);
+            }
+        } else {
+            snprintf(coordinates, sizeof(coordinates),
+                     "No valid points selected");
+        }
+    } else {
+        snprintf(coordinates, sizeof(coordinates), "No points selected");
     }
+    snprintf(panel_text, sizeof(panel_text),
+             "%s   |   3D RX=%.1f RY=%.1f RZ=%.1f  Zoom=%.2fx",
+             coordinates, g->views[1].rot_x, g->views[1].rot_y,
+             g->views[1].rot_z, g->views[1].zoom);
+    font_draw(g->font, inner.x + 8, inner.y + 6, panel_text, 0);
+}
+
+static int command_checked(const GuiState* g, CadCommandId command) {
+    EditorCommandContext context = editor_command_context(g);
+    return EditorController_GetCommandState(
+        &g->controller, command, &context).checked;
 }
 
 static void draw_state_panel(GuiState* g, int win_h) {
@@ -5240,7 +5022,9 @@ static void draw_state_panel(GuiState* g, int win_h) {
         snprintf(summary, sizeof(summary), "%s target: %d selected%s",
                  g->state_face_target ? "Face" : "Point", selected,
                  CadDocument_HasAnimation(&g->document)
-                     ? " (corresponding animation frames included)" : "");
+                     ? (g->animation.allFrames ? " (all corresponding frames)"
+                                               : " (current frame)")
+                     : "");
         font_draw(g->font, inner.x + 8, inner.y + 7, summary, 0);
     }
 
@@ -5289,6 +5073,8 @@ static void draw_state_panel(GuiState* g, int win_h) {
 
 static void draw_menu_item(GuiState* g, const CadMenuItemDescriptor* item,
                            Rect row, int hovered) {
+    char dynamic_label[160];
+    const char* label;
     if (item->flags & CAD_MENU_ITEM_SEPARATOR) {
         rg_line(row.x + 6, row.y + row.h / 2, row.x + row.w - 6,
                 row.y + row.h / 2, (RG_Color){120,120,120,255});
@@ -5304,7 +5090,9 @@ static void draw_menu_item(GuiState* g, const CadMenuItemDescriptor* item,
     if (command_checked(g, item->command)) {
         rg_fill_rect(row.x + 7, row.y + 7, 6, 6, (RG_Color){30,30,30,255});
     }
-    if (g->font) font_draw(g->font, row.x + 18, row.y + 3, item->label, 0);
+    label = menu_item_display_text(g, item, dynamic_label,
+                                   sizeof(dynamic_label));
+    if (g->font) font_draw(g->font, row.x + 18, row.y + 3, label, 0);
     if (item->flags & CAD_MENU_ITEM_SUBMENU) {
         rg_line(row.x + row.w - 10, row.y + 6, row.x + row.w - 5, row.y + 10,
                 (RG_Color){0,0,0,255});
@@ -5330,10 +5118,13 @@ static void gui_draw_dropdown(GuiState* g) {
     if (g->submenu_open == 5 || g->submenu_open == 6) {
         const CadMenuItemDescriptor* submenu = g->submenu_open == 5
                                                 ? importSubMenuItems : exportSubMenuItems;
+        int submenu_count = g->submenu_open == 5
+                                ? ARRAY_COUNT(importSubMenuItems)
+                                : ARRAY_COUNT(exportSubMenuItems);
         Rect r = g->submenu_rect;
         rg_fill_rect(r.x, r.y, r.w, r.h, (RG_Color){245,245,245,255});
         rg_stroke_rect(r.x, r.y, r.w, r.h, (RG_Color){0,0,0,255});
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < submenu_count; ++i) {
             draw_menu_item(g, &submenu[i], (Rect){r.x, r.y + i * 20, r.w, 20},
                            i == g->submenu_hover_item);
         }
@@ -5386,7 +5177,9 @@ static void gui_draw_cad_views(GuiState* g, int win_w, int win_h, int fb_w, int 
     float scale_y = (fb_h > 0 && win_h > 0) ? (float)fb_h / (float)win_h : 1.0f;
     
     /* Render CAD data in each view */
-    for (int i = 0; i < 4; i++) {
+    for (int slot = 0; slot < 4; ++slot) {
+        int i = g->view_z_order[slot];
+        if (i < 0 || i >= 4) continue;
         if (!g->view_visible[i]) continue;
         /* Each view is painted as a complete desktop window in input z-order.
            Later views therefore cover earlier views without their model
@@ -5417,9 +5210,15 @@ static void gui_draw_cad_views(GuiState* g, int win_w, int win_h, int fb_w, int 
         glClear(GL_DEPTH_BUFFER_BIT);
         glDisable(GL_SCISSOR_TEST);
         
-        CadView_Render(&g->views[i], g->cad,
-                       scaled_x, scaled_y, scaled_w, scaled_h, fb_h,
-                       content.w, content.h);
+        if (g->scene_valid) {
+            CadView_RenderScene(&g->views[i], &g->scene,
+                                scaled_x, scaled_y, scaled_w, scaled_h, fb_h,
+                                content.w, content.h);
+        } else {
+            CadView_Render(&g->views[i], g->cad,
+                           scaled_x, scaled_y, scaled_w, scaled_h, fb_h,
+                           content.w, content.h);
+        }
         
         /* Reset to 2D after CAD rendering - restore main viewport/projection */
         rg_reset_viewport(win_w, win_h, fb_w, fb_h);
@@ -5454,22 +5253,460 @@ static void gui_draw_interaction_overlays(GuiState* g, int view_index) {
     }
     if (g->point_pending) {
         unsigned axes = axes_for_view(g->views[view_index].type);
-        if (!axes || (axes & g->point_known_axes) != axes) return;
+        unsigned horizontal_axis = 0;
+        unsigned vertical_axis = 0;
         int x, y;
-        CadView_ProjectPoint(&g->views[view_index], g->point_pending_x,
-                             g->point_pending_y, g->point_pending_z,
-                             &x, &y, content.w, content.h);
-        x += content.x;
-        y += content.y;
-        if (y >= content.y && y < content.y + content.h) {
-            int x1 = x - 7 < content.x ? content.x : x - 7;
-            int x2 = x + 7 >= content.x + content.w ? content.x + content.w - 1 : x + 7;
-            if (x2 >= x1) rg_line(x1, y, x2, y, (RG_Color){220,45,45,255});
+        if (g->views[view_index].type == CAD_VIEW_TOP) {
+            horizontal_axis = 1u; vertical_axis = 4u;
+        } else if (g->views[view_index].type == CAD_VIEW_FRONT) {
+            horizontal_axis = 1u; vertical_axis = 2u;
+        } else if (g->views[view_index].type == CAD_VIEW_RIGHT) {
+            horizontal_axis = 4u; vertical_axis = 2u;
         }
-        if (x >= content.x && x < content.x + content.w) {
-            int y1 = y - 7 < content.y ? content.y : y - 7;
-            int y2 = y + 7 >= content.y + content.h ? content.y + content.h - 1 : y + 7;
-            if (y2 >= y1) rg_line(x, y1, x, y2, (RG_Color){220,45,45,255});
+        if (axes && horizontal_axis && vertical_axis) {
+            CadView_ProjectPoint(&g->views[view_index], g->point_pending_x,
+                                 g->point_pending_y, g->point_pending_z,
+                                 &x, &y, content.w, content.h);
+            x += content.x;
+            y += content.y;
+            if ((g->point_known_axes & horizontal_axis) &&
+                x >= content.x && x < content.x + content.w) {
+                rg_line(x, content.y, x, content.y + content.h - 1,
+                        (RG_Color){218,92,44,255});
+            }
+            if ((g->point_known_axes & vertical_axis) &&
+                y >= content.y && y < content.y + content.h) {
+                rg_line(content.x, y, content.x + content.w - 1, y,
+                        (RG_Color){218,92,44,255});
+            }
+            if ((g->point_known_axes & axes) == axes &&
+                x >= content.x && x < content.x + content.w &&
+                y >= content.y && y < content.y + content.h) {
+                rg_stroke_rect(x - 4, y - 4, 8, 8, (RG_Color){220,45,45,255});
+            }
+        }
+    }
+
+    if (g->selected_tool == CAD_TOOL_FACE_CREATE &&
+        g->cad->selection.pointCount > 0) {
+        int count = g->cad->selection.pointCount;
+        int px[CAD_MAX_FACE_POINTS];
+        int py[CAD_MAX_FACE_POINTS];
+        double coords[CAD_MAX_FACE_POINTS][3];
+        int valid = count <= CAD_MAX_FACE_POINTS;
+        for (int i = 0; valid && i < count; ++i) {
+            int16_t point_index = g->cad->selection.selectedPoints[i];
+            CadPosition point;
+            if (!gui_scene_point(g, point_index, &point)) {
+                valid = 0;
+                break;
+            }
+            coords[i][0] = point.x;
+            coords[i][1] = point.y;
+            coords[i][2] = point.z;
+            CadView_ProjectPoint(&g->views[view_index], point.x,
+                                 point.y, point.z,
+                                 &px[i], &py[i], content.w, content.h);
+            px[i] += content.x;
+            py[i] += content.y;
+        }
+        if (valid) {
+            const RG_Color chain_color = { 125, 50, 190, 255 };
+            CadPointChainPlanarity planarity =
+                CadGeometry_ClassifyPointChain(coords, count, 0.01);
+            const RG_Color close_color =
+                planarity == CAD_POINT_CHAIN_COPLANAR
+                    ? (RG_Color){ 30, 150, 85, 255 }
+                    : planarity == CAD_POINT_CHAIN_DEGENERATE
+                        ? (RG_Color){ 215, 132, 35, 255 }
+                        : (RG_Color){ 210, 55, 45, 255 };
+            for (int i = 1; i < count; ++i) {
+                if (pt_in_rect(px[i - 1], py[i - 1], content) &&
+                    pt_in_rect(px[i], py[i], content)) {
+                    rg_line(px[i - 1], py[i - 1], px[i], py[i], chain_color);
+                }
+            }
+            if (count >= 3 && pt_in_rect(px[count - 1], py[count - 1], content) &&
+                pt_in_rect(px[0], py[0], content)) {
+                rg_line(px[count - 1], py[count - 1], px[0], py[0], close_color);
+            }
+            for (int i = 0; i < count; ++i) {
+                char number[8];
+                Rect label;
+                if (!pt_in_rect(px[i], py[i], content)) continue;
+                snprintf(number, sizeof(number), "%d", i + 1);
+                label = (Rect){px[i] + 5, py[i] - 11, 18, 15};
+                if (label.w > content.w || label.h > content.h) continue;
+                if (label.x < content.x) label.x = content.x;
+                if (label.y < content.y) label.y = content.y;
+                if (label.x + label.w > content.x + content.w)
+                    label.x = content.x + content.w - label.w;
+                if (label.y + label.h > content.y + content.h)
+                    label.y = content.y + content.h - label.h;
+                rg_fill_rect(label.x, label.y, label.w, label.h,
+                             (RG_Color){ 250, 247, 230, 255 });
+                rg_stroke_rect(label.x, label.y, label.w, label.h, chain_color);
+                if (g->font)
+                    font_draw(g->font, label.x + 3, label.y + 1, number, 0);
+            }
+        }
+    }
+}
+
+static void draw_animation_button(GuiState* g, Rect rect, const char* text,
+                                  int checked, int enabled) {
+    RG_Color fill = !enabled ? (RG_Color){218,218,218,255}
+                    : checked ? (RG_Color){166,202,238,255}
+                              : (RG_Color){244,244,244,255};
+    RG_Color edge = enabled ? (RG_Color){82,82,82,255}
+                            : (RG_Color){160,160,160,255};
+    if (rect.w <= 0 || rect.h <= 0) return;
+    rg_fill_rect(rect.x, rect.y, rect.w, rect.h, fill);
+    rg_stroke_rect(rect.x, rect.y, rect.w, rect.h, edge);
+    if (g->font && text) {
+        int width = font_measure(g->font, text);
+        int x = rect.x + (rect.w - width) / 2;
+        if (x < rect.x + 2) x = rect.x + 2;
+        font_draw(g->font, x, rect.y + 3, text, enabled ? 0 : 1);
+    }
+}
+
+static void draw_animation_panel(GuiState* g) {
+    AnimationPanelLayout layout;
+    CadAnimationPanelState state;
+    int frames;
+    if (!g || !g->animation_visible || g->animationWindow.r.w <= 0 ||
+        g->animationWindow.r.h <= 0) return;
+    layout = animation_panel_layout(g);
+    state = animation_panel_state(g);
+    frames = g->animation_info_valid && g->animation_info.frameCount > 0
+                 ? g->animation_info.frameCount : 0;
+    rg_fill_rect(layout.inner.x, layout.inner.y, layout.inner.w, layout.inner.h,
+                 (RG_Color){242,242,242,255});
+    rg_stroke_rect(layout.inner.x, layout.inner.y, layout.inner.w, layout.inner.h,
+                   (RG_Color){120,120,120,255});
+    if (!layout.usable) {
+        if (g->font)
+            font_draw(g->font, layout.inner.x + 6, layout.inner.y + 4,
+                      "Animation timeline: enlarge or float this panel", 0);
+        return;
+    }
+
+    draw_animation_button(g, layout.first, "|<", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_FIRST, &state));
+    draw_animation_button(g, layout.previous, "<", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_PREVIOUS, &state));
+    draw_animation_button(g, layout.play,
+                          g->animation.playing ? "Pause" : "Play",
+                          g->animation.playing,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_PLAY_PAUSE, &state));
+    draw_animation_button(g, layout.stop, "Stop", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_STOP, &state));
+    draw_animation_button(g, layout.next, ">", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_NEXT, &state));
+    draw_animation_button(g, layout.last, ">|", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_LAST, &state));
+    draw_animation_button(g, layout.loop, "Loop", g->animation.loop,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_TOGGLE_LOOP, &state));
+    draw_animation_button(g, layout.interpolation, "Interp",
+                          g->animation.interpolation,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_TOGGLE_INTERPOLATION,
+                              &state));
+    draw_animation_button(g, layout.fps_down, "FPS-", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_FPS_DOWN, &state));
+    draw_animation_button(g, layout.fps_up, "FPS+", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_FPS_UP, &state));
+    draw_animation_button(g, layout.all_frames, "All Frames",
+                          g->animation.allFrames,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_TOGGLE_ALL_FRAMES, &state));
+    if (layout.dock.w)
+        draw_animation_button(g, layout.dock,
+                              g->animation_docked ? "Float" : "Dock", 0,
+                              CadAnimationPanel_IsActionEnabled(
+                                  CAD_ANIMATION_PANEL_TOGGLE_DOCK, &state));
+
+    if (g->font) {
+        char readout[96];
+        snprintf(readout, sizeof(readout), "F %.2f / %d  %.0f fps",
+                 g->animation.previewFrame, frames,
+                 g->animation.fps);
+        font_draw(g->font, layout.last.x + layout.last.w + 7,
+                  layout.last.y + 3, readout, 0);
+    }
+
+    for (int frame = 0; frame < CAD_ANIMATION_FRAMES; ++frame) {
+        int left = layout.strip.x + frame * layout.strip.w / CAD_ANIMATION_FRAMES;
+        int right = layout.strip.x + (frame + 1) * layout.strip.w / CAD_ANIMATION_FRAMES;
+        Rect cell = {left, layout.strip.y, right - left, layout.strip.h};
+        int active = frame < frames;
+        int current = frame == g->animation.currentFrame && active;
+        int sampled = g->scene_valid && active &&
+                      (frame == g->scene.pose->sample.frameA ||
+                       frame == g->scene.pose->sample.frameB);
+        RG_Color fill = !active ? (RG_Color){222,222,222,255}
+                        : current ? (RG_Color){56,116,188,255}
+                        : sampled ? (RG_Color){137,190,223,255}
+                                  : (RG_Color){250,250,250,255};
+        rg_fill_rect(cell.x, cell.y, cell.w, cell.h, fill);
+        rg_stroke_rect(cell.x, cell.y, cell.w, cell.h,
+                       (RG_Color){135,135,135,255});
+        if (g->font && active && (frame % 8 == 0 || current) && cell.w >= 8) {
+            char number[8];
+            snprintf(number, sizeof(number), "%d", frame);
+            font_draw(g->font, cell.x + 1, cell.y + 2, number, current ? 1 : 0);
+        }
+    }
+    if (g->scene_valid && g->scene.pose->sample.interpolated && frames > 1) {
+        double frame_width = (double)layout.strip.w / CAD_ANIMATION_FRAMES;
+        int marker = layout.strip.x +
+            (int)lround((g->animation.previewFrame + 0.5) * frame_width);
+        rg_line(marker, layout.strip.y, marker,
+                layout.strip.y + layout.strip.h - 1,
+                (RG_Color){220,54,43,255});
+    }
+
+    draw_animation_button(g, layout.create_all, "Create All", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_CREATE_ALL, &state));
+    draw_animation_button(g, layout.create_selected, "Create Sel", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_CREATE_SELECTED, &state));
+    draw_animation_button(g, layout.count_down, "Count -", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_COUNT_DOWN, &state));
+    draw_animation_button(g, layout.count_up, "Count +", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_COUNT_UP, &state));
+    draw_animation_button(g, layout.insert, "Insert", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_INSERT, &state));
+    draw_animation_button(g, layout.duplicate, "Duplicate", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_DUPLICATE, &state));
+    draw_animation_button(g, layout.delete_frame, "Delete", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_DELETE, &state));
+    draw_animation_button(g, layout.copy_all, "Copy All",
+                          g->anim_copy_mode == 1,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_COPY_ALL, &state));
+    draw_animation_button(g, layout.copy_selected, "Copy Sel",
+                          g->anim_copy_mode == 2,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_COPY_SELECTED, &state));
+    draw_animation_button(g, layout.add_faces, "Add Faces", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_ADD_FACES, &state));
+    draw_animation_button(g, layout.static_copy, "Make Static Copy", 0,
+                          CadAnimationPanel_IsActionEnabled(
+                              CAD_ANIMATION_PANEL_MAKE_STATIC_COPY, &state));
+    if (g->font) {
+        char summary[144];
+        int x = layout.static_copy.x + layout.static_copy.w + 8;
+        if (state.editable) {
+            snprintf(summary, sizeof(summary), "%d animated / %d static face%s%s",
+                     g->animation_info.animatedFaceCount,
+                     g->animation_info.staticFaceCount,
+                     (g->animation_info.unattachedIndexCount ||
+                      g->animation_info.unattachedPointCount)
+                         ? "; unattached records preserved" : "",
+                     g->anim_copy_mode ? "; choose target frame" : "");
+        } else if (CadAnimation_HasAny(&g->cad->data)) {
+            snprintf(summary, sizeof(summary), "Unattached animation records preserved");
+        } else {
+            snprintf(summary, sizeof(summary), "Static document");
+        }
+        if (layout.static_copy.w > 0 &&
+            x < layout.inner.x + layout.inner.w - 20)
+            font_draw(g->font, x, layout.static_copy.y + 3, summary, 0);
+    }
+}
+
+static void draw_shape_browser_window(GuiState* g, int win_w, int win_h,
+                                      int fb_w, int fb_h) {
+    ShapeBrowserLayout layout;
+    int result_count;
+    int visible_items;
+    int max_scroll;
+    Rect preview_view;
+    RG_Color replace_fill;
+    if (!g || !aux_window_visible(g, GUI_AUX_SHAPE_BROWSER)) return;
+    draw_window_chrome(g, &g->shapeBrowserWindow, win_h, 1.0f, 1.0f);
+    layout = shape_browser_layout(g);
+    rg_fill_rect(layout.inner.x, layout.inner.y, layout.inner.w, layout.inner.h,
+                 (RG_Color){250,250,250,255});
+    rg_stroke_rect(layout.inner.x, layout.inner.y, layout.inner.w,
+                   layout.inner.h, (RG_Color){120,120,120,255});
+    result_count = filtered_shape_count(g);
+    visible_items = layout.list.h / 20;
+    max_scroll = result_count > visible_items
+                     ? result_count - visible_items : 0;
+    if (g->shape_scroll_offset > max_scroll)
+        g->shape_scroll_offset = max_scroll;
+    if (g->shape_scroll_offset < 0) g->shape_scroll_offset = 0;
+
+    if (g->font) {
+        char title[160];
+        snprintf(title, sizeof(title),
+                 "Recovered ASM shapes: %d total, %d matching",
+                 g->shape_count, result_count);
+        font_draw(g->font, layout.inner.x + 8, layout.inner.y + 7, title, 0);
+        font_draw(g->font, layout.inner.x + 8, layout.inner.y + 27,
+                  g->shape_folder_path, 0);
+        font_draw(g->font, layout.inner.x + 8, layout.search.y + 5,
+                  "Find:", 0);
+    }
+
+    rg_fill_rect(layout.search.x, layout.search.y, layout.search.w,
+                 layout.search.h,
+                 g->shape_search_active ? (RG_Color){210,224,248,255}
+                                        : (RG_Color){255,255,255,255});
+    rg_stroke_rect(layout.search.x, layout.search.y, layout.search.w,
+                   layout.search.h,
+                   g->shape_search_active ? (RG_Color){45,90,170,255}
+                                          : (RG_Color){110,110,110,255});
+    if (g->font) {
+        font_draw(g->font, layout.search.x + 5, layout.search.y + 5,
+                  g->shape_search[0] ? g->shape_search : "type to filter...",
+                  0);
+    }
+
+    rg_fill_rect(layout.list.x, layout.list.y, layout.list.w, layout.list.h,
+                 (RG_Color){255,255,255,255});
+    rg_stroke_rect(layout.list.x, layout.list.y, layout.list.w, layout.list.h,
+                   (RG_Color){80,80,80,255});
+    for (int row = 0; row < visible_items; ++row) {
+        int source_index = filtered_shape_index(
+            g, g->shape_scroll_offset + row);
+        Rect item;
+        if (source_index < 0) break;
+        item = (Rect){layout.list.x + 2, layout.list.y + row * 20 + 1,
+                      layout.list.w - (max_scroll > 0 ? 16 : 4), 18};
+        if (source_index == g->shape_selected) {
+            rg_fill_rect(item.x, item.y, item.w, item.h,
+                         (RG_Color){190,210,240,255});
+        }
+        if (g->font) {
+            font_draw(g->font, item.x + 3, item.y + 3,
+                      g->shape_names[source_index], 0);
+        }
+    }
+
+    if (max_scroll > 0) {
+        Rect track = {layout.list.x + layout.list.w - 14, layout.list.y,
+                      14, layout.list.h};
+        int thumb_h = visible_items * track.h / result_count;
+        int thumb_y;
+        if (thumb_h < 24) thumb_h = 24;
+        thumb_y = track.y + g->shape_scroll_offset *
+                  (track.h - thumb_h) / max_scroll;
+        rg_fill_rect(track.x, track.y, track.w, track.h,
+                     (RG_Color){220,220,220,255});
+        rg_stroke_rect(track.x, track.y, track.w, track.h,
+                       (RG_Color){100,100,100,255});
+        rg_fill_rect(track.x + 2, thumb_y, track.w - 4, thumb_h,
+                     (RG_Color){145,145,145,255});
+    }
+
+    rg_fill_rect(layout.preview.x, layout.preview.y, layout.preview.w,
+                 layout.preview.h, (RG_Color){238,238,238,255});
+    rg_stroke_rect(layout.preview.x, layout.preview.y, layout.preview.w,
+                   layout.preview.h, (RG_Color){80,80,80,255});
+    if (g->font) {
+        char preview_title[160];
+        if (g->shape_preview_valid && g->shape_selected >= 0) {
+            snprintf(preview_title, sizeof(preview_title),
+                     "%s - %d points, %d faces",
+                     g->shape_names[g->shape_selected],
+                     g->shape_preview->data.pointCount,
+                     g->shape_preview->data.polygonCount);
+        } else {
+            snprintf(preview_title, sizeof(preview_title),
+                     "Select a shape to preview");
+        }
+        font_draw(g->font, layout.preview.x + 6, layout.preview.y + 5,
+                  preview_title, 0);
+    }
+
+    preview_view = (Rect){layout.preview.x + 4, layout.preview.y + 25,
+                          layout.preview.w - 8, layout.preview.h - 29};
+    if (g->shape_preview_valid && preview_view.w > 1 && preview_view.h > 1) {
+        float scale_x = win_w > 0 ? (float)fb_w / (float)win_w : 1.0f;
+        float scale_y = win_h > 0 ? (float)fb_h / (float)win_h : 1.0f;
+        int pixel_x = (int)lroundf(preview_view.x * scale_x);
+        int pixel_y = (int)lroundf(preview_view.y * scale_y);
+        int pixel_right =
+            (int)lroundf((preview_view.x + preview_view.w) * scale_x);
+        int pixel_bottom =
+            (int)lroundf((preview_view.y + preview_view.h) * scale_y);
+        int pixel_w = pixel_right - pixel_x;
+        int pixel_h = pixel_bottom - pixel_y;
+        int gl_y = fb_h - (pixel_y + pixel_h);
+        if (gl_y < 0) gl_y = 0;
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(pixel_x, gl_y, pixel_w, pixel_h);
+        glClearDepth(1.0);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        CadView_Render(&g->shape_preview_view, g->shape_preview,
+                       pixel_x, pixel_y, pixel_w, pixel_h, fb_h,
+                       preview_view.w, preview_view.h);
+        rg_reset_viewport(win_w, win_h, fb_w, fb_h);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        rg_stroke_rect(preview_view.x, preview_view.y, preview_view.w,
+                       preview_view.h, (RG_Color){100,100,100,255});
+    }
+
+    replace_fill = g->shape_preview_valid
+                       ? (RG_Color){195,218,198,255}
+                       : (RG_Color){225,225,225,255};
+    rg_fill_rect(layout.replace_button.x, layout.replace_button.y,
+                 layout.replace_button.w, layout.replace_button.h,
+                 replace_fill);
+    rg_stroke_rect(layout.replace_button.x, layout.replace_button.y,
+                   layout.replace_button.w, layout.replace_button.h,
+                   (RG_Color){100,100,100,255});
+    if (g->font) {
+        font_draw(g->font, layout.replace_button.x + 20,
+                  layout.replace_button.y + 5, "Replace", 0);
+    }
+}
+
+static void draw_aux_windows(GuiState* g, int win_w, int win_h,
+                             int fb_w, int fb_h) {
+    if (!g) return;
+    for (int slot = 0; slot < GUI_AUX_COUNT; ++slot) {
+        int id = g->aux_z_order[slot];
+        if (!aux_window_visible(g, id)) continue;
+        switch ((GuiAuxWindowId)id) {
+        case GUI_AUX_TOOL_PALETTE:
+            draw_tool_palette_overlay(g, win_h);
+            break;
+        case GUI_AUX_COORDINATES:
+            draw_coordinates_window(g, win_h);
+            break;
+        case GUI_AUX_ANIMATION:
+            draw_window_chrome(g, &g->animationWindow, win_h, 1.0f, 1.0f);
+            draw_animation_panel(g);
+            break;
+        case GUI_AUX_SHAPE_BROWSER:
+            draw_shape_browser_window(g, win_w, win_h, fb_w, fb_h);
+            break;
+        default:
+            break;
         }
     }
 }
@@ -5504,243 +5741,14 @@ void gui_draw(GuiState* g, const GuiInput* in, int win_w, int win_h, int fb_w, i
     glClearDepth(1.0);
     glClear(GL_DEPTH_BUFFER_BIT);
 
-    /* Step 1: Draw GUI elements (menu bar, tool palette, windows) */
-    gui_draw_gui_elements(g, win_w, win_h);
-    
-    /* Step 2: Draw CAD models in viewports (with proper 3D/depth state) */
+    /* Modeling views are the base desktop layer.  Auxiliary panels are then
+       painted as complete windows in their shared back-to-front order. */
     gui_draw_cad_views(g, win_w, win_h, fb_w, fb_h, in);
-    draw_tool_palette_overlay(g, win_h);
-    
-    /* Step 3: Draw windows that should appear on top of CAD models */
-    if (g->coordinates_visible) draw_window_chrome(g, &g->coordBox, win_h, 1.0f, 1.0f);
-    if (g->animationWindow.r.w > 0 && g->animationWindow.r.h > 0) {
-        draw_window_chrome(g, &g->animationWindow, win_h, 1.0f, 1.0f);
-    }
-    
-    if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0) {
-        draw_window_chrome(g, &g->shapeBrowserWindow, win_h, 1.0f, 1.0f);
-    }
-    
-    /* Draw coordinates box content */
-    if (g->coordinates_visible) {
-    Rect cr = g->coordBox.r;
-    Rect cinner = (Rect){ cr.x + 6, cr.y + 26, cr.w - 12, cr.h - 32 };
-    rg_fill_rect(cinner.x, cinner.y, cinner.w, cinner.h, (RG_Color){250,250,250,255});
-    rg_stroke_rect(cinner.x, cinner.y, cinner.w, cinner.h, (RG_Color){120,120,120,255});
-    
-    if (g->font && g->cad) {
-        char coord_str[128];
-        if (g->cad->selection.pointCount > 0) {
-            /* Calculate average of selected points */
-            double avg_x = 0.0, avg_y = 0.0, avg_z = 0.0;
-            int valid_count = 0;
-            
-            for (int i = 0; i < g->cad->selection.pointCount; i++) {
-                int16_t point_idx = g->cad->selection.selectedPoints[i];
-                if (point_idx < 0) continue;
-                
-                CadPoint* pt = CadCore_GetPoint(g->cad, point_idx);
-                if (!pt) continue;
-                
-                avg_x += pt->pointx;
-                avg_y += pt->pointy;
-                avg_z += pt->pointz;
-                valid_count++;
-            }
-            
-            if (valid_count > 0) {
-                avg_x /= valid_count;
-                avg_y /= valid_count;
-                avg_z /= valid_count;
-                
-                /* Check if all points are at the same location (merged points) */
-                int all_same_location = 1;
-                const double location_threshold = 0.01; /* 0.01 unit threshold */
-                
-                if (valid_count > 1) {
-                    for (int i = 0; i < g->cad->selection.pointCount; i++) {
-                        int16_t point_idx = g->cad->selection.selectedPoints[i];
-                        if (point_idx < 0) continue;
-                        
-                        CadPoint* pt = CadCore_GetPoint(g->cad, point_idx);
-                        if (!pt) continue;
-                        
-                        double dx = pt->pointx - avg_x;
-                        double dy = pt->pointy - avg_y;
-                        double dz = pt->pointz - avg_z;
-                        double dist_sq = dx * dx + dy * dy + dz * dz;
-                        
-                        if (dist_sq > location_threshold * location_threshold) {
-                            all_same_location = 0;
-                            break;
-                        }
-                    }
-                }
-                
-                if (valid_count == 1 || all_same_location) {
-                    /* Single point or all points at same location - show coordinates */
-                    snprintf(coord_str, sizeof(coord_str), "X=%.2f   Y=%.2f   Z=%.2f", avg_x, avg_y, avg_z);
-                } else {
-                    /* Multiple points at different locations - show average */
-                    snprintf(coord_str, sizeof(coord_str), "X=%.2f   Y=%.2f   Z=%.2f  (avg of %d)", avg_x, avg_y, avg_z, valid_count);
-                }
-            } else {
-                snprintf(coord_str, sizeof(coord_str), "No valid points selected");
-            }
-        } else {
-            snprintf(coord_str, sizeof(coord_str), "No points selected");
-        }
-        char panel_text[256];
-        snprintf(panel_text, sizeof(panel_text), "%s   |   3D RX=%.1f RY=%.1f RZ=%.1f  Zoom=%.2fx",
-                 coord_str, g->views[1].rot_x, g->views[1].rot_y,
-                 g->views[1].rot_z, g->views[1].zoom);
-        font_draw(g->font, cinner.x + 8, cinner.y + 6, panel_text, 0);
-    }
-    }
-    
-    /* Draw animation window content */
-    if (g->animationWindow.r.w > 0 && g->animationWindow.r.h > 0) {
-        Rect ar = g->animationWindow.r;
-        Rect inner = { ar.x + 6, ar.y + 26, ar.w - 12, ar.h - 32 };
-        rg_fill_rect(inner.x, inner.y, inner.w, inner.h, (RG_Color){242,242,242,255});
-        rg_stroke_rect(inner.x, inner.y, inner.w, inner.h, (RG_Color){120,120,120,255});
-        if (g->font) {
-            char summary[160];
-            snprintf(summary, sizeof(summary), "%s  |  %d index record(s), %d animation point(s)",
-                     CadDocument_HasAnimation(&g->document) ? "Animation preserved" : "No animation data",
-                     g->cad->data.animationIndexCount, g->cad->data.animationPointCount);
-            font_draw(g->font, inner.x + 8, inner.y + 8, summary, 0);
-            font_draw(g->font, inner.x + 8, inner.y + 32,
-                      "Editing and playback are deferred; static transforms preserve frame coordinates.", 0);
-        }
-    }
+    draw_aux_windows(g, win_w, win_h, fb_w, fb_h);
 
-    /* Draw shape browser window content */
-    if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0) {
-        ShapeBrowserLayout layout = shape_browser_layout(g);
-        rg_fill_rect(layout.inner.x, layout.inner.y, layout.inner.w, layout.inner.h,
-                     (RG_Color){250,250,250,255});
-        rg_stroke_rect(layout.inner.x, layout.inner.y, layout.inner.w, layout.inner.h,
-                       (RG_Color){120,120,120,255});
-        int result_count = filtered_shape_count(g);
-        int visible_items = layout.list.h / 20;
-        int max_scroll = result_count > visible_items ? result_count - visible_items : 0;
-        if (g->shape_scroll_offset > max_scroll) g->shape_scroll_offset = max_scroll;
-        if (g->shape_scroll_offset < 0) g->shape_scroll_offset = 0;
-
-        if (g->font) {
-            char title[160];
-            snprintf(title, sizeof(title), "Recovered ASM shapes: %d total, %d matching",
-                     g->shape_count, result_count);
-            font_draw(g->font, layout.inner.x + 8, layout.inner.y + 7, title, 0);
-            font_draw(g->font, layout.inner.x + 8, layout.inner.y + 27,
-                      g->shape_folder_path, 0);
-            font_draw(g->font, layout.inner.x + 8, layout.search.y + 5, "Find:", 0);
-        }
-
-        rg_fill_rect(layout.search.x, layout.search.y, layout.search.w, layout.search.h,
-                     g->shape_search_active ? (RG_Color){210,224,248,255}
-                                            : (RG_Color){255,255,255,255});
-        rg_stroke_rect(layout.search.x, layout.search.y, layout.search.w, layout.search.h,
-                       g->shape_search_active ? (RG_Color){45,90,170,255}
-                                              : (RG_Color){110,110,110,255});
-        if (g->font) {
-            font_draw(g->font, layout.search.x + 5, layout.search.y + 5,
-                      g->shape_search[0] ? g->shape_search : "type to filter...", 0);
-        }
-
-        rg_fill_rect(layout.list.x, layout.list.y, layout.list.w, layout.list.h,
-                     (RG_Color){255,255,255,255});
-        rg_stroke_rect(layout.list.x, layout.list.y, layout.list.w, layout.list.h,
-                       (RG_Color){80,80,80,255});
-        for (int row = 0; row < visible_items; ++row) {
-            int source_index = filtered_shape_index(g, g->shape_scroll_offset + row);
-            if (source_index < 0) break;
-            Rect item = { layout.list.x + 2, layout.list.y + row * 20 + 1,
-                          layout.list.w - (max_scroll > 0 ? 16 : 4), 18 };
-            if (source_index == g->shape_selected) {
-                rg_fill_rect(item.x, item.y, item.w, item.h, (RG_Color){190,210,240,255});
-            }
-            if (g->font) {
-                font_draw(g->font, item.x + 3, item.y + 3,
-                          g->shape_names[source_index], 0);
-            }
-        }
-
-        if (max_scroll > 0) {
-            Rect track = { layout.list.x + layout.list.w - 14, layout.list.y, 14,
-                           layout.list.h };
-            int thumb_h = visible_items * track.h / result_count;
-            if (thumb_h < 24) thumb_h = 24;
-            int thumb_y = track.y + g->shape_scroll_offset *
-                          (track.h - thumb_h) / max_scroll;
-            rg_fill_rect(track.x, track.y, track.w, track.h, (RG_Color){220,220,220,255});
-            rg_stroke_rect(track.x, track.y, track.w, track.h, (RG_Color){100,100,100,255});
-            rg_fill_rect(track.x + 2, thumb_y, track.w - 4, thumb_h,
-                         (RG_Color){145,145,145,255});
-        }
-
-        rg_fill_rect(layout.preview.x, layout.preview.y, layout.preview.w, layout.preview.h,
-                     (RG_Color){238,238,238,255});
-        rg_stroke_rect(layout.preview.x, layout.preview.y, layout.preview.w, layout.preview.h,
-                       (RG_Color){80,80,80,255});
-        if (g->font) {
-            char preview_title[160];
-            if (g->shape_preview_valid && g->shape_selected >= 0) {
-                snprintf(preview_title, sizeof(preview_title), "%s - %d points, %d faces",
-                         g->shape_names[g->shape_selected],
-                         g->shape_preview->data.pointCount,
-                         g->shape_preview->data.polygonCount);
-            } else {
-                snprintf(preview_title, sizeof(preview_title), "Select a shape to preview");
-            }
-            font_draw(g->font, layout.preview.x + 6, layout.preview.y + 5,
-                      preview_title, 0);
-        }
-
-        Rect preview_view = { layout.preview.x + 4, layout.preview.y + 25,
-                              layout.preview.w - 8, layout.preview.h - 29 };
-        if (g->shape_preview_valid && preview_view.w > 1 && preview_view.h > 1) {
-            float scale_x = win_w > 0 ? (float)fb_w / (float)win_w : 1.0f;
-            float scale_y = win_h > 0 ? (float)fb_h / (float)win_h : 1.0f;
-            int pixel_x = (int)lroundf(preview_view.x * scale_x);
-            int pixel_y = (int)lroundf(preview_view.y * scale_y);
-            int pixel_right = (int)lroundf((preview_view.x + preview_view.w) * scale_x);
-            int pixel_bottom = (int)lroundf((preview_view.y + preview_view.h) * scale_y);
-            int pixel_w = pixel_right - pixel_x;
-            int pixel_h = pixel_bottom - pixel_y;
-            int gl_y = fb_h - (pixel_y + pixel_h);
-            if (gl_y < 0) gl_y = 0;
-            glEnable(GL_DEPTH_TEST);
-            glEnable(GL_SCISSOR_TEST);
-            glScissor(pixel_x, gl_y, pixel_w, pixel_h);
-            glClearDepth(1.0);
-            glClear(GL_DEPTH_BUFFER_BIT);
-            glDisable(GL_SCISSOR_TEST);
-            CadView_Render(&g->shape_preview_view, g->shape_preview,
-                           pixel_x, pixel_y, pixel_w, pixel_h, fb_h,
-                           preview_view.w, preview_view.h);
-            rg_reset_viewport(win_w, win_h, fb_w, fb_h);
-            glDisable(GL_DEPTH_TEST);
-            glDisable(GL_CULL_FACE);
-            rg_stroke_rect(preview_view.x, preview_view.y, preview_view.w, preview_view.h,
-                           (RG_Color){100,100,100,255});
-        }
-
-        RG_Color replace_fill = g->shape_preview_valid
-                                ? (RG_Color){195,218,198,255}
-                                : (RG_Color){225,225,225,255};
-        rg_fill_rect(layout.replace_button.x, layout.replace_button.y,
-                     layout.replace_button.w, layout.replace_button.h, replace_fill);
-        rg_stroke_rect(layout.replace_button.x, layout.replace_button.y,
-                       layout.replace_button.w, layout.replace_button.h,
-                       (RG_Color){100,100,100,255});
-        if (g->font) {
-            font_draw(g->font, layout.replace_button.x + 20,
-                      layout.replace_button.y + 5, "Replace", 0);
-        }
-    }
-    
+    /* The persistent menu and status surfaces stay above all desktop
+       windows, regardless of their focus order. */
+    draw_menu_bar(g, win_w);
     /* Persistent contextual status; dropdowns remain the topmost layer. */
     int status_y = win_h - 22;
     rg_fill_rect(0, status_y, win_w, 22, (RG_Color){225,225,225,255});

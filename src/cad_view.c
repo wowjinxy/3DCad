@@ -33,10 +33,72 @@ typedef struct ProjectedPolygon {
     int selected;
 } ProjectedPolygon;
 
+typedef struct CadViewGeometry {
+    const CadFileData* data;
+    const CadPose* pose;
+} CadViewGeometry;
+
 /* OpenGL rendering is single-threaded in the SDL frontend.  Reusing one BSS
    scratch array avoids allocating roughly half a megabyte four times every
    frame without putting that storage on the small Windows thread stack. */
 static ProjectedPolygon cad_polygon_scratch[CAD_MAX_POLYGONS];
+
+static int cad_geometry_from_core(const CadCore* core,
+                                  CadViewGeometry* geometry)
+{
+    if (!core || !geometry) return 0;
+    geometry->data = &core->data;
+    geometry->pose = NULL;
+    return 1;
+}
+
+static int cad_geometry_from_scene(const CadScene* scene,
+                                   CadViewGeometry* geometry)
+{
+    if (!scene || !scene->topology || !scene->pose || !geometry) return 0;
+    geometry->data = scene->topology;
+    geometry->pose = scene->pose;
+    return 1;
+}
+
+static int cad_geometry_point(const CadViewGeometry* geometry,
+                              int16_t point_index,
+                              CadPosition* position)
+{
+    const CadPoint* point;
+    if (!geometry || !geometry->data || !position || point_index < 0 ||
+        point_index >= CAD_MAX_POINTS) return 0;
+    point = &geometry->data->points[point_index];
+    if (!point->flags) return 0;
+    if (geometry->pose) {
+        if (!geometry->pose->pointValid[point_index]) return 0;
+        *position = geometry->pose->points[point_index];
+    } else {
+        position->x = point->pointx;
+        position->y = point->pointy;
+        position->z = point->pointz;
+    }
+    return isfinite(position->x) && isfinite(position->y) &&
+           isfinite(position->z);
+}
+
+static int cad_geometry_point_selected(const CadViewGeometry* geometry,
+                                       int16_t point_index)
+{
+    return geometry && geometry->data && point_index >= 0 &&
+           point_index < CAD_MAX_POINTS &&
+           geometry->data->points[point_index].flags &&
+           geometry->data->points[point_index].selectFlag != 0;
+}
+
+static int cad_geometry_polygon_selected(const CadViewGeometry* geometry,
+                                         int16_t polygon_index)
+{
+    return geometry && geometry->data && polygon_index >= 0 &&
+           polygon_index < CAD_MAX_POLYGONS &&
+           geometry->data->polygons[polygon_index].flags &&
+           geometry->data->polygons[polygon_index].selectFlag != 0;
+}
 
 static int cad_view_parameters_valid(const CadView* view)
 {
@@ -320,6 +382,138 @@ void CadView_Pan3DVertical(CadView* view, double dy)
     view->pan_y = pan_y;
 }
 
+static int cad_frame_bounds(CadView* view,
+                            double min_x, double min_y, double min_z,
+                            double max_x, double max_y, double max_z,
+                            int viewport_w, int viewport_h,
+                            int preserve_orientation)
+{
+    const double padding = 0.82;
+    double center_x, center_y, center_z;
+    double span_x, span_y;
+    double zoom;
+    if (!view || viewport_w <= 0 || viewport_h <= 0 ||
+        !isfinite(min_x) || !isfinite(min_y) || !isfinite(min_z) ||
+        !isfinite(max_x) || !isfinite(max_y) || !isfinite(max_z) ||
+        min_x > max_x || min_y > max_y || min_z > max_z) return 0;
+
+    center_x = min_x + (max_x - min_x) * 0.5;
+    center_y = min_y + (max_y - min_y) * 0.5;
+    center_z = min_z + (max_z - min_z) * 0.5;
+    if (!isfinite(center_x) || !isfinite(center_y) || !isfinite(center_z)) return 0;
+
+    if (view->type != CAD_VIEW_3D) {
+        double component_x, component_y, ignored;
+        double component_min_x, component_min_y;
+        double component_max_x, component_max_y;
+        cad_orthographic_components(view->type, min_x, min_y, min_z,
+                                    &component_min_x, &component_min_y, &ignored);
+        cad_orthographic_components(view->type, max_x, max_y, max_z,
+                                    &component_max_x, &component_max_y, &ignored);
+        if (component_min_x > component_max_x) {
+            double swap = component_min_x; component_min_x = component_max_x; component_max_x = swap;
+        }
+        if (component_min_y > component_max_y) {
+            double swap = component_min_y; component_min_y = component_max_y; component_max_y = swap;
+        }
+        span_x = component_max_x - component_min_x;
+        span_y = component_max_y - component_min_y;
+        if (span_x < 1e-9) span_x = 1.0;
+        if (span_y < 1e-9) span_y = 1.0;
+        zoom = fmin((double)viewport_w * padding / span_x,
+                    (double)viewport_h * padding / span_y);
+        CadView_SetZoom(view, zoom);
+        cad_orthographic_components(view->type, center_x, center_y, center_z,
+                                    &component_x, &component_y, &ignored);
+        view->pan_x = -component_x * view->zoom;
+        view->pan_y = -component_y * view->zoom;
+        return isfinite(view->pan_x) && isfinite(view->pan_y);
+    }
+
+    /* Size the perspective camera from all eight bounds corners.  Framing
+       the rotated box instead of only its radius avoids clipping long, thin
+       models while keeping the familiar home orbit. */
+    if (preserve_orientation) {
+        /* A selection fit is a dolly/zoom operation, not an orbit.  Start
+           the projection measurement from neutral scale and pan while
+           retaining the user's current 3D camera axes and focal length. */
+        if (!cad_view_parameters_valid(view)) return 0;
+        view->zoom = 1.0;
+        view->pan_x = 0.0;
+        view->pan_y = 0.0;
+    } else {
+        cad_default_camera(view);
+    }
+    {
+        double min_vz = DBL_MAX;
+        double radius = hypot(hypot(max_x - min_x, max_y - min_y), max_z - min_z) * 0.5;
+        int corner;
+        for (corner = 0; corner < 8; ++corner) {
+            double x = (corner & 1) ? max_x : min_x;
+            double y = (corner & 2) ? max_y : min_y;
+            double z = (corner & 4) ? max_z : min_z;
+            double vx, vy, vz;
+            cad_rotate_to_view(view, x, y, z, &vx, &vy, &vz);
+            if (vz < min_vz) min_vz = vz;
+        }
+        if (radius < 1.0) radius = 1.0;
+        view->camera_distance = -min_vz + fmax(64.0, radius * 2.5);
+        if (!isfinite(view->camera_distance)) return 0;
+    }
+    {
+        double screen_min_x = DBL_MAX, screen_min_y = DBL_MAX;
+        double screen_max_x = -DBL_MAX, screen_max_y = -DBL_MAX;
+        int projected = 0;
+        int corner;
+        for (corner = 0; corner < 8; ++corner) {
+            double x = (corner & 1) ? max_x : min_x;
+            double y = (corner & 2) ? max_y : min_y;
+            double z = (corner & 4) ? max_z : min_z;
+            double sx, sy, depth;
+            if (!CadView_ProjectPointDepth(view, x, y, z, &sx, &sy, &depth,
+                                           viewport_w, viewport_h)) continue;
+            if (sx < screen_min_x) screen_min_x = sx;
+            if (sx > screen_max_x) screen_max_x = sx;
+            if (sy < screen_min_y) screen_min_y = sy;
+            if (sy > screen_max_y) screen_max_y = sy;
+            ++projected;
+        }
+        if (!projected) return 0;
+        span_x = screen_max_x - screen_min_x;
+        span_y = screen_max_y - screen_min_y;
+        if (span_x < 1e-9) span_x = 1.0;
+        if (span_y < 1e-9) span_y = 1.0;
+        CadView_SetZoom(view, fmin((double)viewport_w * padding / span_x,
+                                  (double)viewport_h * padding / span_y));
+
+        /* Projection is affine in zoom once camera distance is fixed. */
+        view->pan_x = -(((screen_min_x + screen_max_x) * 0.5 - viewport_w * 0.5) * view->zoom);
+        view->pan_y = (((screen_min_y + screen_max_y) * 0.5 - viewport_h * 0.5) * view->zoom);
+        return isfinite(view->pan_x) && isfinite(view->pan_y);
+    }
+}
+
+int CadView_FrameBounds(CadView* view,
+                        double min_x, double min_y, double min_z,
+                        double max_x, double max_y, double max_z,
+                        int viewport_w, int viewport_h)
+{
+    return cad_frame_bounds(view, min_x, min_y, min_z,
+                            max_x, max_y, max_z,
+                            viewport_w, viewport_h, 0);
+}
+
+int CadView_FrameBoundsPreserveOrientation(
+    CadView* view,
+    double min_x, double min_y, double min_z,
+    double max_x, double max_y, double max_z,
+    int viewport_w, int viewport_h)
+{
+    return cad_frame_bounds(view, min_x, min_y, min_z,
+                            max_x, max_y, max_z,
+                            viewport_w, viewport_h, 1);
+}
+
 void CadView_SetPalette(CadView* view, const uint8_t* rgba256x4)
 {
     if (!view || !rgba256x4) return;
@@ -534,7 +728,8 @@ static void cad_draw_3d_ground(const CadView* view, int width, int height)
     }
 }
 
-static int cad_collect_polygon(const CadView* view, const CadCore* core, int16_t index,
+static int cad_collect_polygon(const CadView* view,
+                               const CadViewGeometry* geometry, int16_t index,
                                ProjectedPolygon* projected, int width, int height)
 {
     const CadPolygon* polygon;
@@ -545,20 +740,23 @@ static int cad_collect_polygon(const CadView* view, const CadCore* core, int16_t
     double input_y[CAD_MAX_FACE_POINTS];
     double input_z[CAD_MAX_FACE_POINTS];
 
-    if (!cad_view_parameters_valid(view) || !core || !projected ||
+    if (!cad_view_parameters_valid(view) || !geometry || !geometry->data ||
+        !projected ||
         width <= 0 || height <= 0 || index < 0 || index >= CAD_MAX_POLYGONS) return 0;
-    polygon = &core->data.polygons[index];
+    polygon = &geometry->data->polygons[index];
     if (!polygon->flags || polygon->npoints < 2 || polygon->npoints > CAD_MAX_FACE_POINTS) return 0;
     point_index = polygon->firstPoint;
 
     while (point_index >= 0 && point_index < CAD_MAX_POINTS && count < polygon->npoints) {
-        const CadPoint* point = &core->data.points[point_index];
-        if (!point->flags) return 0;
+        const CadPoint* point = &geometry->data->points[point_index];
+        CadPosition position;
+        if (!cad_geometry_point(geometry, point_index, &position)) return 0;
         if (view->type == CAD_VIEW_3D) {
-            cad_rotate_to_view(view, point->pointx, point->pointy, point->pointz,
+            cad_rotate_to_view(view, position.x, position.y, position.z,
                                &input_x[count], &input_y[count], &input_z[count]);
         } else {
-            cad_orthographic_components(view->type, point->pointx, point->pointy, point->pointz,
+            cad_orthographic_components(view->type,
+                                        position.x, position.y, position.z,
                                         &input_x[count], &input_y[count], &input_z[count]);
         }
         if (!isfinite(input_x[count]) || !isfinite(input_y[count]) ||
@@ -651,7 +849,7 @@ static int cad_collect_polygon(const CadView* view, const CadCore* core, int16_t
     }
     projected->index = index;
     projected->depth = depth_mean;
-    projected->selected = CadCore_IsPolygonSelected(core, index);
+    projected->selected = cad_geometry_polygon_selected(geometry, index);
     return 1;
 }
 
@@ -719,6 +917,130 @@ static double cad_polygon_brightness(const ProjectedPolygon* polygon)
     dot = fabs(nx * 0.35 + ny * 0.55 + nz * 0.76);
     if (!isfinite(dot)) return 0.8;
     return 0.38 + dot * 0.62;
+}
+
+static int cad_points_coincident(const CadPosition* a, const CadPosition* b)
+{
+    const double epsilon = 1e-8;
+    double scale;
+    if (!a || !b) return 0;
+    scale = fmax(1.0, fmax(fabs(a->x), fabs(b->x)));
+    if (fabs(a->x - b->x) > epsilon * scale) return 0;
+    scale = fmax(1.0, fmax(fabs(a->y), fabs(b->y)));
+    if (fabs(a->y - b->y) > epsilon * scale) return 0;
+    scale = fmax(1.0, fmax(fabs(a->z), fabs(b->z)));
+    return fabs(a->z - b->z) <= epsilon * scale;
+}
+
+/* A reciprocal link by itself is not enough to suppress a face: malformed
+   files can contain stale links.  Only geometrically reversed, mutual pairs
+   participate in solid-mode side selection. */
+static int cad_polygons_form_reciprocal_pair(const CadViewGeometry* geometry,
+                                             int16_t first, int16_t second)
+{
+    int16_t first_points[CAD_MAX_FACE_POINTS];
+    int16_t second_points[CAD_MAX_FACE_POINTS];
+    const CadPolygon* a;
+    const CadPolygon* b;
+    int16_t point;
+    int i, offset;
+    if (!geometry || !geometry->data || first < 0 || second < 0 ||
+        first >= CAD_MAX_POLYGONS ||
+        second >= CAD_MAX_POLYGONS || first == second) return 0;
+    a = &geometry->data->polygons[first];
+    b = &geometry->data->polygons[second];
+    if (!a->flags || !b->flags || a->both != second || b->both != first ||
+        a->npoints < 3 || a->npoints != b->npoints ||
+        a->npoints > CAD_MAX_FACE_POINTS) return 0;
+    point = a->firstPoint;
+    for (i = 0; i < a->npoints; ++i) {
+        if (point < 0 || point >= CAD_MAX_POINTS ||
+            !geometry->data->points[point].flags) return 0;
+        first_points[i] = point;
+        point = geometry->data->points[point].nextPoint;
+    }
+    if (point != INVALID_INDEX) return 0;
+    point = b->firstPoint;
+    for (i = 0; i < b->npoints; ++i) {
+        if (point < 0 || point >= CAD_MAX_POINTS ||
+            !geometry->data->points[point].flags) return 0;
+        second_points[i] = point;
+        point = geometry->data->points[point].nextPoint;
+    }
+    if (point != INVALID_INDEX) return 0;
+
+    for (offset = 0; offset < a->npoints; ++offset) {
+        CadPosition first_position;
+        CadPosition second_position;
+        if (!cad_geometry_point(geometry, first_points[0], &first_position) ||
+            !cad_geometry_point(geometry, second_points[offset],
+                                &second_position) ||
+            !cad_points_coincident(&first_position, &second_position)) continue;
+        for (i = 1; i < a->npoints; ++i) {
+            int reverse = (offset - i + a->npoints) % a->npoints;
+            if (!cad_geometry_point(geometry, first_points[i],
+                                    &first_position) ||
+                !cad_geometry_point(geometry, second_points[reverse],
+                                    &second_position) ||
+                !cad_points_coincident(&first_position, &second_position)) break;
+        }
+        if (i == a->npoints) return 1;
+    }
+    return 0;
+}
+
+static double cad_projected_normal_z(const ProjectedPolygon* polygon)
+{
+    double ax, ay, bx, by;
+    if (!polygon || polygon->count < 3) return 0.0;
+    ax = polygon->vx[1] - polygon->vx[0];
+    ay = polygon->vy[1] - polygon->vy[0];
+    bx = polygon->vx[2] - polygon->vx[0];
+    by = polygon->vy[2] - polygon->vy[0];
+    return ax * by - ay * bx;
+}
+
+static double cad_geometry_camera_normal_z(const CadView* view,
+                                           const CadViewGeometry* geometry,
+                                           int16_t index,
+                                           const ProjectedPolygon* projected)
+{
+    if (view && geometry && geometry->pose && index >= 0 &&
+        index < CAD_MAX_POLYGONS &&
+        geometry->pose->faceNormalValid[index]) {
+        const CadPosition normal = geometry->pose->faceNormals[index];
+        double view_x, view_y, view_z;
+        cad_rotate_to_view(view, normal.x, normal.y, normal.z,
+                           &view_x, &view_y, &view_z);
+        if (isfinite(view_z)) return view_z;
+    }
+    return cad_projected_normal_z(projected);
+}
+
+static int cad_paired_member_is_hidden(const CadView* view,
+                                       const CadViewGeometry* geometry,
+                                       int16_t index,
+                                       const ProjectedPolygon* projected,
+                                       int width, int height)
+{
+    const int16_t pair = geometry && geometry->data && index >= 0 &&
+                         index < CAD_MAX_POLYGONS
+                         ? geometry->data->polygons[index].both : INVALID_INDEX;
+    ProjectedPolygon opposite;
+    double normal, opposite_normal;
+    if (!view || view->type != CAD_VIEW_3D || view->wireframe || !projected ||
+        !cad_polygons_form_reciprocal_pair(geometry, index, pair) ||
+        !cad_collect_polygon(view, geometry, pair, &opposite, width, height)) return 0;
+    normal = cad_geometry_camera_normal_z(view, geometry, index, projected);
+    opposite_normal = cad_geometry_camera_normal_z(view, geometry, pair,
+                                                    &opposite);
+    if (fabs(normal) <= 1e-10 || fabs(opposite_normal) <= 1e-10 ||
+        (normal < 0.0) == (opposite_normal < 0.0)) {
+        return index > pair;
+    }
+    /* Camera-space depth increases away from the camera, so a normal facing
+       toward it has a negative Z component. */
+    return normal >= 0.0;
 }
 
 static double cad_gl_depth(double camera_depth)
@@ -857,19 +1179,23 @@ static void cad_outline_projected(const ProjectedPolygon* polygon,
     glEnd();
 }
 
-void CadView_Render(const CadView* view, const CadCore* core,
-                    int pixel_x, int pixel_y, int pixel_w, int pixel_h,
-                    int framebuffer_h, int logical_w, int logical_h)
+static void cad_render_geometry(const CadView* view,
+                                const CadViewGeometry* geometry,
+                                int pixel_x, int pixel_y,
+                                int pixel_w, int pixel_h,
+                                int framebuffer_h,
+                                int logical_w, int logical_h)
 {
     ProjectedPolygon* polygons;
     uint8_t connected_points[CAD_MAX_POINTS];
+    uint8_t hidden_pair_member[CAD_MAX_POLYGONS];
     int polygon_count = 0;
     int i;
     const RG_Color background = { 250, 250, 248, 255 };
     const RG_Color edge = { 32, 61, 190, 255 };
     const RG_Color selected_edge = { 28, 150, 90, 255 };
 
-    if (!cad_view_parameters_valid(view) || !core ||
+    if (!cad_view_parameters_valid(view) || !geometry || !geometry->data ||
         pixel_w <= 0 || pixel_h <= 0 || logical_w <= 0 || logical_h <= 0) return;
     rg_set_viewport_tl(pixel_x, pixel_y, pixel_w, pixel_h, framebuffer_h, logical_w, logical_h);
     glDisable(GL_DEPTH_TEST);
@@ -885,20 +1211,22 @@ void CadView_Render(const CadView* view, const CadCore* core,
 
     polygons = cad_polygon_scratch;
     memset(connected_points, 0, sizeof(connected_points));
-    for (i = 0; i < core->data.polygonCount && i < CAD_MAX_POLYGONS; ++i) {
-        const CadPolygon* source = &core->data.polygons[i];
+    memset(hidden_pair_member, 0, sizeof(hidden_pair_member));
+    for (i = 0; i < geometry->data->polygonCount && i < CAD_MAX_POLYGONS; ++i) {
+        const CadPolygon* source = &geometry->data->polygons[i];
         int16_t point;
         int step;
         if (source->flags) {
             point = source->firstPoint;
             for (step = 0; step < source->npoints &&
                            point >= 0 && point < CAD_MAX_POINTS; ++step) {
-                if (!core->data.points[point].flags) break;
+                if (!geometry->data->points[point].flags) break;
                 connected_points[point] = 1;
-                point = core->data.points[point].nextPoint;
+                point = geometry->data->points[point].nextPoint;
             }
         }
-        if (cad_collect_polygon(view, core, (int16_t)i, &polygons[polygon_count],
+        if (cad_collect_polygon(view, geometry, (int16_t)i,
+                                &polygons[polygon_count],
                                 logical_w, logical_h)) {
             ++polygon_count;
         }
@@ -908,13 +1236,31 @@ void CadView_Render(const CadView* view, const CadCore* core,
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         glDepthMask(GL_TRUE);
+
+        if (!view->wireframe)
+            for (i = 0; i < polygon_count; ++i)
+                hidden_pair_member[polygons[i].index] = (uint8_t)cad_paired_member_is_hidden(
+                    view, geometry, polygons[i].index, &polygons[i],
+                    logical_w, logical_h);
     }
 
     for (i = 0; i < polygon_count; ++i) {
-        const CadPolygon* source = &core->data.polygons[polygons[i].index];
-        RG_Color line_color = polygons[i].selected ? selected_edge : edge;
+        const CadPolygon* source = &geometry->data->polygons[polygons[i].index];
+        int selected = polygons[i].selected;
+        RG_Color line_color;
+        if (hidden_pair_member[polygons[i].index]) continue;
+        if (view->type == CAD_VIEW_3D && !view->wireframe && source->both >= 0 &&
+            source->both < CAD_MAX_POLYGONS &&
+            cad_polygons_form_reciprocal_pair(geometry, polygons[i].index,
+                                              source->both)) {
+            selected |= cad_geometry_polygon_selected(geometry, source->both);
+        }
+        line_color = selected ? selected_edge
+                              : polygons[i].count == 2
+                                ? cad_index_color(view, source->color, 1.0)
+                                : edge;
         if (view->type == CAD_VIEW_3D && !view->wireframe && polygons[i].count >= 3) {
-            RG_Color fill = polygons[i].selected
+            RG_Color fill = selected
                 ? (RG_Color){ 92, 190, 138, 255 }
                 : cad_index_color(view, source->color, cad_polygon_brightness(&polygons[i]));
             cad_fill_projected(&polygons[i], fill);
@@ -927,17 +1273,20 @@ void CadView_Render(const CadView* view, const CadCore* core,
        when the selected point lies behind a shaded face. */
     glDisable(GL_DEPTH_TEST);
 
-    for (i = 0; i < core->data.pointCount && i < CAD_MAX_POINTS; ++i) {
-        const CadPoint* point = &core->data.points[i];
+    for (i = 0; i < geometry->data->pointCount && i < CAD_MAX_POINTS; ++i) {
+        const CadPoint* point = &geometry->data->points[i];
+        CadPosition position;
         int selected, connected;
         int screen_x, screen_y;
         double x, y, depth;
         RG_Color color;
         if (!point->flags) continue;
-        selected = CadCore_IsPointSelected(core, (int16_t)i);
+        selected = cad_geometry_point_selected(geometry, (int16_t)i);
         connected = connected_points[i] != 0;
         if (!selected && connected) continue;
-        if (!CadView_ProjectPointDepth(view, point->pointx, point->pointy, point->pointz,
+        if (!cad_geometry_point(geometry, (int16_t)i, &position)) continue;
+        if (!CadView_ProjectPointDepth(view,
+                                       position.x, position.y, position.z,
                                        &x, &y, &depth, logical_w, logical_h)) continue;
         if (!cad_round_screen_coordinate(x, &screen_x) ||
             !cad_round_screen_coordinate(y, &screen_y)) continue;
@@ -946,11 +1295,32 @@ void CadView_Render(const CadView* view, const CadCore* core,
     }
 }
 
-int16_t CadView_FindNearestPoint(const CadView* view, const CadCore* core,
-                                 int screen_x, int screen_y,
-                                 int viewport_x, int viewport_y,
-                                 int viewport_w, int viewport_h,
-                                 int threshold_pixels)
+void CadView_Render(const CadView* view, const CadCore* core,
+                    int pixel_x, int pixel_y, int pixel_w, int pixel_h,
+                    int framebuffer_h, int logical_w, int logical_h)
+{
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_core(core, &geometry)) return;
+    cad_render_geometry(view, &geometry, pixel_x, pixel_y, pixel_w, pixel_h,
+                        framebuffer_h, logical_w, logical_h);
+}
+
+void CadView_RenderScene(const CadView* view, const CadScene* scene,
+                         int pixel_x, int pixel_y, int pixel_w, int pixel_h,
+                         int framebuffer_h, int logical_w, int logical_h)
+{
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_scene(scene, &geometry)) return;
+    cad_render_geometry(view, &geometry, pixel_x, pixel_y, pixel_w, pixel_h,
+                        framebuffer_h, logical_w, logical_h);
+}
+
+static int16_t cad_find_nearest_point(const CadView* view,
+                                      const CadViewGeometry* geometry,
+                                      int screen_x, int screen_y,
+                                      int viewport_x, int viewport_y,
+                                      int viewport_w, int viewport_h,
+                                      int threshold_pixels)
 {
     int16_t nearest = -1;
     double best = (double)threshold_pixels * threshold_pixels;
@@ -958,13 +1328,15 @@ int16_t CadView_FindNearestPoint(const CadView* view, const CadCore* core,
     int i;
     int local_x = screen_x - viewport_x;
     int local_y = screen_y - viewport_y;
-    if (!view || !core || local_x < 0 || local_y < 0 || local_x >= viewport_w || local_y >= viewport_h) return -1;
+    if (!view || !geometry || !geometry->data || local_x < 0 || local_y < 0 ||
+        local_x >= viewport_w || local_y >= viewport_h) return -1;
 
-    for (i = 0; i < core->data.pointCount && i < CAD_MAX_POINTS; ++i) {
-        const CadPoint* point = &core->data.points[i];
+    for (i = 0; i < geometry->data->pointCount && i < CAD_MAX_POINTS; ++i) {
+        CadPosition position;
         double x, y, depth, dx, dy, distance;
-        if (!point->flags) continue;
-        if (!CadView_ProjectPointDepth(view, point->pointx, point->pointy, point->pointz,
+        if (!cad_geometry_point(geometry, (int16_t)i, &position)) continue;
+        if (!CadView_ProjectPointDepth(view,
+                                       position.x, position.y, position.z,
                                        &x, &y, &depth, viewport_w, viewport_h)) continue;
         dx = local_x - x;
         dy = local_y - y;
@@ -979,6 +1351,68 @@ int16_t CadView_FindNearestPoint(const CadView* view, const CadCore* core,
     return nearest;
 }
 
+int16_t CadView_FindNearestPoint(const CadView* view, const CadCore* core,
+                                 int screen_x, int screen_y,
+                                 int viewport_x, int viewport_y,
+                                 int viewport_w, int viewport_h,
+                                 int threshold_pixels)
+{
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_core(core, &geometry)) return -1;
+    return cad_find_nearest_point(view, &geometry, screen_x, screen_y,
+                                  viewport_x, viewport_y,
+                                  viewport_w, viewport_h, threshold_pixels);
+}
+
+int16_t CadView_FindNearestScenePoint(const CadView* view,
+                                      const CadScene* scene,
+                                      int screen_x, int screen_y,
+                                      int viewport_x, int viewport_y,
+                                      int viewport_w, int viewport_h,
+                                      int threshold_pixels)
+{
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_scene(scene, &geometry)) return -1;
+    return cad_find_nearest_point(view, &geometry, screen_x, screen_y,
+                                  viewport_x, viewport_y,
+                                  viewport_w, viewport_h, threshold_pixels);
+}
+
+static int cad_find_points_at_location(const CadView* view,
+                                       const CadViewGeometry* geometry,
+                                       int screen_x, int screen_y,
+                                       int viewport_x, int viewport_y,
+                                       int viewport_w, int viewport_h,
+                                       int threshold_pixels,
+                                       double world_threshold,
+                                       int16_t* out_indices, int max_count)
+{
+    int16_t nearest;
+    CadPosition reference;
+    int count = 0;
+    int i;
+    if (!view || !geometry || !geometry->data || !out_indices || max_count <= 0 ||
+        !isfinite(world_threshold) || world_threshold < 0.0) return 0;
+    nearest = cad_find_nearest_point(view, geometry, screen_x, screen_y,
+                                     viewport_x, viewport_y,
+                                     viewport_w, viewport_h,
+                                     threshold_pixels);
+    if (nearest < 0 || !cad_geometry_point(geometry, nearest, &reference)) return 0;
+    for (i = 0; i < geometry->data->pointCount && i < CAD_MAX_POINTS &&
+                    count < max_count; ++i) {
+        CadPosition position;
+        double dx, dy, dz;
+        if (!cad_geometry_point(geometry, (int16_t)i, &position)) continue;
+        dx = position.x - reference.x;
+        dy = position.y - reference.y;
+        dz = position.z - reference.z;
+        if (dx * dx + dy * dy + dz * dz <= world_threshold * world_threshold) {
+            out_indices[count++] = (int16_t)i;
+        }
+    }
+    return count;
+}
+
 int CadView_FindPointsAtLocation(const CadView* view, const CadCore* core,
                                  int screen_x, int screen_y,
                                  int viewport_x, int viewport_y,
@@ -987,28 +1421,31 @@ int CadView_FindPointsAtLocation(const CadView* view, const CadCore* core,
                                  double world_threshold,
                                  int16_t* out_indices, int max_count)
 {
-    int16_t nearest;
-    const CadPoint* reference;
-    int count = 0;
-    int i;
-    if (!view || !core || !out_indices || max_count <= 0) return 0;
-    nearest = CadView_FindNearestPoint(view, core, screen_x, screen_y,
-                                       viewport_x, viewport_y, viewport_w, viewport_h,
-                                       threshold_pixels);
-    if (nearest < 0) return 0;
-    reference = &core->data.points[nearest];
-    for (i = 0; i < core->data.pointCount && i < CAD_MAX_POINTS && count < max_count; ++i) {
-        const CadPoint* point = &core->data.points[i];
-        double dx, dy, dz;
-        if (!point->flags) continue;
-        dx = point->pointx - reference->pointx;
-        dy = point->pointy - reference->pointy;
-        dz = point->pointz - reference->pointz;
-        if (dx * dx + dy * dy + dz * dz <= world_threshold * world_threshold) {
-            out_indices[count++] = (int16_t)i;
-        }
-    }
-    return count;
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_core(core, &geometry)) return 0;
+    return cad_find_points_at_location(view, &geometry, screen_x, screen_y,
+                                       viewport_x, viewport_y,
+                                       viewport_w, viewport_h,
+                                       threshold_pixels, world_threshold,
+                                       out_indices, max_count);
+}
+
+int CadView_FindScenePointsAtLocation(const CadView* view,
+                                      const CadScene* scene,
+                                      int screen_x, int screen_y,
+                                      int viewport_x, int viewport_y,
+                                      int viewport_w, int viewport_h,
+                                      int threshold_pixels,
+                                      double world_threshold,
+                                      int16_t* out_indices, int max_count)
+{
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_scene(scene, &geometry)) return 0;
+    return cad_find_points_at_location(view, &geometry, screen_x, screen_y,
+                                       viewport_x, viewport_y,
+                                       viewport_w, viewport_h,
+                                       threshold_pixels, world_threshold,
+                                       out_indices, max_count);
 }
 
 static double cad_segment_distance_sq(double px, double py, double ax, double ay,
@@ -1032,6 +1469,116 @@ static double cad_segment_distance_sq(double px, double py, double ax, double ay
     return dx * dx + dy * dy;
 }
 
+/* Evaluate the surface depth at the cursor instead of using the face's mean
+   vertex depth.  Orthographic depth is affine in screen space; perspective
+   reciprocal depth is affine.  Any non-degenerate projected triangle on a
+   validated coplanar face therefore describes the entire face plane, even
+   when the cursor lies in a different part of a concave polygon. */
+static int cad_projected_depth_at_point(const CadView* view,
+                                        const ProjectedPolygon* polygon,
+                                        double x, double y,
+                                        double* out_depth)
+{
+    if (!view || !polygon || !out_depth || polygon->count < 2 ||
+        !isfinite(x) || !isfinite(y)) return 0;
+
+    if (polygon->count == 2) {
+        const double dx = polygon->x[1] - polygon->x[0];
+        const double dy = polygon->y[1] - polygon->y[0];
+        const double length_sq = dx * dx + dy * dy;
+        double t = 0.0;
+        double depth;
+        if (isfinite(length_sq) && length_sq > 1e-12) {
+            t = ((x - polygon->x[0]) * dx +
+                 (y - polygon->y[0]) * dy) / length_sq;
+            if (!isfinite(t)) return 0;
+            if (t < 0.0) t = 0.0;
+            if (t > 1.0) t = 1.0;
+        }
+        if (view->type == CAD_VIEW_3D) {
+            const double reciprocal =
+                (1.0 - t) / polygon->camera_depth[0] +
+                t / polygon->camera_depth[1];
+            if (!isfinite(reciprocal) || reciprocal <= 0.0) return 0;
+            depth = 1.0 / reciprocal;
+        } else if (!cad_lerp_finite(polygon->camera_depth[0],
+                                    polygon->camera_depth[1], t, &depth)) {
+            return 0;
+        }
+        if (!isfinite(depth)) return 0;
+        *out_depth = depth;
+        return 1;
+    }
+
+    {
+        int second = -1;
+        int third = -1;
+        double denominator = 0.0;
+        double largest_area = 0.0;
+        double first_weight, second_weight, third_weight;
+        double depth;
+
+        /* Locate the most stable triangle that includes vertex zero. */
+        for (int b = 1; b + 1 < polygon->count; ++b) {
+            for (int c = b + 1; c < polygon->count; ++c) {
+                const double area =
+                    (polygon->y[b] - polygon->y[c]) *
+                        (polygon->x[0] - polygon->x[c]) +
+                    (polygon->x[c] - polygon->x[b]) *
+                        (polygon->y[0] - polygon->y[c]);
+                if (isfinite(area) && fabs(area) > largest_area) {
+                    largest_area = fabs(area);
+                    denominator = area;
+                    second = b;
+                    third = c;
+                }
+            }
+        }
+        if (second < 0 || third < 0 || largest_area <= 1e-12) return 0;
+
+        first_weight =
+            ((polygon->y[second] - polygon->y[third]) *
+                 (x - polygon->x[third]) +
+             (polygon->x[third] - polygon->x[second]) *
+                 (y - polygon->y[third])) / denominator;
+        second_weight =
+            ((polygon->y[third] - polygon->y[0]) *
+                 (x - polygon->x[third]) +
+             (polygon->x[0] - polygon->x[third]) *
+                 (y - polygon->y[third])) / denominator;
+        third_weight = 1.0 - first_weight - second_weight;
+        if (!isfinite(first_weight) || !isfinite(second_weight) ||
+            !isfinite(third_weight)) return 0;
+
+        if (view->type == CAD_VIEW_3D) {
+            const double reciprocal =
+                first_weight / polygon->camera_depth[0] +
+                second_weight / polygon->camera_depth[second] +
+                third_weight / polygon->camera_depth[third];
+            if (!isfinite(reciprocal) || reciprocal <= 0.0) return 0;
+            depth = 1.0 / reciprocal;
+        } else {
+            const double scale = fmax(
+                fabs(polygon->camera_depth[0]),
+                fmax(fabs(polygon->camera_depth[second]),
+                     fabs(polygon->camera_depth[third])));
+            if (!isfinite(scale)) return 0;
+            if (scale == 0.0) {
+                depth = 0.0;
+            } else {
+                depth = (first_weight * (polygon->camera_depth[0] / scale) +
+                         second_weight *
+                             (polygon->camera_depth[second] / scale) +
+                         third_weight *
+                             (polygon->camera_depth[third] / scale)) * scale;
+            }
+        }
+        if (!isfinite(depth)) return 0;
+        *out_depth = depth;
+        return 1;
+    }
+}
+
 static int cad_point_in_polygon(double x, double y, const ProjectedPolygon* polygon)
 {
     int inside = 0;
@@ -1047,11 +1594,12 @@ static int cad_point_in_polygon(double x, double y, const ProjectedPolygon* poly
     return inside;
 }
 
-int16_t CadView_FindNearestPolygon(const CadView* view, const CadCore* core,
-                                   int screen_x, int screen_y,
-                                   int viewport_x, int viewport_y,
-                                   int viewport_w, int viewport_h,
-                                   int threshold_pixels)
+static int16_t cad_find_nearest_polygon(const CadView* view,
+                                        const CadViewGeometry* geometry,
+                                        int screen_x, int screen_y,
+                                        int viewport_x, int viewport_y,
+                                        int viewport_w, int viewport_h,
+                                        int threshold_pixels)
 {
     const double threshold_sq = (double)threshold_pixels * threshold_pixels;
     double best = threshold_sq;
@@ -1060,12 +1608,17 @@ int16_t CadView_FindNearestPolygon(const CadView* view, const CadCore* core,
     int local_x = screen_x - viewport_x;
     int local_y = screen_y - viewport_y;
     int i;
-    if (!view || !core || local_x < 0 || local_y < 0 || local_x >= viewport_w || local_y >= viewport_h) return -1;
-    for (i = 0; i < core->data.polygonCount && i < CAD_MAX_POLYGONS; ++i) {
+    if (!view || !geometry || !geometry->data || local_x < 0 || local_y < 0 ||
+        local_x >= viewport_w || local_y >= viewport_h) return -1;
+    for (i = 0; i < geometry->data->polygonCount && i < CAD_MAX_POLYGONS; ++i) {
         ProjectedPolygon polygon;
         double distance = HUGE_VAL;
+        double hit_depth;
         int edge_index;
-        if (!cad_collect_polygon(view, core, (int16_t)i, &polygon, viewport_w, viewport_h)) continue;
+        if (!cad_collect_polygon(view, geometry, (int16_t)i, &polygon,
+                                 viewport_w, viewport_h)) continue;
+        if (cad_paired_member_is_hidden(view, geometry, (int16_t)i, &polygon,
+                                        viewport_w, viewport_h)) continue;
         if (polygon.count >= 3 && cad_point_in_polygon(local_x, local_y, &polygon)) {
             distance = 0.0;
         } else {
@@ -1078,16 +1631,49 @@ int16_t CadView_FindNearestPolygon(const CadView* view, const CadCore* core,
                 if (polygon.count == 2) break;
             }
         }
+        hit_depth = polygon.depth;
+        if (distance <= threshold_sq)
+            (void)cad_projected_depth_at_point(view, &polygon,
+                                               local_x, local_y, &hit_depth);
         if (distance <= threshold_sq &&
-            (distance < best - 1e-9 ||
-             (fabs(distance - best) <= 1e-9 &&
-              polygon.depth < best_depth))) {
+            (nearest == -1 || hit_depth < best_depth - 1e-9 ||
+             (fabs(hit_depth - best_depth) <= 1e-9 &&
+              distance < best - 1e-9))) {
             best = distance;
-            best_depth = polygon.depth;
+            best_depth = hit_depth;
             nearest = (int16_t)i;
         }
     }
     return nearest;
+}
+
+int16_t CadView_FindNearestPolygon(const CadView* view, const CadCore* core,
+                                   int screen_x, int screen_y,
+                                   int viewport_x, int viewport_y,
+                                   int viewport_w, int viewport_h,
+                                   int threshold_pixels)
+{
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_core(core, &geometry)) return -1;
+    return cad_find_nearest_polygon(view, &geometry, screen_x, screen_y,
+                                    viewport_x, viewport_y,
+                                    viewport_w, viewport_h,
+                                    threshold_pixels);
+}
+
+int16_t CadView_FindNearestScenePolygon(const CadView* view,
+                                        const CadScene* scene,
+                                        int screen_x, int screen_y,
+                                        int viewport_x, int viewport_y,
+                                        int viewport_w, int viewport_h,
+                                        int threshold_pixels)
+{
+    CadViewGeometry geometry;
+    if (!cad_geometry_from_scene(scene, &geometry)) return -1;
+    return cad_find_nearest_polygon(view, &geometry, screen_x, screen_y,
+                                    viewport_x, viewport_y,
+                                    viewport_w, viewport_h,
+                                    threshold_pixels);
 }
 
 void CadView_UnprojectPoint(const CadView* view, int screen_x, int screen_y,

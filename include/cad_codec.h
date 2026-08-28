@@ -18,7 +18,9 @@ extern "C" {
 typedef enum CadFormat {
     CAD_FORMAT_AUTO = 0,
     CAD_FORMAT_X11_STREAM,
-    CAD_FORMAT_LEGACY_PACKED
+    CAD_FORMAT_LEGACY_PACKED,
+    CAD_FORMAT_ANM_3DAN,
+    CAD_FORMAT_ANM_3DGI
 } CadFormat;
 
 typedef enum CadStatus {
@@ -91,13 +93,6 @@ CadResult CadCodec_Encode(const CadFileData* data, CadFormat format,
 void CadCodec_FreeBuffer(void* buffer);
 
 CadResult CadCodec_Validate(const CadFileData* data);
-
-/* UTF-8 path helpers used by CadDocument and the compatibility CadFile API. */
-CadResult CadCodec_LoadPath(const char* utf8Path, CadFormat requestedFormat,
-                            CadFileData* output);
-CadResult CadCodec_SavePathAtomic(const char* utf8Path,
-                                  const CadFileData* data,
-                                  CadFormat format);
 
 #ifdef __cplusplus
 }

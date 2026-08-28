@@ -1171,6 +1171,94 @@ int CadCore_ArePointsMerged(CadCore* core) {
     return 1; /* No duplicate points found */
 }
 
+static int points_share_grid_position(const CadPoint* first,
+                                      const CadPoint* second) {
+    return first && second &&
+           convert_coordinate(first->pointx) ==
+               convert_coordinate(second->pointx) &&
+           convert_coordinate(first->pointy) ==
+               convert_coordinate(second->pointy) &&
+           convert_coordinate(first->pointz) ==
+               convert_coordinate(second->pointz);
+}
+
+int CadCore_MergePolygonPoints(CadCore* core) {
+    int removed = 0;
+    int polygonIndex;
+    if (!core) return 0;
+    for (polygonIndex = 0;
+         polygonIndex < core->data.polygonCount &&
+         polygonIndex < CAD_MAX_POLYGONS;
+         ++polygonIndex) {
+        CadPolygon* polygon = &core->data.polygons[polygonIndex];
+        int16_t chain[CAD_MAX_FACE_POINTS];
+        int16_t kept[CAD_MAX_FACE_POINTS];
+        uint8_t keepMask[CAD_MAX_FACE_POINTS];
+        int count = 0;
+        int keptCount = 0;
+        int16_t current;
+        int index;
+        if (!polygon->flags || polygon->npoints < CAD_MIN_FACE_POINTS ||
+            polygon->npoints > CAD_MAX_FACE_POINTS) continue;
+        memset(keepMask, 0, sizeof(keepMask));
+        current = polygon->firstPoint;
+        while (current != INVALID_INDEX && count < polygon->npoints) {
+            if (current < 0 || current >= CAD_MAX_POINTS ||
+                !core->data.points[current].flags) break;
+            chain[count++] = current;
+            current = core->data.points[current].nextPoint;
+        }
+        if (count != polygon->npoints || current != INVALID_INDEX) continue;
+
+        for (index = 0; index < count; ++index) {
+            if (keptCount > 0 &&
+                points_share_grid_position(
+                    &core->data.points[kept[keptCount - 1]],
+                    &core->data.points[chain[index]]))
+                continue;
+            kept[keptCount++] = chain[index];
+            keepMask[index] = 1;
+        }
+        if (keptCount > 1 &&
+            points_share_grid_position(&core->data.points[kept[0]],
+                                       &core->data.points[kept[keptCount - 1]])) {
+            int16_t closing = kept[--keptCount];
+            for (index = count - 1; index >= 0; --index) {
+                if (chain[index] == closing && keepMask[index]) {
+                    keepMask[index] = 0;
+                    break;
+                }
+            }
+        }
+        if (keptCount == count) continue;
+        if (keptCount < CAD_MIN_FACE_POINTS) {
+            removed += count;
+            CadCore_DeletePolygon(core, (int16_t)polygonIndex);
+            continue;
+        }
+        polygon = &core->data.polygons[polygonIndex];
+        polygon->firstPoint = kept[0];
+        polygon->npoints = (uint8_t)keptCount;
+        for (index = 0; index < keptCount; ++index)
+            core->data.points[kept[index]].nextPoint =
+                index + 1 < keptCount ? kept[index + 1] : INVALID_INDEX;
+        for (index = 0; index < count; ++index) {
+            CadPoint* point;
+            if (keepMask[index]) continue;
+            point = &core->data.points[chain[index]];
+            CadCore_DeselectPoint(core, chain[index]);
+            memset(point, 0, sizeof(*point));
+            point->nextPoint = INVALID_INDEX;
+            ++removed;
+        }
+    }
+    if (removed) {
+        CadCore_RebuildDerivedState(core);
+        core->isDirty = 1;
+    }
+    return removed;
+}
+
 /* Check if all merge operations have been applied */
 int CadCore_IsFullyMerged(CadCore* core) {
     if (!core) return 0;

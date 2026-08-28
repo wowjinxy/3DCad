@@ -159,6 +159,11 @@ int CadCore_AreCoordinatesMerged(CadCore* core);
 /* Check if points are merged (no duplicate points at same grid location) */
 int CadCore_ArePointsMerged(CadCore* core);
 
+/* Remove consecutive and closing linked-chain vertices that resolve to the
+   same recovered integer grid position. Polygons reduced below the recovered
+   two-point minimum are removed. Returns the number of point records removed. */
+int CadCore_MergePolygonPoints(CadCore* core);
+
 /* Check if all merge operations have been applied */
 int CadCore_IsFullyMerged(CadCore* core);
 

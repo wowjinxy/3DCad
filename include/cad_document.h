@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 #define CAD_DOCUMENT_HISTORY_LIMIT 64
+#define CAD_DOCUMENT_HISTORY_LABEL_CAPACITY 64
 #define CAD_COLOR_DATA_SIZE 0x200
 #define CAD_PALETTE_DATA_SIZE 0x8200
 
@@ -23,6 +24,10 @@ typedef struct CadRgba {
     uint8_t a;
 } CadRgba;
 
+struct CadDocument;
+typedef CadResult (*CadDocumentEditCallback)(struct CadDocument* document,
+                                             void* userData);
+
 typedef struct CadDocument {
     CadCore core;
 
@@ -33,6 +38,11 @@ typedef struct CadDocument {
     char* lastImportPath;
     char* lastExportPath;
     char* paletteSourcePath;
+    /* Retained only for a validated native X11 load.  An unchanged document
+       can therefore be saved byte-for-byte, including recovered fields that
+       have no editable in-memory representation. */
+    uint8_t* originalNativeBytes;
+    size_t originalNativeByteCount;
     CadFormat sourceFormat;
     int isDirty;
 
@@ -55,15 +65,25 @@ typedef struct CadDocument {
     unsigned historyCount;
     unsigned historyCursor;
     CadDocumentSnapshot* transactionBefore;
+    char transactionLabel[CAD_DOCUMENT_HISTORY_LABEL_CAPACITY];
 } CadDocument;
 
 void CadDocument_Init(CadDocument* document);
 void CadDocument_Destroy(CadDocument* document);
 void CadDocument_New(CadDocument* document);
+/* Retains the current content and history, but detaches it from model source,
+   import/export, and save destinations.  The result always requires a native
+   Save As and remains dirty across undo/redo. */
+void CadDocument_MakeUnnamed(CadDocument* document);
 
 /* Transactional replacement.  Legacy packed inputs remain unnamed and dirty
    so a later-X11 Save As is required; their path is retained as import origin. */
 CadResult CadDocument_Load(CadDocument* document, const char* utf8Path);
+CadResult CadDocument_ImportAnm(CadDocument* document,
+                                const char* utf8Path);
+CadResult CadDocument_ExportAnm(CadDocument* document,
+                                const char* utf8Path,
+                                CadFormat format);
 CadResult CadDocument_Save(CadDocument* document, const char* utf8Path);
 CadResult CadDocument_SaveCurrent(CadDocument* document);
 
@@ -73,12 +93,21 @@ int CadDocument_HasAnimation(const CadDocument* document);
 /* Begin/commit brackets one user gesture (including a whole pointer drag).
    Cancel restores the exact pre-gesture document. */
 CadResult CadDocument_BeginEdit(CadDocument* document);
+CadResult CadDocument_BeginEditNamed(CadDocument* document,
+                                     const char* label);
+/* Runs any number of core mutations as one named, validated history entry.
+   Callback failure or final validation failure restores the exact snapshot. */
+CadResult CadDocument_ApplyEdit(CadDocument* document, const char* label,
+                                CadDocumentEditCallback callback,
+                                void* userData);
 CadResult CadDocument_CommitEdit(CadDocument* document);
 void CadDocument_CancelEdit(CadDocument* document);
 int CadDocument_CanUndo(const CadDocument* document);
 int CadDocument_CanRedo(const CadDocument* document);
 CadResult CadDocument_Undo(CadDocument* document);
 CadResult CadDocument_Redo(CadDocument* document);
+const char* CadDocument_GetUndoLabel(const CadDocument* document);
+const char* CadDocument_GetRedoLabel(const CadDocument* document);
 void CadDocument_ClearHistory(CadDocument* document);
 
 /* Paths are copied, never borrowed. */

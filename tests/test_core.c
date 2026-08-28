@@ -1,3 +1,5 @@
+#define _CRT_SECURE_NO_WARNINGS
+
 #include "cad_codec.h"
 #include "cad_core.h"
 #include "cad_document.h"
@@ -60,6 +62,29 @@ static int write_test_file(const char* path, const void* bytes, size_t size) {
     return ok;
 }
 
+static uint8_t* read_test_file(const char* path, size_t* size) {
+    FILE* file;
+    long length;
+    uint8_t* bytes;
+    if (size) *size = 0;
+    file = fopen(path, "rb");
+    if (!file) return NULL;
+    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 ||
+        fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    bytes = (uint8_t*)malloc((size_t)length ? (size_t)length : 1);
+    if (!bytes || fread(bytes, 1, (size_t)length, file) != (size_t)length) {
+        free(bytes);
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+    if (size) *size = (size_t)length;
+    return bytes;
+}
+
 static void test_later_animation_round_trip(void) {
     CadCore core;
     CadFileData* decoded;
@@ -71,6 +96,7 @@ static void test_later_animation_round_trip(void) {
     CadCore_Init(&core);
     polygon = append_triangle(&core, 0.0, 255);
     CHECK(polygon == 0);
+    core.data.polygons[polygon].side = 5;
     core.data.objects[0].selectFlag = 1;
     core.data.polygons[polygon].selectFlag = 1;
     core.data.points[0].selectFlag = 1;
@@ -90,9 +116,27 @@ static void test_later_animation_round_trip(void) {
     }
     core.data.animationPointCount = 3;
 
+    /* Native streams can contain authoring records that are not attached to
+       a face.  They are inspected as non-editable but must survive a native
+       decode/encode cycle without reinterpretation. */
+    core.data.animationIndices[1].flags = 3;
+    for (frame = 0; frame < CAD_ANIMATION_FRAMES; ++frame)
+        core.data.animationIndices[1].frame[frame] = -1;
+    core.data.animationIndices[1].frame[0] = 3;
+    core.data.animationIndexCount = 2;
+    for (frame = 3; frame < 5; ++frame) {
+        core.data.animationPoints[frame].flags = 4;
+        core.data.animationPoints[frame].nextPoint =
+            (int16_t)(frame == 4 ? -1 : frame + 1);
+        core.data.animationPoints[frame].pointx = 40.0 + frame;
+        core.data.animationPoints[frame].pointy = 50.0 + frame;
+        core.data.animationPoints[frame].pointz = 60.0 + frame;
+    }
+    core.data.animationPointCount = 5;
+
     result = CadCodec_Encode(&core.data, CAD_FORMAT_X11_STREAM, &bytes, &size);
     CHECK(CadResult_IsSuccess(&result));
-    CHECK(size == (size_t)(43 + 17 + 3 * 35 + 133 + 3 * 35));
+    CHECK(size == (size_t)(43 + 17 + 3 * 35 + 2 * 133 + 5 * 35));
     decoded = (CadFileData*)malloc(sizeof(*decoded));
     CHECK(decoded != NULL);
     if (decoded && bytes) {
@@ -100,6 +144,7 @@ static void test_later_animation_round_trip(void) {
         CHECK(CadResult_IsSuccess(&result));
         CHECK(result.format == CAD_FORMAT_X11_STREAM);
         CHECK(decoded->polygons[0].color == 255);
+        CHECK(decoded->polygons[0].side == 5);
         CHECK(decoded->objects[0].selectFlag == 0);
         CHECK(decoded->polygons[0].selectFlag == 0);
         CHECK(decoded->points[0].selectFlag == 0);
@@ -111,6 +156,12 @@ static void test_later_animation_round_trip(void) {
         CHECK(fabs(decoded->animationPoints[0].pointy + 2.5) < 1e-12);
         CHECK(decoded->animationPoints[0].nextPoint == 1);
         CHECK(decoded->animationPoints[2].nextPoint == -1);
+        CHECK(decoded->animationIndices[1].flags == 3);
+        CHECK(decoded->animationIndices[1].frame[0] == 3);
+        CHECK(decoded->animationIndices[1].frame[1] == -1);
+        CHECK(decoded->animationPoints[3].flags == 4);
+        CHECK(decoded->animationPoints[3].nextPoint == 4);
+        CHECK(fabs(decoded->animationPoints[4].pointz - 64.0) < 1e-12);
         decoded->animationPoints[1].nextPoint = -1;
         result = CadCodec_Validate(decoded);
         CHECK(!CadResult_IsSuccess(&result));
@@ -168,6 +219,48 @@ static size_t make_legacy_triangle(uint8_t* bytes, size_t capacity) {
     return p;
 }
 
+static size_t make_legacy_collinear_leading_face(uint8_t* bytes,
+                                                 size_t capacity) {
+    static const double xyz[5][3] = {
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {2.0, 0.0, 0.0},
+        {2.0, -2.0, 0.0}, {0.0, -2.0, 0.0}
+    };
+    const size_t required = 2 + CAD_LEGACY_OBJECT_PAYLOAD_SIZE +
+                            2 + CAD_LEGACY_POLYGON_PAYLOAD_SIZE +
+                            5 * (2 + CAD_LEGACY_POINT_PAYLOAD_SIZE);
+    size_t p = 0;
+    int i;
+    if (capacity < required) return 0;
+    memset(bytes, 0, capacity);
+
+    be16(bytes + p, 0x0000); p += 2;
+    bytes[p] = 1;
+    be16(bytes + p + 2, -1);
+    be16(bytes + p + 4, -1);
+    be16(bytes + p + 6, -1);
+    be16(bytes + p + 8, 0);
+    p += CAD_LEGACY_OBJECT_PAYLOAD_SIZE;
+
+    be16(bytes + p, 0x4000); p += 2;
+    bytes[p] = 1;
+    be16(bytes + p + 2, -1);
+    be16(bytes + p + 4, 0);
+    bytes[p + 6] = 9;
+    bytes[p + 7] = 5;
+    p += CAD_LEGACY_POLYGON_PAYLOAD_SIZE;
+
+    for (i = 0; i < 5; ++i) {
+        be16(bytes + p, 0x8000 | i); p += 2;
+        bytes[p] = 2;
+        be16(bytes + p + 2, i == 4 ? -1 : i + 1);
+        be_double(bytes + p + 8, xyz[i][0]);
+        be_double(bytes + p + 16, xyz[i][1]);
+        be_double(bytes + p + 24, xyz[i][2]);
+        p += CAD_LEGACY_POINT_PAYLOAD_SIZE;
+    }
+    return p;
+}
+
 static void test_legacy_decode_and_transactionality(void) {
     uint8_t legacy[154];
     size_t size = make_legacy_triangle(legacy, sizeof(legacy));
@@ -187,6 +280,7 @@ static void test_legacy_decode_and_transactionality(void) {
     CHECK(decoded->pointCount == 3);
     CHECK(decoded->polygons[0].animation == -1);
     CHECK(decoded->polygons[0].both == -1);
+    CHECK(decoded->polygons[0].side == 2);
     CHECK(decoded->polygons[0].color == 255);
 
     /* A failed decode must leave the caller's existing document untouched. */
@@ -202,6 +296,23 @@ static void test_legacy_decode_and_transactionality(void) {
     CHECK(!CadResult_IsSuccess(&result));
     CHECK(memcmp(before, decoded, sizeof(*decoded)) == 0);
     free(before);
+    free(decoded);
+}
+
+static void test_legacy_collinear_leading_side_reconstruction(void) {
+    uint8_t legacy[222];
+    size_t size = make_legacy_collinear_leading_face(legacy, sizeof(legacy));
+    CadFileData* decoded = (CadFileData*)malloc(sizeof(*decoded));
+    CadResult result;
+    CHECK(size == sizeof(legacy));
+    CHECK(decoded != NULL);
+    if (!decoded) return;
+    result = CadCodec_Decode(legacy, size, CAD_FORMAT_LEGACY_PACKED, decoded);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(decoded->polygonCount == 1);
+    CHECK(decoded->polygons[0].npoints == 5);
+    /* The clockwise XY chain has a negative Z normal. */
+    CHECK(decoded->polygons[0].side == 0);
     free(decoded);
 }
 
@@ -312,6 +423,61 @@ static void test_mutation_topology_guards(void) {
     CadCore_Destroy(&core);
 }
 
+static void test_polygon_point_merge(void) {
+    CadCore core;
+    int16_t points[5];
+    int16_t line[2];
+    int16_t polygon;
+    int16_t degenerate;
+    char diagnostic[192];
+    int i;
+    static const double coordinates[5][3] = {
+        {0.0, 0.0, 0.0},
+        {0.2, 0.0, 0.0}, /* same recovered grid position as point zero */
+        {2.0, 0.0, 0.0},
+        {2.0, 2.0, 0.0},
+        {0.4, 0.0, 0.0}  /* closing duplicate of point zero */
+    };
+
+    CadCore_Init(&core);
+    for (i = 0; i < 5; ++i) {
+        points[i] = CadCore_AddPoint(
+            &core, coordinates[i][0], coordinates[i][1], coordinates[i][2]);
+        CHECK(points[i] >= 0);
+        if (i > 0) core.data.points[points[i - 1]].nextPoint = points[i];
+    }
+    core.data.points[points[4]].nextPoint = INVALID_INDEX;
+    polygon = CadCore_AddPolygon(&core, points[0], 7, 5);
+    CHECK(polygon >= 0);
+    CHECK(!CadCore_ArePointsMerged(&core));
+    CHECK(CadCore_MergePolygonPoints(&core) == 2);
+    CHECK(core.data.polygons[polygon].npoints == 3);
+    CHECK(core.data.polygons[polygon].firstPoint == points[0]);
+    CHECK(core.data.points[points[0]].nextPoint == points[2]);
+    CHECK(core.data.points[points[2]].nextPoint == points[3]);
+    CHECK(core.data.points[points[3]].nextPoint == INVALID_INDEX);
+    CHECK(!core.data.points[points[1]].flags);
+    CHECK(!core.data.points[points[4]].flags);
+    CHECK(CadCore_ArePointsMerged(&core));
+    CHECK(CadCore_IsFullyMerged(&core));
+    CHECK(CadCore_ValidateDocument(&core, diagnostic, sizeof(diagnostic)));
+
+    line[0] = CadCore_AddPoint(&core, 10.0, 0.0, 0.0);
+    line[1] = CadCore_AddPoint(&core, 10.0, 0.0, 0.0);
+    CHECK(line[0] >= 0 && line[1] >= 0);
+    core.data.points[line[0]].nextPoint = line[1];
+    core.data.points[line[1]].nextPoint = INVALID_INDEX;
+    degenerate = CadCore_AddPolygon(&core, line[0], 8, 2);
+    CHECK(degenerate >= 0);
+    CHECK(!CadCore_ArePointsMerged(&core));
+    CHECK(CadCore_MergePolygonPoints(&core) == 2);
+    CHECK(!core.data.polygons[degenerate].flags);
+    CHECK(CadCore_GetActivePolygonCount(&core) == 1);
+    CHECK(CadCore_IsFullyMerged(&core));
+    CHECK(CadCore_ValidateDocument(&core, diagnostic, sizeof(diagnostic)));
+    CadCore_Destroy(&core);
+}
+
 static void test_document_undo_redo_and_palette(void) {
     CadDocument* document = (CadDocument*)malloc(sizeof(*document));
     CadResult result;
@@ -397,6 +563,39 @@ static void test_document_undo_redo_and_palette(void) {
     CadDocument_ClearPalette(document);
     CHECK(!document->paletteValid);
     CHECK(!document->isDirty);
+
+    result = CadDocument_BeginEditNamed(document, "Load Palette A");
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(CadDocument_SetPalette(document, palette, "palette-a.pal"));
+    result = CadDocument_CommitEdit(document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(strcmp(document->paletteSourcePath, "palette-a.pal") == 0);
+    CHECK(document->palette[0].r == 0);
+
+    palette[0].r = 77;
+    result = CadDocument_BeginEditNamed(document, "Load Palette B");
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(CadDocument_SetPalette(document, palette, "palette-b.pal"));
+    result = CadDocument_CommitEdit(document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(strcmp(document->paletteSourcePath, "palette-b.pal") == 0);
+    CHECK(document->palette[0].r == 77);
+    result = CadDocument_Undo(document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(strcmp(document->paletteSourcePath, "palette-a.pal") == 0);
+    CHECK(document->palette[0].r == 0);
+    result = CadDocument_Redo(document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(strcmp(document->paletteSourcePath, "palette-b.pal") == 0);
+    CHECK(document->palette[0].r == 77);
+
+    CadDocument_MakeUnnamed(document);
+    CHECK(document->sourcePath == NULL);
+    CHECK(document->savePath == NULL);
+    CHECK(document->isDirty);
+    result = CadDocument_Undo(document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(document->isDirty);
     remove(savePath);
     CadDocument_Destroy(document);
     free(document);
@@ -438,11 +637,97 @@ static void test_document_load_replacement_safety(void) {
     CHECK(document->savePath == NULL);
     CHECK(document->lastImportPath != NULL);
     CHECK(CadCore_GetActivePointCount(&document->core) == 3);
+    result = CadDocument_Save(document, legacyPath);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(document->savePath == NULL);
+    CHECK(document->isDirty);
     CadDocument_Destroy(document);
     free(document);
     free(before);
     remove(legacyPath);
     remove(brokenPath);
+}
+
+static void test_untouched_native_document_preserves_source_bytes(void) {
+    const char* sourcePath = "threedcad-native-original-test.cad";
+    const char* savedPath = "threedcad-native-original-saved.cad";
+    CadCore core;
+    CadDocument* document = (CadDocument*)malloc(sizeof(*document));
+    CadResult result;
+    uint8_t* sourceBytes = NULL;
+    uint8_t* savedBytes = NULL;
+    size_t sourceSize = 0;
+    size_t savedSize = 0;
+    size_t position = 0;
+    int changedReservedByte = 0;
+
+    CHECK(document != NULL);
+    if (!document) return;
+    CadCore_Init(&core);
+    CHECK(append_triangle(&core, 0.0, 6) >= 0);
+    result = CadCodec_Encode(&core.data, CAD_FORMAT_X11_STREAM,
+                             &sourceBytes, &sourceSize);
+    CHECK(CadResult_IsSuccess(&result));
+    while (sourceBytes && position + 3 <= sourceSize) {
+        const uint8_t tag = sourceBytes[position];
+        size_t payloadSize = 0;
+        if (tag == CAD_TAG_OBJECT) payloadSize = CAD_X11_OBJECT_PAYLOAD_SIZE;
+        else if (tag == CAD_TAG_POLYGON) payloadSize = CAD_X11_POLYGON_PAYLOAD_SIZE;
+        else if (tag == CAD_TAG_POINT) payloadSize = CAD_X11_POINT_PAYLOAD_SIZE;
+        else if (tag == CAD_TAG_ANIMATION_INDEX)
+            payloadSize = CAD_X11_ANIMATION_INDEX_PAYLOAD_SIZE;
+        else if (tag == CAD_TAG_ANIMATION_POINT)
+            payloadSize = CAD_X11_ANIMATION_POINT_PAYLOAD_SIZE;
+        else break;
+        if (position + 3 + payloadSize > sourceSize) break;
+        if (tag == CAD_TAG_POINT) {
+            sourceBytes[position + 4] = 1;    /* recovered selection byte */
+            sourceBytes[position + 7] = 0xA5; /* uninterpreted alignment byte */
+            changedReservedByte = 1;
+            break;
+        }
+        position += 3 + payloadSize;
+    }
+    CHECK(changedReservedByte);
+    CHECK(write_test_file(sourcePath, sourceBytes, sourceSize));
+
+    CadDocument_Init(document);
+    result = CadDocument_Load(document, sourcePath);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(document->originalNativeBytes != NULL);
+    CHECK(CadCore_IsPointSelected(&document->core, 0));
+    CadCore_DeselectPoint(&document->core, 0);
+    CHECK(!document->isDirty);
+    result = CadDocument_Save(document, savedPath);
+    CHECK(CadResult_IsSuccess(&result));
+    savedBytes = read_test_file(savedPath, &savedSize);
+    CHECK(savedBytes != NULL);
+    CHECK(savedSize == sourceSize);
+    if (savedBytes && savedSize == sourceSize)
+        CHECK(memcmp(savedBytes, sourceBytes, sourceSize) == 0);
+
+    free(savedBytes);
+    savedBytes = NULL;
+    result = CadDocument_BeginEditNamed(document, "Move Loaded Point");
+    CHECK(CadResult_IsSuccess(&result));
+    document->core.data.points[0].pointx += 4.0;
+    result = CadDocument_CommitEdit(document);
+    CHECK(CadResult_IsSuccess(&result));
+    result = CadDocument_Save(document, savedPath);
+    CHECK(CadResult_IsSuccess(&result));
+    savedBytes = read_test_file(savedPath, &savedSize);
+    CHECK(savedBytes != NULL);
+    CHECK(savedSize == sourceSize);
+    if (savedBytes && savedSize == sourceSize)
+        CHECK(memcmp(savedBytes, sourceBytes, sourceSize) != 0);
+
+    free(savedBytes);
+    CadDocument_Destroy(document);
+    free(document);
+    CadCodec_FreeBuffer(sourceBytes);
+    CadCore_Destroy(&core);
+    remove(sourcePath);
+    remove(savedPath);
 }
 
 static void test_editor_tool_lifecycle(void) {
@@ -476,14 +761,182 @@ static void test_editor_tool_lifecycle(void) {
     CadDocument_Destroy(&document);
 }
 
+static void test_named_history_and_invalid_rollback(void) {
+    CadDocument document;
+    CadResult result;
+    uint64_t revision;
+    uint64_t nextRevision;
+    unsigned historyCount;
+    int polygon;
+    int point;
+
+    CadDocument_Init(&document);
+
+    /* A cancelled or rejected transaction is observationally a no-op,
+       including the monotonic allocator used for future content revisions.
+       This matters when a composed edit marks itself dirty before a later
+       mutation fails validation. */
+    revision = document.revision;
+    nextRevision = document.nextRevision;
+    historyCount = document.historyCount;
+    result = CadDocument_BeginEditNamed(&document, "Cancelled Dirty Edit");
+    CHECK(CadResult_IsSuccess(&result));
+    CadDocument_MarkDirty(&document);
+    CHECK(document.nextRevision > nextRevision);
+    CadDocument_CancelEdit(&document);
+    CHECK(document.revision == revision);
+    CHECK(document.nextRevision == nextRevision);
+    CHECK(document.historyCount == historyCount);
+    CHECK(!document.isDirty);
+
+    result = CadDocument_BeginEditNamed(&document, "Rejected Dirty Edit");
+    CHECK(CadResult_IsSuccess(&result));
+    CadDocument_MarkDirty(&document);
+    polygon = append_triangle(&document.core, 0.0, 7);
+    CHECK(polygon >= 0);
+    point = document.core.data.polygons[polygon].firstPoint;
+    document.core.data.points[point].nextPoint = (int16_t)point;
+    result = CadDocument_CommitEdit(&document);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(document.revision == revision);
+    CHECK(document.nextRevision == nextRevision);
+    CHECK(document.historyCount == historyCount);
+    CHECK(CadCore_GetActivePolygonCount(&document.core) == 0);
+    CHECK(!document.isDirty);
+
+    result = CadDocument_BeginEditNamed(&document, "Create Triangle");
+    CHECK(CadResult_IsSuccess(&result));
+    polygon = append_triangle(&document.core, 0.0, 7);
+    CHECK(polygon >= 0);
+    result = CadDocument_CommitEdit(&document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(CadDocument_GetUndoLabel(&document) != NULL);
+    CHECK(strcmp(CadDocument_GetUndoLabel(&document), "Create Triangle") == 0);
+
+    revision = document.revision;
+    historyCount = document.historyCount;
+    result = CadDocument_BeginEditNamed(&document, "Break Topology");
+    CHECK(CadResult_IsSuccess(&result));
+    point = document.core.data.polygons[polygon].firstPoint;
+    CHECK(point >= 0);
+    document.core.data.points[point].nextPoint = (int16_t)point;
+    result = CadDocument_CommitEdit(&document);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(document.transactionBefore == NULL);
+    CHECK(document.revision == revision);
+    CHECK(document.historyCount == historyCount);
+    CHECK(document.core.data.points[point].nextPoint != point);
+    CHECK(strcmp(CadDocument_GetUndoLabel(&document), "Create Triangle") == 0);
+
+    result = CadDocument_BeginEditNamed(&document, "Non-finite Coordinate");
+    CHECK(CadResult_IsSuccess(&result));
+    document.core.data.points[point].pointx = NAN;
+    result = CadDocument_CommitEdit(&document);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(document.revision == revision);
+    CHECK(document.historyCount == historyCount);
+    CHECK(isfinite(document.core.data.points[point].pointx));
+
+    result = CadDocument_Undo(&document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(CadDocument_GetRedoLabel(&document) != NULL);
+    CHECK(strcmp(CadDocument_GetRedoLabel(&document), "Create Triangle") == 0);
+    result = CadDocument_Redo(&document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(strcmp(CadDocument_GetUndoLabel(&document), "Create Triangle") == 0);
+    CadDocument_Destroy(&document);
+}
+
+static CadResult append_two_points_edit(CadDocument* document,
+                                        void* userData) {
+    double offset = userData ? *(const double*)userData : 0.0;
+    if (CadCore_AddPoint(&document->core, offset, 0.0, 0.0) < 0 ||
+        CadCore_AddPoint(&document->core, offset + 1.0, 0.0, 0.0) < 0) {
+        CadResult result = CadResult_Ok(CAD_FORMAT_AUTO);
+        result.status = CAD_STATUS_INDEX_OUT_OF_RANGE;
+        return result;
+    }
+    return CadResult_Ok(CAD_FORMAT_AUTO);
+}
+
+static CadResult failing_composite_edit(CadDocument* document,
+                                        void* userData) {
+    CadResult result = append_two_points_edit(document, userData);
+    if (!CadResult_IsSuccess(&result)) return result;
+    result.status = CAD_STATUS_INVALID_ARGUMENT;
+    return result;
+}
+
+static void test_composable_document_edit(void) {
+    CadDocument document;
+    CadResult result;
+    double offset = 4.0;
+    CadDocument_Init(&document);
+    result = CadDocument_ApplyEdit(&document, "Add Point Pair",
+                                   append_two_points_edit, &offset);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(CadCore_GetActivePointCount(&document.core) == 2);
+    CHECK(strcmp(CadDocument_GetUndoLabel(&document), "Add Point Pair") == 0);
+    result = CadDocument_Undo(&document);
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(CadCore_GetActivePointCount(&document.core) == 0);
+    result = CadDocument_ApplyEdit(&document, "Rejected Pair",
+                                   failing_composite_edit, &offset);
+    CHECK(!CadResult_IsSuccess(&result));
+    CHECK(CadCore_GetActivePointCount(&document.core) == 0);
+    CHECK(!CadDocument_CanUndo(&document));
+    CadDocument_Destroy(&document);
+}
+
+static void test_history_capacity_eviction(void) {
+    CadDocument document;
+    CadResult result;
+    int edit;
+    int undoCount = 0;
+    int redoCount = 0;
+    char label[32];
+    CadDocument_Init(&document);
+    for (edit = 1; edit <= 70; ++edit) {
+        snprintf(label, sizeof(label), "Add Point %d", edit);
+        result = CadDocument_BeginEditNamed(&document, label);
+        CHECK(CadResult_IsSuccess(&result));
+        CHECK(CadCore_AddPoint(&document.core, (double)edit, 0.0, 0.0) >= 0);
+        result = CadDocument_CommitEdit(&document);
+        CHECK(CadResult_IsSuccess(&result));
+    }
+    CHECK(document.historyCount == CAD_DOCUMENT_HISTORY_LIMIT);
+    CHECK(strcmp(CadDocument_GetUndoLabel(&document), "Add Point 70") == 0);
+    while (CadDocument_CanUndo(&document)) {
+        result = CadDocument_Undo(&document);
+        CHECK(CadResult_IsSuccess(&result));
+        ++undoCount;
+    }
+    CHECK(undoCount == CAD_DOCUMENT_HISTORY_LIMIT - 1);
+    CHECK(CadCore_GetActivePointCount(&document.core) == 7);
+    while (CadDocument_CanRedo(&document)) {
+        result = CadDocument_Redo(&document);
+        CHECK(CadResult_IsSuccess(&result));
+        ++redoCount;
+    }
+    CHECK(redoCount == CAD_DOCUMENT_HISTORY_LIMIT - 1);
+    CHECK(CadCore_GetActivePointCount(&document.core) == 70);
+    CadDocument_Destroy(&document);
+}
+
 int main(void) {
     test_later_animation_round_trip();
     test_legacy_decode_and_transactionality();
+    test_legacy_collinear_leading_side_reconstruction();
     test_root_and_delete_repair();
     test_mutation_topology_guards();
+    test_polygon_point_merge();
     test_document_undo_redo_and_palette();
     test_document_load_replacement_safety();
+    test_untouched_native_document_preserves_source_bytes();
     test_editor_tool_lifecycle();
+    test_named_history_and_invalid_rollback();
+    test_composable_document_edit();
+    test_history_capacity_eviction();
     if (failures) {
         fprintf(stderr, "%d core test(s) failed\n", failures);
         return 1;

@@ -1,13 +1,54 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "cad_codec.h"
+#include "platform_fs.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+
+static int expected_count_matches(const char* variable, unsigned actual)
+{
+    const char* text = getenv(variable);
+    char* end = NULL;
+    unsigned long expected;
+    if (!text || !text[0]) return 1;
+    expected = strtoul(text, &end, 10);
+    if (!end || *end || expected > UINT_MAX) {
+        fprintf(stderr, "Invalid %s expectation: %s\n", variable, text);
+        return 0;
+    }
+    if (actual != (unsigned)expected) {
+        fprintf(stderr, "%s expected %lu, found %u\n",
+                variable, expected, actual);
+        return 0;
+    }
+    return 1;
+}
+
+static int expected_cad_counts_match(unsigned total, unsigned x11,
+                                     unsigned legacy)
+{
+    return expected_count_matches("THREEDCAD_EXPECT_CAD_TOTAL", total) &&
+           expected_count_matches("THREEDCAD_EXPECT_CAD_X11", x11) &&
+           expected_count_matches("THREEDCAD_EXPECT_CAD_LEGACY", legacy);
+}
+
+static CadResult decode_path(const char* path, CadFileData* data)
+{
+    uint8_t* bytes = NULL;
+    size_t size = 0;
+    CadResult result = CadPlatform_ReadFile(
+        path, CAD_PLATFORM_DEFAULT_FILE_LIMIT, &bytes, &size);
+    if (CadResult_IsSuccess(&result))
+        result = CadCodec_Decode(bytes, size, CAD_FORMAT_AUTO, data);
+    CadPlatform_Free(bytes);
+    return result;
+}
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -87,7 +128,7 @@ static void validate_file(const wchar_t* path, CorpusCounts* counts)
         ++counts->failed;
         return;
     }
-    result = CadCodec_LoadPath(utf8, CAD_FORMAT_AUTO, data);
+    result = decode_path(utf8, data);
     ++counts->total;
     if (!CadResult_IsSuccess(&result)) {
         const char* message = result.diagnosticCount ? result.diagnostics[0].message : CadStatus_Name(result.status);
@@ -155,7 +196,9 @@ int wmain(int argc, wchar_t** argv)
     walk_directory(argv[1], &counts);
     printf("CAD corpus: %u total, %u X11 stream, %u legacy packed, %u failed\n",
            counts.total, counts.x11, counts.legacy, counts.failed);
-    return counts.total && !counts.failed ? 0 : 1;
+    return counts.total && !counts.failed &&
+           expected_cad_counts_match(counts.total, counts.x11, counts.legacy)
+               ? 0 : 1;
 }
 #else
 int main(int argc, char** argv)
@@ -167,7 +210,9 @@ int main(int argc, char** argv)
     free(root);
     printf("CAD corpus: %u total, %u X11 stream, %u legacy packed, %u failed\n",
            counts.total, counts.x11, counts.legacy, counts.failed);
-    return counts.total && !counts.failed ? 0 : 1;
+    return counts.total && !counts.failed &&
+           expected_cad_counts_match(counts.total, counts.x11, counts.legacy)
+               ? 0 : 1;
 }
 #endif
 
@@ -194,7 +239,7 @@ static void validate_file(const char* path, CorpusCounts* counts)
     CadFileData* data = (CadFileData*)malloc(sizeof(*data));
     CadResult result;
     if (!data) { ++counts->failed; return; }
-    result = CadCodec_LoadPath(path, CAD_FORMAT_AUTO, data);
+    result = decode_path(path, data);
     ++counts->total;
     if (!CadResult_IsSuccess(&result)) {
         fprintf(stderr, "FAIL: %s\n", path);
@@ -234,6 +279,8 @@ int main(int argc, char** argv)
     walk_directory(argv[1], &counts);
     printf("CAD corpus: %u total, %u X11 stream, %u legacy packed, %u failed\n",
            counts.total, counts.x11, counts.legacy, counts.failed);
-    return counts.total && !counts.failed ? 0 : 1;
+    return counts.total && !counts.failed &&
+           expected_cad_counts_match(counts.total, counts.x11, counts.legacy)
+               ? 0 : 1;
 }
 #endif

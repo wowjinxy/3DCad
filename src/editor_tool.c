@@ -37,7 +37,8 @@ int EditorTool_IsActive(const EditorTool* tool) {
     return tool && tool->phase != EDITOR_TOOL_IDLE;
 }
 
-CadResult EditorTool_Begin(EditorTool* tool, CadToolId id) {
+CadResult EditorTool_BeginNamed(EditorTool* tool, CadToolId id,
+                                const char* historyLabel) {
     CadResult result;
     if (!tool || !tool->document)
         return editor_tool_error(CAD_STATUS_INVALID_ARGUMENT,
@@ -45,11 +46,15 @@ CadResult EditorTool_Begin(EditorTool* tool, CadToolId id) {
     if (EditorTool_IsActive(tool))
         return editor_tool_error(CAD_STATUS_INVALID_ARGUMENT,
                                  "The editor tool already has an active edit");
-    result = CadDocument_BeginEdit(tool->document);
+    result = CadDocument_BeginEditNamed(tool->document, historyLabel);
     if (!CadResult_IsSuccess(&result)) return result;
     tool->id = id;
     tool->phase = EDITOR_TOOL_ACTIVE;
     return result;
+}
+
+CadResult EditorTool_Begin(EditorTool* tool, CadToolId id) {
+    return EditorTool_BeginNamed(tool, id, "Edit");
 }
 
 CadResult EditorTool_Update(EditorTool* tool) {

@@ -1,23 +1,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "cad_codec.h"
+#include "cad_geometry.h"
 
-#include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
 
 typedef struct CadDecodeState {
     CadFileData data;
@@ -261,6 +251,37 @@ static void decode_legacy_polygon(const uint8_t* p, CadPolygon* polygon) {
     polygon->npoints = p[7];
 }
 
+static void reconstruct_legacy_sides(CadFileData* data) {
+    int polygonIndex;
+    if (!data) return;
+    for (polygonIndex = 0; polygonIndex < CAD_MAX_POLYGONS; ++polygonIndex) {
+        CadPolygon* polygon = &data->polygons[polygonIndex];
+        double coordinates[CAD_MAX_FACE_POINTS][3];
+        double normal[3] = {0.0, 0.0, 0.0};
+        int16_t pointIndex;
+        int pointCount = 0;
+        if (!polygon->flags) continue;
+        pointIndex = polygon->firstPoint;
+        while (pointCount < polygon->npoints &&
+               pointCount < CAD_MAX_FACE_POINTS &&
+               pointIndex >= 0 && pointIndex < CAD_MAX_POINTS &&
+               data->points[pointIndex].flags) {
+            const CadPoint* point = &data->points[pointIndex];
+            coordinates[pointCount][0] = point->pointx;
+            coordinates[pointCount][1] = point->pointy;
+            coordinates[pointCount][2] = point->pointz;
+            ++pointCount;
+            pointIndex = point->nextPoint;
+        }
+        if (pointCount == polygon->npoints)
+            (void)CadGeometry_ComputePolygonNormal(coordinates, pointCount,
+                                                   normal);
+        polygon->side = (uint8_t)((normal[1] < 0.0 ? 1 : 0) |
+                                  (normal[2] >= 0.0 ? 2 : 0) |
+                                  (normal[0] < 0.0 ? 4 : 0));
+    }
+}
+
 static void decode_point(const uint8_t* p, CadPoint* point) {
     point->flags = p[0];
     point->selectFlag = p[1];
@@ -393,7 +414,7 @@ static CadResult decode_x11(const uint8_t* bytes, size_t size,
     update_high_water(state);
     {
         unsigned corrections = normalize_recovered_topology(&state->data);
-    result = CadCodec_Validate(&state->data);
+        result = CadCodec_Validate(&state->data);
         if (CadResult_IsSuccess(&result) && corrections)
             result_add(&result, CAD_DIAGNOSTIC_WARNING,
                        CAD_STATUS_INVALID_TOPOLOGY, 0, -1, -1,
@@ -507,7 +528,8 @@ static CadResult decode_legacy(const uint8_t* bytes, size_t size,
     update_high_water(state);
     {
         unsigned corrections = normalize_recovered_topology(&state->data);
-    result = CadCodec_Validate(&state->data);
+        reconstruct_legacy_sides(&state->data);
+        result = CadCodec_Validate(&state->data);
         if (CadResult_IsSuccess(&result) && corrections)
             result_add(&result, CAD_DIAGNOSTIC_WARNING,
                        CAD_STATUS_INVALID_TOPOLOGY, 0, -1, -1,
@@ -1168,183 +1190,4 @@ CadResult CadCodec_Encode(const CadFileData* data, CadFormat format,
 
 void CadCodec_FreeBuffer(void* buffer) {
     free(buffer);
-}
-
-#ifdef _WIN32
-static wchar_t* utf8_to_wide(const char* path) {
-    wchar_t* wide;
-    int count;
-    if (!path) return NULL;
-    count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
-                                NULL, 0);
-    if (!count) return NULL;
-    wide = (wchar_t*)malloc((size_t)count * sizeof(*wide));
-    if (!wide) return NULL;
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
-                             wide, count)) {
-        free(wide);
-        return NULL;
-    }
-    return wide;
-}
-
-static FILE* fopen_utf8(const char* path, const wchar_t* mode) {
-    wchar_t* wide = utf8_to_wide(path);
-    FILE* file = NULL;
-    if (wide) file = _wfopen(wide, mode);
-    free(wide);
-    return file;
-}
-#else
-static FILE* fopen_utf8(const char* path, const char* mode) {
-    return fopen(path, mode);
-}
-#endif
-
-static CadResult read_path(const char* path, uint8_t** output, size_t* size) {
-    FILE* file;
-    long length;
-    uint8_t* bytes;
-    *output = NULL; *size = 0;
-#ifdef _WIN32
-    file = fopen_utf8(path, L"rb");
-#else
-    file = fopen_utf8(path, "rb");
-#endif
-    if (!file)
-        return result_error(CAD_FORMAT_AUTO, CAD_STATUS_IO_ERROR, 0, -1, -1,
-                            "Could not open CAD path for reading");
-    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0 ||
-        fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return result_error(CAD_FORMAT_AUTO, CAD_STATUS_IO_ERROR, 0, -1, -1,
-                            "Could not determine CAD file size");
-    }
-    if (!length) {
-        fclose(file);
-        return result_error(CAD_FORMAT_AUTO, CAD_STATUS_EMPTY_INPUT, 0, -1, -1,
-                            "CAD file is empty");
-    }
-    bytes = (uint8_t*)malloc((size_t)length);
-    if (!bytes) {
-        fclose(file);
-        return result_error(CAD_FORMAT_AUTO, CAD_STATUS_OUT_OF_MEMORY,
-                            0, -1, -1, "Could not allocate file buffer");
-    }
-    if (fread(bytes, 1, (size_t)length, file) != (size_t)length ||
-        fclose(file) != 0) {
-        free(bytes);
-        return result_error(CAD_FORMAT_AUTO, CAD_STATUS_IO_ERROR, 0, -1, -1,
-                            "Could not read the complete CAD file");
-    }
-    *output = bytes; *size = (size_t)length;
-    return CadResult_Ok(CAD_FORMAT_AUTO);
-}
-
-CadResult CadCodec_LoadPath(const char* utf8Path, CadFormat requestedFormat,
-                            CadFileData* output) {
-    uint8_t* bytes;
-    size_t size;
-    CadResult result;
-    if (!utf8Path || !output)
-        return result_error(requestedFormat, CAD_STATUS_INVALID_ARGUMENT,
-                            0, -1, -1, "Load requires a UTF-8 path and output");
-    result = read_path(utf8Path, &bytes, &size);
-    if (!CadResult_IsSuccess(&result)) return result;
-    result = CadCodec_Decode(bytes, size, requestedFormat, output);
-    free(bytes);
-    return result;
-}
-
-static char* make_temp_path(const char* path) {
-    static unsigned counter = 0;
-    char suffix[64];
-    size_t pathLength = strlen(path);
-    char* temporary;
-#ifdef _WIN32
-    unsigned process = (unsigned)GetCurrentProcessId();
-    unsigned serial = (unsigned)InterlockedIncrement((volatile LONG*)&counter);
-#else
-    unsigned process = (unsigned)getpid();
-    unsigned serial = ++counter;
-#endif
-    snprintf(suffix, sizeof(suffix), ".tmp-%u-%u", process, serial);
-    temporary = (char*)malloc(pathLength + strlen(suffix) + 1);
-    if (!temporary) return NULL;
-    memcpy(temporary, path, pathLength);
-    strcpy(temporary + pathLength, suffix);
-    return temporary;
-}
-
-static int remove_utf8(const char* path) {
-#ifdef _WIN32
-    wchar_t* wide = utf8_to_wide(path);
-    int ok = wide && DeleteFileW(wide);
-    free(wide);
-    return ok;
-#else
-    return remove(path) == 0;
-#endif
-}
-
-static int replace_utf8(const char* temporary, const char* destination) {
-#ifdef _WIN32
-    wchar_t* wideTemporary = utf8_to_wide(temporary);
-    wchar_t* wideDestination = utf8_to_wide(destination);
-    int ok = wideTemporary && wideDestination &&
-             MoveFileExW(wideTemporary, wideDestination,
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    free(wideTemporary); free(wideDestination);
-    return ok;
-#else
-    return rename(temporary, destination) == 0;
-#endif
-}
-
-CadResult CadCodec_SavePathAtomic(const char* utf8Path,
-                                  const CadFileData* data,
-                                  CadFormat format) {
-    uint8_t* bytes;
-    size_t size;
-    char* temporary;
-    FILE* file;
-    CadResult result;
-    if (!utf8Path || !data)
-        return result_error(format, CAD_STATUS_INVALID_ARGUMENT,
-                            0, -1, -1, "Save requires a UTF-8 path and data");
-    result = CadCodec_Encode(data, format, &bytes, &size);
-    if (!CadResult_IsSuccess(&result)) return result;
-    temporary = make_temp_path(utf8Path);
-    if (!temporary) {
-        free(bytes);
-        return result_error(format, CAD_STATUS_OUT_OF_MEMORY,
-                            0, -1, -1, "Could not allocate temporary path");
-    }
-#ifdef _WIN32
-    file = fopen_utf8(temporary, L"wb");
-#else
-    file = fopen_utf8(temporary, "wb");
-#endif
-    if (!file || fwrite(bytes, 1, size, file) != size || fflush(file) != 0
-#ifdef _WIN32
-        || _commit(_fileno(file)) != 0
-#else
-        || fsync(fileno(file)) != 0
-#endif
-    ) {
-        if (file) fclose(file);
-        remove_utf8(temporary);
-        free(temporary); free(bytes);
-        return result_error(format, CAD_STATUS_IO_ERROR,
-                            0, -1, -1, "Could not write temporary CAD file");
-    }
-    if (fclose(file) != 0 || !replace_utf8(temporary, utf8Path)) {
-        remove_utf8(temporary);
-        free(temporary); free(bytes);
-        return result_error(format, CAD_STATUS_IO_ERROR,
-                            0, -1, -1, "Could not atomically replace CAD file");
-    }
-    free(temporary); free(bytes);
-    result.bytesConsumed = size;
-    return result;
 }

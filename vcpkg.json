@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "3dcad",
-  "version-semver": "0.2.0",
+  "version-semver": "0.3.0",
   "description": "Portable Iwamoto 3D-CAD core with a Windows-first SDL3 editor",
   "dependencies": [
     {
