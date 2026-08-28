@@ -13,8 +13,25 @@ typedef struct GuiInput {
     int mouse_right_down;      /* current (right button) */
     int mouse_right_pressed;   /* went down this frame (right button) */
     int mouse_right_released;  /* went up this frame (right button) */
+    int mouse_middle_down;
+    int mouse_middle_pressed;
+    int mouse_middle_released;
     int wheel_delta;     /* mouse wheel scroll delta (positive = zoom in, negative = zoom out) */
+    unsigned modifiers;  /* GUI_MOD_* state for pointer gestures */
 } GuiInput;
+
+enum {
+    GUI_KEY_ESCAPE = 0x100,
+    GUI_KEY_DELETE,
+    GUI_KEY_BACKSPACE,
+    GUI_KEY_ENTER
+};
+
+enum {
+    GUI_MOD_CTRL = 1u << 0,
+    GUI_MOD_SHIFT = 1u << 1,
+    GUI_MOD_ALT = 1u << 2
+};
 
 typedef struct GuiState GuiState;
 
@@ -26,6 +43,9 @@ typedef enum GuiCommand {
 GuiState* gui_create(void);
 void gui_destroy(GuiState* g);
 GuiCommand gui_take_command(GuiState* g);
+int gui_request_quit(GuiState* g);
+void gui_handle_key(GuiState* g, int key, unsigned modifiers, int pressed);
+const char* gui_window_title(GuiState* g);
 
 void gui_set_font(GuiState* g, FontWin32* font);
 void gui_load_tool_icons(GuiState* g, const char* resource_path);

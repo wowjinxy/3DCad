@@ -5,12 +5,13 @@
 #include <SDL3/SDL_opengl.h>
 
 #include <stdbool.h>
+#include <string.h>
 
 #include "font_win32.h"
 #include "gui.h"
 
 #define APP_NAME "3DCad"
-#define APP_VERSION "0.1.0"
+#define APP_VERSION "0.2.0"
 #define APP_IDENTIFIER "io.github.wowjinxy.3dcad"
 #define DEFAULT_WINDOW_WIDTH 1258
 #define DEFAULT_WINDOW_HEIGHT 983
@@ -25,6 +26,7 @@ typedef struct AppState {
     float pending_wheel;
     bool vsync_enabled;
     bool font_refresh_pending;
+    char current_title[1024];
 } AppState;
 
 static SDL_AppResult fail_sdl(const char* operation) {
@@ -155,7 +157,60 @@ static void clear_transient_input(GuiInput* input) {
     input->mouse_released = 0;
     input->mouse_right_pressed = 0;
     input->mouse_right_released = 0;
+    input->mouse_middle_pressed = 0;
+    input->mouse_middle_released = 0;
     input->wheel_delta = 0;
+}
+
+static unsigned gui_modifiers(SDL_Keymod modifiers) {
+    unsigned result = 0;
+    if (modifiers & SDL_KMOD_CTRL) result |= GUI_MOD_CTRL;
+    if (modifiers & SDL_KMOD_SHIFT) result |= GUI_MOD_SHIFT;
+    if (modifiers & SDL_KMOD_ALT) result |= GUI_MOD_ALT;
+    return result;
+}
+
+static int gui_keycode(SDL_Keycode key) {
+    switch (key) {
+    case SDLK_ESCAPE: return GUI_KEY_ESCAPE;
+    case SDLK_DELETE: return GUI_KEY_DELETE;
+    case SDLK_BACKSPACE: return GUI_KEY_BACKSPACE;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER: return GUI_KEY_ENTER;
+    case SDLK_KP_0: return '0';
+    case SDLK_KP_1: return '1';
+    case SDLK_KP_2: return '2';
+    case SDLK_KP_3: return '3';
+    case SDLK_KP_4: return '4';
+    case SDLK_KP_5: return '5';
+    case SDLK_KP_6: return '6';
+    case SDLK_KP_7: return '7';
+    case SDLK_KP_8: return '8';
+    case SDLK_KP_9: return '9';
+    case SDLK_KP_PERIOD:
+    case SDLK_KP_DECIMAL: return '.';
+    case SDLK_KP_PLUS: return '+';
+    case SDLK_KP_MINUS: return '-';
+    case SDLK_KP_MULTIPLY: return '*';
+    case SDLK_KP_DIVIDE: return '/';
+    default:
+        if (key >= 0 && key <= 0x7f) return (int)key;
+        return 0;
+    }
+}
+
+static void refresh_window_title(AppState* app) {
+    const char* title;
+    if (!app || !app->window || !app->gui) return;
+    title = gui_window_title(app->gui);
+    if (!title || !*title) title = APP_NAME;
+    if (strcmp(title, app->current_title) != 0) {
+        SDL_strlcpy(app->current_title, title, sizeof(app->current_title));
+        if (!SDL_SetWindowTitle(app->window, app->current_title)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Unable to update the document title: %s", SDL_GetError());
+        }
+    }
 }
 
 SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char* argv[]) {
@@ -244,7 +299,18 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
     switch (event->type) {
     case SDL_EVENT_QUIT:
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-        return SDL_APP_SUCCESS;
+        return gui_request_quit(app->gui) ? SDL_APP_SUCCESS : SDL_APP_CONTINUE;
+
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP: {
+        if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat) break;
+        int key = gui_keycode(event->key.key);
+        if (key) {
+            gui_handle_key(app->gui, key, gui_modifiers(event->key.mod),
+                           event->type == SDL_EVENT_KEY_DOWN);
+        }
+        break;
+    }
 
     case SDL_EVENT_MOUSE_MOTION:
         app->input.mouse_x = (int)event->motion.x;
@@ -260,6 +326,9 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
         } else if (event->button.button == SDL_BUTTON_RIGHT) {
             app->input.mouse_right_down = 1;
             app->input.mouse_right_pressed = 1;
+        } else if (event->button.button == SDL_BUTTON_MIDDLE) {
+            app->input.mouse_middle_down = 1;
+            app->input.mouse_middle_pressed = 1;
         }
         break;
 
@@ -272,6 +341,9 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
         } else if (event->button.button == SDL_BUTTON_RIGHT) {
             app->input.mouse_right_down = 0;
             app->input.mouse_right_released = 1;
+        } else if (event->button.button == SDL_BUTTON_MIDDLE) {
+            app->input.mouse_middle_down = 0;
+            app->input.mouse_middle_released = 1;
         }
         break;
 
@@ -311,6 +383,7 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
     const SDL_MouseButtonFlags mouse_buttons = SDL_GetMouseState(&mouse_x, &mouse_y);
     const bool left_down = (mouse_buttons & SDL_BUTTON_LMASK) != 0;
     const bool right_down = (mouse_buttons & SDL_BUTTON_RMASK) != 0;
+    const bool middle_down = (mouse_buttons & SDL_BUTTON_MMASK) != 0;
 
     int window_width = 0;
     int window_height = 0;
@@ -348,12 +421,19 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
         app->input.mouse_right_released |= !right_down;
         app->input.mouse_right_down = right_down;
     }
+    if (middle_down != (app->input.mouse_middle_down != 0)) {
+        app->input.mouse_middle_pressed |= middle_down;
+        app->input.mouse_middle_released |= !middle_down;
+        app->input.mouse_middle_down = middle_down;
+    }
+    app->input.modifiers = gui_modifiers(SDL_GetModState());
 
     /* Keep sub-step touchpad deltas until they add up to a complete GUI step. */
     app->input.wheel_delta = (int)app->pending_wheel;
     app->pending_wheel -= (float)app->input.wheel_delta;
 
     gui_update(app->gui, &app->input, gui_width, gui_height);
+    refresh_window_title(app);
     if (gui_take_command(app->gui) == GUI_COMMAND_QUIT) {
         return SDL_APP_SUCCESS;
     }

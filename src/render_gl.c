@@ -44,7 +44,6 @@ void rg_set_viewport_tl(int pixel_x, int pixel_y,
                         int logical_w, int logical_h) {
     if (pixel_w <= 0 || pixel_h <= 0 || logical_w <= 0 || logical_h <= 0) return;
     int gl_y = framebuffer_h - (pixel_y + pixel_h);
-    if (gl_y < 0) gl_y = 0;
     glViewport(pixel_x, gl_y, pixel_w, pixel_h);
     glEnable(GL_SCISSOR_TEST);
     glScissor(pixel_x, gl_y, pixel_w, pixel_h);

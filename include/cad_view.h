@@ -26,7 +26,13 @@ typedef struct {
     double zoom;           /* Zoom factor */
     double pan_x, pan_y;   /* Pan offset */
     double rot_x, rot_y;   /* Rotation (for 3D view) */
+    double rot_z;          /* Camera roll (for 3D view) */
+    double camera_distance;/* Perspective camera distance */
+    double focal_length;   /* Perspective focal length */
     int wireframe;         /* 1 = wireframe, 0 = solid */
+    int show_grid;         /* Draw the construction grid */
+    uint8_t palette_rgba[256][4]; /* Optional indexed preview palette */
+    int palette_valid;
 } CadView;
 
 /* ----------------------------------------------------------------------------
@@ -41,13 +47,22 @@ void CadView_Reset(CadView* view);
 void CadView_SetZoom(CadView* view, double zoom);
 void CadView_Pan(CadView* view, double dx, double dy);
 void CadView_Rotate(CadView* view, double dx, double dy);
+void CadView_RotateRoll(CadView* view, double degrees);
 void CadView_Pan3DVertical(CadView* view, double dy); /* Pan 3D view up/down relative to current angle */
+void CadView_SetPalette(CadView* view, const uint8_t* rgba256x4);
+void CadView_ClearPalette(CadView* view);
 
 /* ----------------------------------------------------------------------------
    3D to 2D projection
    ---------------------------------------------------------------------------- */
 void CadView_ProjectPoint(const CadView* view, double x, double y, double z, 
                          int* out_x, int* out_y, int viewport_w, int viewport_h);
+
+/* Extended projection used for depth sorting and near-plane clipping.
+   Returns zero when a point is behind the 3D camera near plane. */
+int CadView_ProjectPointDepth(const CadView* view, double x, double y, double z,
+                              double* out_x, double* out_y, double* out_depth,
+                              int viewport_w, int viewport_h);
 
 /* ----------------------------------------------------------------------------
    Point selection (find nearest point to screen coordinates)
@@ -71,6 +86,13 @@ int CadView_FindPointsAtLocation(const CadView* view, const CadCore* core,
                                  int threshold_pixels,
                                  double world_threshold,
                                  int16_t* out_indices, int max_count);
+
+/* Find the nearest visible polygon edge/interior in screen space. */
+int16_t CadView_FindNearestPolygon(const CadView* view, const CadCore* core,
+                                   int screen_x, int screen_y,
+                                   int viewport_x, int viewport_y,
+                                   int viewport_w, int viewport_h,
+                                   int threshold_pixels);
 
 /* ----------------------------------------------------------------------------
    Unproject screen delta to 3D world delta
