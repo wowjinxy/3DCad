@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64 (${{ matrix.configuration }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\build\vcpkg-cache
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-windows-x64-${{ matrix.configuration }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-windows-x64-${{ matrix.configuration }}-
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          cmake -S . -B build/windows -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DTHREEDCAD_BUILD_GUI=ON `
+            -DTHREEDCAD_BUILD_TOOLS=ON `
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build/windows --config ${{ matrix.configuration }} --parallel
+
+      - name: Test
+        run: >-
+          ctest --test-dir build/windows
+          --build-config ${{ matrix.configuration }}
+          --output-on-failure
+
+  linux-core:
+    name: Linux core, tools, and tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Configure without the Windows GUI
+        run: >-
+          cmake -S . -B build/linux -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DTHREEDCAD_BUILD_GUI=OFF
+          -DTHREEDCAD_BUILD_TOOLS=ON
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build/linux --parallel
+
+      - name: Test
+        run: ctest --test-dir build/linux --output-on-failure
