@@ -26,14 +26,12 @@
 #include <windows.h>
 #endif
 
-#include <GL/gl.h>
+#include <SDL3/SDL_opengl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
-#ifdef _WIN32
-#include <windows.h>
-#else
+#ifndef _WIN32
 #include <sys/stat.h>
 #endif
 #include <ctype.h>
@@ -67,6 +65,7 @@ typedef struct GuiWin {
 
 struct GuiState {
     FontWin32* font;
+    GuiCommand pending_command;
 
     /* CAD core */
     CadCore* cad;
@@ -371,7 +370,7 @@ static void handle_file_menu_action(GuiState* g, int item_index) {
         }
         break;
     case 12: /* (Q)Quit */
-        fprintf(stdout, "Quit (application exit not handled here)\n");
+        g->pending_command = GUI_COMMAND_QUIT;
         break;
     }
 }
@@ -391,50 +390,6 @@ static void handle_edit_menu_action(GuiState* g, int item_index) {
         break;
     case 5: /* Copy */
         fprintf(stdout, "Copy (not implemented yet)\n");
-        break;
-    }
-}
-
-/* Helper function to update a view window size based on its scale */
-static void update_view_window_size(GuiState* g, int view_idx) {
-    if (!g || view_idx < 0 || view_idx >= 4) return;
-    
-    const int baseX = 180, baseY = 20;
-    const int baseWinW = 560, baseWinH = 330;
-    int winW = (int)(baseWinW * g->view_scale[view_idx]);
-    int winH = (int)(baseWinH * g->view_scale[view_idx]);
-    
-    /* Calculate position based on grid layout */
-    switch (view_idx) {
-    case 0: /* Top - top-left */
-        {
-            int winW1 = (int)(baseWinW * g->view_scale[1]);
-            g->view[0].r = (Rect){ baseX + 0, baseY + 0, winW, winH };
-            /* Update 3D view position */
-            g->view[1].r.x = baseX + winW;
-        }
-        break;
-    case 1: /* 3D View - top-right */
-        {
-            int winW0 = (int)(baseWinW * g->view_scale[0]);
-            g->view[1].r = (Rect){ baseX + winW0, baseY + 0, winW, winH };
-        }
-        break;
-    case 2: /* Front - bottom-left */
-        {
-            int winH0 = (int)(baseWinH * g->view_scale[0]);
-            int winW1 = (int)(baseWinW * g->view_scale[1]);
-            g->view[2].r = (Rect){ baseX + 0, baseY + winH0, winW, winH };
-            /* Update Right view position */
-            g->view[3].r.x = baseX + winW;
-        }
-        break;
-    case 3: /* Right - bottom-right */
-        {
-            int winH0 = (int)(baseWinH * g->view_scale[0]);
-            int winW0 = (int)(baseWinW * g->view_scale[0]);
-            g->view[3].r = (Rect){ baseX + winW0, baseY + winH0, winW, winH };
-        }
         break;
     }
 }
@@ -599,9 +554,11 @@ GuiState* gui_create(void) {
 
     /* Initialize CAD core */
     g->cad = (CadCore*)calloc(1, sizeof(CadCore));
-    if (g->cad) {
-        CadCore_Init(g->cad);
+    if (!g->cad) {
+        free(g);
+        return NULL;
     }
+    CadCore_Init(g->cad);
     
     /* Initialize current filename */
     g->current_filename[0] = '\0';
@@ -798,10 +755,10 @@ static void scan_asm_folder_for_shapes(GuiState* g, const char* folder_path) {
                             while (*start && isspace((unsigned char)*start)) start++;
                             char* p_pos_orig = line + (p_pos - line_lower);
                             if (start < p_pos_orig) {
-                                int name_len = p_pos_orig - start;
-                                if (name_len > 0 && name_len < 128) {
-                                    char shape_name[128];
-                                    strncpy(shape_name, start, name_len);
+                                char shape_name[128];
+                                const size_t name_len = (size_t)(p_pos_orig - start);
+                                if (name_len > 0 && name_len < sizeof(shape_name)) {
+                                    memcpy(shape_name, start, name_len);
                                     shape_name[name_len] = '\0';
                                 
                                 /* Check if we already have this shape */
@@ -949,19 +906,6 @@ static void scan_asm_folder_for_shapes(GuiState* g, const char* folder_path) {
     }
 }
 
-/* Helper: skip whitespace and return pointer to first non-whitespace */
-static char* skip_ws(char* s) {
-    while (*s && (*s == ' ' || *s == '\t')) s++;
-    return s;
-}
-
-/* Helper: find pattern in line (case-insensitive) and return pointer after it */
-static char* find_after(char* line_lower, const char* pattern) {
-    char* p = strstr(line_lower, pattern);
-    if (p) return p + strlen(pattern);
-    return NULL;
-}
-
 /* Simple JSON parser to extract shape-to-file mapping from Shapes.SFEOPTIM */
 static char* find_shape_file_in_json(const char* json_content, const char* shape_name) {
     if (!json_content || !shape_name) return NULL;
@@ -979,13 +923,13 @@ static char* find_shape_file_in_json(const char* json_content, const char* shape
     
     /* Extract filename until closing quote */
     static char filename[64];
-    int i = 0;
-    while (*pos && *pos != '"' && i < sizeof(filename) - 1) {
-        filename[i++] = *pos++;
+    size_t filename_length = 0;
+    while (*pos && *pos != '"' && filename_length + 1 < sizeof(filename)) {
+        filename[filename_length++] = *pos++;
     }
-    filename[i] = '\0';
+    filename[filename_length] = '\0';
     
-    if (i == 0) return NULL;
+    if (filename_length == 0) return NULL;
     
     return filename;
 }
@@ -2069,22 +2013,22 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
@@ -2101,7 +2045,7 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     v1 >= 0 && v1 < vertex_count) {
                                     /* Create Face2 (line) with its own point chain */
                                     int line_verts[2] = { v0, v1 };
-                                    if (create_polygon_with_points_safe(g->cad, vertices, line_verts, 2, color, vertex_count) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, line_verts, 2, (uint8_t)color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -2124,22 +2068,22 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
@@ -2163,7 +2107,7 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     v2 >= 0 && v2 < vertex_count) {
                                     /* Create Face3 (triangle) with its own point chain */
                                     int tri_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points_safe(g->cad, vertices, tri_verts, 3, color, vertex_count) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri_verts, 3, (uint8_t)color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -2183,22 +2127,22 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
@@ -2228,12 +2172,12 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     /* Split quad into 2 triangles: v0,v1,v2 and v0,v2,v3 */
                                     /* Each triangle gets its own point chain */
                                     int tri1_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points_safe(g->cad, vertices, tri1_verts, 3, color, vertex_count) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri1_verts, 3, (uint8_t)color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                     
                                     int tri2_verts[3] = { v0, v2, v3 };
-                                    if (create_polygon_with_points_safe(g->cad, vertices, tri2_verts, 3, color, vertex_count) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri2_verts, 3, (uint8_t)color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -2253,22 +2197,22 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int viz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* visibility */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nx = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal X */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int ny = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Y */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             
-                            int nz = (int)strtol(parse_pos, &parse_pos, 10);
+                            (void)strtol(parse_pos, &parse_pos, 10); /* normal Z */
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
                             if (*parse_pos == ',') parse_pos++;
                             while (*parse_pos == ' ' || *parse_pos == '\t') parse_pos++;
@@ -2304,17 +2248,17 @@ static int load_shape_from_asm(GuiState* g, const char* shape_name, const char* 
                                     /* Split pentagon into 3 triangles: v0,v1,v2, v0,v2,v3, and v0,v3,v4 */
                                     /* Each triangle gets its own point chain */
                                     int tri1_verts[3] = { v0, v1, v2 };
-                                    if (create_polygon_with_points_safe(g->cad, vertices, tri1_verts, 3, color, vertex_count) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri1_verts, 3, (uint8_t)color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                     
                                     int tri2_verts[3] = { v0, v2, v3 };
-                                    if (create_polygon_with_points_safe(g->cad, vertices, tri2_verts, 3, color, vertex_count) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri2_verts, 3, (uint8_t)color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                     
                                     int tri3_verts[3] = { v0, v3, v4 };
-                                    if (create_polygon_with_points_safe(g->cad, vertices, tri3_verts, 3, color, vertex_count) != INVALID_INDEX) {
+                                    if (create_polygon_with_points_safe(g->cad, vertices, tri3_verts, 3, (uint8_t)color, vertex_count) != INVALID_INDEX) {
                                         face_count++;
                                     }
                                 }
@@ -2360,8 +2304,16 @@ void gui_set_font(GuiState* g, FontWin32* font) {
     g->font = font;
 }
 
+GuiCommand gui_take_command(GuiState* g) {
+    if (!g) return GUI_COMMAND_NONE;
+
+    const GuiCommand command = g->pending_command;
+    g->pending_command = GUI_COMMAND_NONE;
+    return command;
+}
+
 void gui_load_tool_icons(GuiState* g, const char* resource_path) {
-    if (!g) return;
+    if (!g || !resource_path) return;
     
     /* Tool icon filenames in order (matching toolIcons array from bitmap.c) */
     const char* tool_names[TOOL_COUNT] = {
@@ -2393,6 +2345,8 @@ void gui_load_tool_icons(GuiState* g, const char* resource_path) {
     
     char path[512];
     for (int i = 0; i < TOOL_COUNT; i++) {
+        rg_free_texture(g->tool_icons[i]);
+        g->tool_icons[i] = NULL;
         snprintf(path, sizeof(path), "%s/%s", resource_path, tool_names[i]);
         g->tool_icons[i] = rg_load_texture(path);
         if (!g->tool_icons[i]) {
@@ -2402,7 +2356,7 @@ void gui_load_tool_icons(GuiState* g, const char* resource_path) {
 }
 
 void gui_load_anim_icons(GuiState* g, const char* resource_path) {
-    if (!g) return;
+    if (!g || !resource_path) return;
     
     /* Animation icon filenames in order */
     const char* anim_names[12] = {
@@ -2422,6 +2376,8 @@ void gui_load_anim_icons(GuiState* g, const char* resource_path) {
     
     char path[512];
     for (int i = 0; i < 12; i++) {
+        rg_free_texture(g->anim_icons[i]);
+        g->anim_icons[i] = NULL;
         snprintf(path, sizeof(path), "%s/%s", resource_path, anim_names[i]);
         g->anim_icons[i] = rg_load_texture(path);
         if (!g->anim_icons[i]) {
@@ -2681,12 +2637,10 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             CadView_Pan3DVertical(&g->views[g->view_right_interacting], -dy * 0.5);
             /* Also pan left/right in 3D view */
             CadView* view = &g->views[g->view_right_interacting];
-            double rx = view->rot_x * M_PI / 180.0;
             double ry = view->rot_y * M_PI / 180.0;
             /* Calculate right vector in world space */
             double right_x = cos(ry);
             double right_y = 0.0;
-            double right_z = sin(ry);
             /* Apply panning along the right vector */
             double pan_scale = 1.0 / view->zoom;
             view->pan_x += right_x * dx * pan_scale;
@@ -2796,12 +2750,10 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                                         fprintf(stderr, "Need at least 2 valid points to create a face\n");
                                         CadCore_ClearSelection(g->cad);
                                     } else {
-                                        int16_t p1 = selected_points[0];
-                                        
                                         /* Check if a polygon with these exact points already exists */
                                         int polygon_exists = 0;
                                         for (int poly_i = 0; poly_i < g->cad->data.polygonCount; poly_i++) {
-                                            CadPolygon* existing_poly = CadCore_GetPolygon(g->cad, poly_i);
+                                            CadPolygon* existing_poly = CadCore_GetPolygon(g->cad, (int16_t)poly_i);
                                             if (!existing_poly || existing_poly->flags == 0) continue;
                                             if (existing_poly->npoints != valid_count) continue;
                                             
@@ -2876,7 +2828,10 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                                                 }
                                                 
                                                 /* Create polygon with first new point */
-                                                int16_t poly_idx = CadCore_AddPolygon(g->cad, new_points[0], 0, new_point_count);
+                                                int16_t poly_idx = CadCore_AddPolygon(g->cad,
+                                                                                     new_points[0],
+                                                                                     0,
+                                                                                     (uint8_t)new_point_count);
                                                 
                                                 if (poly_idx != INVALID_INDEX) {
                                                     fprintf(stdout, "Created face with %d points (polygon index %d)\n", 
@@ -3213,6 +3168,7 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                                     if (CadImport_3DG1(g->cad, filename)) {
                                         fprintf(stdout, "Imported from: %s\n", filename);
                                         strncpy(g->current_filename, filename, sizeof(g->current_filename) - 1);
+                                        g->current_filename[sizeof(g->current_filename) - 1] = '\0';
                                     } else {
                                         fprintf(stderr, "Error: Failed to import 3DG1 file\n");
                                     }
@@ -3225,6 +3181,7 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                                     if (CadImport_OBJ(g->cad, filename)) {
                                         fprintf(stdout, "Imported from: %s\n", filename);
                                         strncpy(g->current_filename, filename, sizeof(g->current_filename) - 1);
+                                        g->current_filename[sizeof(g->current_filename) - 1] = '\0';
                                     } else {
                                         fprintf(stderr, "Error: Failed to import OBJ file\n");
                                     }
@@ -3314,8 +3271,6 @@ static void gui_draw_gui_elements(GuiState* g, int win_w, int win_h) {
     RG_Color edge = { 120,120,120,255 };
     
     const int cols = 2;
-    const int rows = (TOOL_COUNT + cols - 1) / cols; /* Round up */
-    
     /* Use original icon size (32x48) - buttons sized to fit icons */
     const int icon_w = 32;
     const int icon_h = 48;
@@ -3369,7 +3324,7 @@ static void gui_draw_gui_elements(GuiState* g, int win_w, int win_h) {
    DROPDOWN MENU RENDERING (must be drawn last, on top of everything)
    ============================================================================ */
 
-static void gui_draw_dropdown(GuiState* g, int win_w, int win_h) {
+static void gui_draw_dropdown(GuiState* g) {
     if (!g) return;
     
     /* Viewport and projection already set in gui_draw */
@@ -3485,7 +3440,7 @@ static void gui_draw_dropdown(GuiState* g, int win_w, int win_h) {
    CAD MODEL RENDERING (3D with depth testing)
    ============================================================================ */
 
-static void gui_draw_view_info_bar(GuiState* g, int view_idx, const GuiInput* in, int win_w, int win_h, int fb_w, int fb_h) {
+static void gui_draw_view_info_bar(GuiState* g, int view_idx, const GuiInput* in) {
     if (!g || !g->font || !in || view_idx < 0 || view_idx >= 4) return;
     
     Rect vr = g->view[view_idx].r;
@@ -3532,11 +3487,14 @@ static void gui_draw_cad_views(GuiState* g, int win_w, int win_h, int fb_w, int 
         Rect vr = g->view[i].r;
         Rect content = (Rect){ vr.x + 6, vr.y + 26, vr.w - 12, vr.h - 32 };
         
-        /* Scale viewport coordinates to framebuffer */
-        int scaled_x = (int)(content.x * scale_x);
-        int scaled_y = (int)(content.y * scale_y);
-        int scaled_w = (int)(content.w * scale_x);
-        int scaled_h = (int)(content.h * scale_y);
+        /* OpenGL clips in framebuffer pixels, while model projection stays in
+           the same logical coordinate system used by hit testing and dragging. */
+        int scaled_x = (int)lroundf((float)content.x * scale_x);
+        int scaled_y = (int)lroundf((float)content.y * scale_y);
+        int scaled_right = (int)lroundf((float)(content.x + content.w) * scale_x);
+        int scaled_bottom = (int)lroundf((float)(content.y + content.h) * scale_y);
+        int scaled_w = scaled_right - scaled_x;
+        int scaled_h = scaled_bottom - scaled_y;
         
         /* Enable depth testing for this viewport */
         glEnable(GL_DEPTH_TEST);
@@ -3552,8 +3510,9 @@ static void gui_draw_cad_views(GuiState* g, int win_w, int win_h, int fb_w, int 
         glClear(GL_DEPTH_BUFFER_BIT);
         glDisable(GL_SCISSOR_TEST);
         
-        /* Render CAD model in this viewport - use scaled coordinates */
-        CadView_Render(&g->views[i], g->cad, scaled_x, scaled_y, scaled_w, scaled_h, fb_h);
+        CadView_Render(&g->views[i], g->cad,
+                       scaled_x, scaled_y, scaled_w, scaled_h, fb_h,
+                       content.w, content.h);
         
         /* Reset to 2D after CAD rendering - restore main viewport/projection */
         rg_reset_viewport(win_w, win_h, fb_w, fb_h);
@@ -3562,7 +3521,7 @@ static void gui_draw_cad_views(GuiState* g, int win_w, int win_h, int fb_w, int 
         
         /* Draw info bar for this view */
         if (in) {
-            gui_draw_view_info_bar(g, i, in, win_w, win_h, fb_w, fb_h);
+            gui_draw_view_info_bar(g, i, in);
         }
     }
 }
@@ -3894,7 +3853,7 @@ void gui_draw(GuiState* g, const GuiInput* in, int win_w, int win_h, int fb_w, i
     }
     
     /* Step 4: Draw dropdown menu last (on top of everything) */
-    gui_draw_dropdown(g, win_w, win_h);
+    gui_draw_dropdown(g);
     
     /* Final reset to ensure clean state */
     rg_reset_viewport(win_w, win_h, fb_w, fb_h);

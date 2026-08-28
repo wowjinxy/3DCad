@@ -4,11 +4,10 @@
 
 typedef struct FontWin32 FontWin32;
 
-/* Creates a bitmap-font in the current OpenGL context using wglUseFontBitmaps.
-   faceName: "Helvetica" (falls back to Arial)
-   pointSize: e.g. 12 */
-FontWin32* font_create_helvetica_12(void* glfw_window);
-FontWin32* font_create_helvetica(void* glfw_window, int pointSize);
+/* Creates a bitmap font in the current OpenGL context using
+   wglUseFontBitmaps. Helvetica falls back to Arial when unavailable.
+   display_scale converts GDI's physical-pixel metrics to GUI coordinates. */
+FontWin32* font_create_helvetica(int point_size, float display_scale);
 void font_destroy(FontWin32* f);
 
 int font_height(const FontWin32* f);

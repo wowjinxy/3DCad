@@ -285,12 +285,12 @@ void CadCore_ClearSelection(CadCore* core) {
     
     /* Clear all selection flags */
     for (int i = 0; i < core->data.pointCount; i++) {
-        if (CadCore_IsPointValid(core, i)) {
+        if (CadCore_IsPointValid(core, (int16_t)i)) {
             core->data.points[i].selectFlag = 0;
         }
     }
     for (int i = 0; i < core->data.polygonCount; i++) {
-        if (CadCore_IsPolygonValid(core, i)) {
+        if (CadCore_IsPolygonValid(core, (int16_t)i)) {
             core->data.polygons[i].selectFlag = 0;
         }
     }
@@ -385,15 +385,15 @@ void CadCore_SelectAll(CadCore* core) {
     if (core->selectModeFlag == 1) {
         /* Select all points */
         for (int i = 0; i < core->data.pointCount; i++) {
-            if (CadCore_IsPointValid(core, i)) {
-                CadCore_SelectPoint(core, i);
+            if (CadCore_IsPointValid(core, (int16_t)i)) {
+                CadCore_SelectPoint(core, (int16_t)i);
             }
         }
     } else {
         /* Select all polygons */
         for (int i = 0; i < core->data.polygonCount; i++) {
-            if (CadCore_IsPolygonValid(core, i)) {
-                CadCore_SelectPolygon(core, i);
+            if (CadCore_IsPolygonValid(core, (int16_t)i)) {
+                CadCore_SelectPolygon(core, (int16_t)i);
             }
         }
     }
@@ -483,7 +483,7 @@ int CadCore_GetActivePointCount(CadCore* core) {
     
     int count = 0;
     for (int i = 0; i < core->data.pointCount; i++) {
-        if (CadCore_IsPointValid(core, i)) count++;
+        if (CadCore_IsPointValid(core, (int16_t)i)) count++;
     }
     return count;
 }
@@ -493,7 +493,7 @@ int CadCore_GetActivePolygonCount(CadCore* core) {
     
     int count = 0;
     for (int i = 0; i < core->data.polygonCount; i++) {
-        if (CadCore_IsPolygonValid(core, i)) count++;
+        if (CadCore_IsPolygonValid(core, (int16_t)i)) count++;
     }
     return count;
 }
@@ -503,7 +503,7 @@ int CadCore_GetActiveObjectCount(CadCore* core) {
     
     int count = 0;
     for (int i = 0; i < core->data.objectCount; i++) {
-        if (CadCore_IsObjectValid(core, i)) count++;
+        if (CadCore_IsObjectValid(core, (int16_t)i)) count++;
     }
     return count;
 }
@@ -702,7 +702,7 @@ int CadCore_IsPointConnected(CadCore* core, int16_t pointIndex) {
     
     /* Check all polygons to see if this point is used */
     for (int i = 0; i < core->data.polygonCount; i++) {
-        CadPolygon* poly = CadCore_GetPolygon(core, i);
+        CadPolygon* poly = CadCore_GetPolygon(core, (int16_t)i);
         if (!poly || poly->flags == 0) continue;
         if (poly->npoints < 2) continue;
         

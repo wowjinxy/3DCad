@@ -133,18 +133,6 @@ int FileDialog_SaveCAD(char* filename_out, int filename_out_size) {
     return FileDialog_Save(filename_out, filename_out_size, filter, "Save CAD File");
 }
 
-/* Convert UTF-8 to wide string */
-static int UTF8ToWide(const char* utf8, wchar_t* wide, int wide_size) {
-    if (!utf8 || !wide || wide_size <= 0) return 0;
-    
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, wide_size);
-    if (len <= 0) {
-        wide[0] = L'\0';
-        return 0;
-    }
-    return 1;
-}
-
 /* Folder selection dialog using IFileOpenDialog (faster, modern API) */
 int FileDialog_SelectFolder(char* folder_path_out, int folder_path_out_size) {
     if (!folder_path_out || folder_path_out_size < MAX_PATH) return 0;

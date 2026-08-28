@@ -1,20 +1,10 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "render_gl.h"
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
 #define STB_IMAGE_IMPLEMENTATION
 #include "../include/stb_image.h"
 
-#include <GL/gl.h>
+#include <SDL3/SDL_opengl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,38 +39,19 @@ static void set_color(RG_Color c) {
     glColor4ub(c.r, c.g, c.b, c.a);
 }
 
-void rg_begin_frame(int win_w, int win_h, RG_Color clear) {
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_LIGHTING);
-    glDisable(GL_TEXTURE_2D);
-    glDisable(GL_SCISSOR_TEST);
-
-    /* win_w and win_h should be framebuffer size for viewport */
-    glViewport(0, 0, win_w, win_h);
-
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    /* Use framebuffer size for projection to match viewport */
-    glOrtho(0.0, (double)win_w, (double)win_h, 0.0, -1.0, 1.0);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-
-    glClearColor(clear.r / 255.0f, clear.g / 255.0f, clear.b / 255.0f, clear.a / 255.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-}
-
-void rg_set_viewport_tl(int x, int y, int w, int h, int win_h) {
-    if (w <= 0 || h <= 0) return;
-    int gl_y = win_h - (y + h);
+void rg_set_viewport_tl(int pixel_x, int pixel_y,
+                        int pixel_w, int pixel_h, int framebuffer_h,
+                        int logical_w, int logical_h) {
+    if (pixel_w <= 0 || pixel_h <= 0 || logical_w <= 0 || logical_h <= 0) return;
+    int gl_y = framebuffer_h - (pixel_y + pixel_h);
     if (gl_y < 0) gl_y = 0;
-    glViewport(x, gl_y, w, h);
+    glViewport(pixel_x, gl_y, pixel_w, pixel_h);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(x, gl_y, w, h);
+    glScissor(pixel_x, gl_y, pixel_w, pixel_h);
 
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0.0, (double)w, (double)h, 0.0, -1.0, 1.0);
+    glOrtho(0.0, (double)logical_w, (double)logical_h, 0.0, -1.0, 1.0);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 }
@@ -124,16 +95,6 @@ void rg_line(int x1, int y1, int x2, int y2, RG_Color c) {
     glBegin(GL_LINES);
     glVertex2i(x1, y1);
     glVertex2i(x2, y2);
-    glEnd();
-}
-
-void rg_fill_polygon(const int* x_coords, const int* y_coords, int num_points, RG_Color c) {
-    if (!x_coords || !y_coords || num_points < 3) return;
-    set_color(c);
-    glBegin(GL_POLYGON);
-    for (int i = 0; i < num_points; i++) {
-        glVertex2i(x_coords[i], y_coords[i]);
-    }
     glEnd();
 }
 

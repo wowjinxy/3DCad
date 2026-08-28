@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "3dcad",
+  "version-semver": "0.1.0",
+  "description": "SDL3 and OpenGL frontend for the Iwamoto 3D-CAD file format",
+  "supports": "windows",
+  "dependencies": [
+    "sdl3"
+  ]
+}

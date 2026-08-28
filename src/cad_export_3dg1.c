@@ -75,7 +75,6 @@ int CadExport_3DG1(const CadCore* core, const char* filename) {
     }
     
     /* Step 3: Collect unique colors */
-    uint8_t used_colors[256]; // never used again for 3DG1 but this is needed to compute the total at the end
     int color_count = 0;
     int color_map[256]; /* Maps color index to material index */
     
@@ -91,8 +90,7 @@ int CadExport_3DG1(const CadCore* core, const char* filename) {
         
         uint8_t color_idx = poly->color;
         if (color_map[color_idx] == -1) {
-            color_map[color_idx] = color_count;
-            used_colors[color_count++] = color_idx;
+            color_map[color_idx] = color_count++;
         }
     }
     

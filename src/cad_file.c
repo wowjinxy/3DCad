@@ -20,10 +20,6 @@ static inline int16_t swap_int16(int16_t value) {
     return (int16_t)(((value & 0xFF) << 8) | ((value & 0xFF00) >> 8));
 }
 
-static inline uint16_t swap_uint16(uint16_t value) {
-    return (uint16_t)(((value & 0xFF) << 8) | ((value & 0xFF00) >> 8));
-}
-
 static inline double swap_double(double value) {
     union { double d; uint64_t i; } u;
     u.d = value;
@@ -188,7 +184,7 @@ int CadFile_Load(const char* filename, CadFileData* data) {
             }
             
             if (actual_index >= 0 && actual_index < CAD_MAX_POLYGONS) {
-                index = actual_index;
+                index = (int16_t)actual_index;
                 CadPolygon temp_poly;
                 if (fread(&temp_poly, sizeof(CadPolygon), 1, fp) != 1) {
                     fprintf(stderr, "Error: Failed to read polygon data for index %d (at byte %zu)\n", index, bytes_read);
@@ -248,7 +244,7 @@ int CadFile_Load(const char* filename, CadFileData* data) {
             }
             
             if (actual_index >= 0 && actual_index < CAD_MAX_POINTS) {
-                index = actual_index;
+                index = (int16_t)actual_index;
                 CadPoint temp_point;
                 if (fread(&temp_point, sizeof(CadPoint), 1, fp) != 1) {
                     fprintf(stderr, "Error: Failed to read point data for index %d (at byte %zu)\n", index, bytes_read);
@@ -279,9 +275,10 @@ int CadFile_Load(const char* filename, CadFileData* data) {
             /* Try to read a few more bytes to see what's in the file */
             uint8_t peek[16];
             long pos = ftell(fp);
-            if (fread(peek, 1, sizeof(peek), fp) > 0) {
-                fprintf(stderr, "Next 16 bytes: ");
-                for (int i = 0; i < 16 && i < sizeof(peek); i++) {
+            const size_t peek_size = fread(peek, 1, sizeof(peek), fp);
+            if (peek_size > 0) {
+                fprintf(stderr, "Next %zu bytes: ", peek_size);
+                for (size_t i = 0; i < peek_size; ++i) {
                     fprintf(stderr, "%02X ", peek[i]);
                 }
                 fprintf(stderr, "\n");

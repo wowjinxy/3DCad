@@ -3,17 +3,7 @@
 #include "cad_view.h"
 #include "render_gl.h"
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
-#include <GL/gl.h>
+#include <SDL3/SDL_opengl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,7 +75,6 @@ void CadView_Pan3DVertical(CadView* view, double dy) {
     /* The up vector in view space is (0, 1, 0), we need to rotate it */
     double up_x = -sin(ry) * sin(rx);
     double up_y = cos(rx);
-    double up_z = cos(ry) * sin(rx);
     
     /* Apply panning along the up vector */
     /* Scale the movement and apply to pan */
@@ -102,7 +91,7 @@ void CadView_ProjectPoint(const CadView* view, double x, double y, double z,
                          int* out_x, int* out_y, int viewport_w, int viewport_h) {
     if (!view || !out_x || !out_y) return;
     
-    double px, py, pz;
+    double px, py;
     
     /* Apply rotation for 3D view */
     if (view->type == CAD_VIEW_3D) {
@@ -116,31 +105,26 @@ void CadView_ProjectPoint(const CadView* view, double x, double y, double z,
         /* Rotate around Y axis */
         px = x * cos(ry) + z1 * sin(ry);
         py = y1;
-        pz = -x * sin(ry) + z1 * cos(ry);
     } else {
         /* Orthographic projections */
         switch (view->type) {
         case CAD_VIEW_TOP:
             px = x;
             py = -z;  /* Y becomes depth */
-            pz = y;
             break;
         case CAD_VIEW_FRONT:
             /* Front view: looking from front, X is left/right, Y is up/down, Z is depth */
             px = x;  /* X is horizontal (left/right) */
             py = y;  /* Y is vertical (up/down, flipped) */
-            pz = z;  /* Z is depth */
             break;
         case CAD_VIEW_RIGHT:
             /* Right view: looking from right, Z is forward/back, Y is up/down, X is depth */
             px = z;  /* Z becomes horizontal (forward/back) */
             py = y;  /* Y is vertical (up/down, flipped) */
-            pz = -x; /* X is depth (negative because we're looking from right) */
             break;
         default:
             px = x;
             py = y;
-            pz = z;
             break;
         }
     }
@@ -158,20 +142,23 @@ void CadView_ProjectPoint(const CadView* view, double x, double y, double z,
    Rendering
    ---------------------------------------------------------------------------- */
 void CadView_Render(const CadView* view, const CadCore* core,
-                    int viewport_x, int viewport_y, int viewport_w, int viewport_h, int win_h)
+                    int pixel_x, int pixel_y, int pixel_w, int pixel_h,
+                    int framebuffer_h, int logical_w, int logical_h)
 {
-    if (!view || !core) return;
+    if (!view || !core || pixel_w <= 0 || pixel_h <= 0 ||
+        logical_w <= 0 || logical_h <= 0) return;
 
     /* -----------------------------
        Viewport + scissor (top-left UI coords)
        ----------------------------- */
-    rg_set_viewport_tl(viewport_x, viewport_y, viewport_w, viewport_h, win_h);
+    rg_set_viewport_tl(pixel_x, pixel_y, pixel_w, pixel_h, framebuffer_h,
+                       logical_w, logical_h);
 
     glEnable(GL_SCISSOR_TEST);
     {
-        int sc_y = win_h - (viewport_y + viewport_h);
+        int sc_y = framebuffer_h - (pixel_y + pixel_h);
         if (sc_y < 0) sc_y = 0;
-        glScissor(viewport_x, sc_y, viewport_w, viewport_h);
+        glScissor(pixel_x, sc_y, pixel_w, pixel_h);
     }
 
     /* -----------------------------
@@ -182,19 +169,14 @@ void CadView_Render(const CadView* view, const CadCore* core,
     glDisable(GL_CULL_FACE);
 
     RG_Color white = { 255, 255, 255, 255 };
-    rg_fill_rect(0, 0, viewport_w, viewport_h, white);
+    rg_fill_rect(0, 0, logical_w, logical_h, white);
 
     RG_Color grid = { 200, 200, 200, 255 };
     {
-        int cx = viewport_w / 2;
-        int cy = viewport_h / 2;
-        rg_line(0, cy, viewport_w, cy, grid);
-        rg_line(cx, 0, cx, viewport_w /* oops */, grid); /* fixed below */
-    }
-    /* Fix vertical line end (typo-safe) */
-    {
-        int cx = viewport_w / 2;
-        rg_line(cx, 0, cx, viewport_h, grid);
+        int cx = logical_w / 2;
+        int cy = logical_h / 2;
+        rg_line(0, cy, logical_w, cy, grid);
+        rg_line(cx, 0, cx, logical_h, grid);
     }
 
     const CadFileData* data = &core->data;
@@ -204,7 +186,7 @@ void CadView_Render(const CadView* view, const CadCore* core,
        ----------------------------- */
     if (view->wireframe) {
         for (int i = 0; i < data->polygonCount; i++) {
-            CadPolygon* poly = CadCore_GetPolygon((CadCore*)core, i);
+            CadPolygon* poly = CadCore_GetPolygon((CadCore*)core, (int16_t)i);
             if (!poly || poly->flags == 0) continue;
 
             int16_t point_idx = poly->firstPoint;
@@ -256,7 +238,7 @@ void CadView_Render(const CadView* view, const CadCore* core,
                 if (!pt || pt->flags == 0) break; /* Invalid point */
 
                 CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz,
-                                     &x_coords[count], &y_coords[count], viewport_w, viewport_h);
+                                     &x_coords[count], &y_coords[count], logical_w, logical_h);
 
                 current = pt->nextPoint;
                 count++;
@@ -279,19 +261,20 @@ void CadView_Render(const CadView* view, const CadCore* core,
 
         /* Render all points: selected = red, orphaned = blue */
         for (int i = 0; i < core->data.pointCount; i++) {
-            CadPoint* pt = CadCore_GetPoint((CadCore*)core, i);
+            CadPoint* pt = CadCore_GetPoint((CadCore*)core, (int16_t)i);
             if (!pt || pt->flags == 0) continue;
             
             /* Check if point is selected */
-            int is_selected = CadCore_IsPointSelected((CadCore*)core, i);
+            int is_selected = CadCore_IsPointSelected((CadCore*)core, (int16_t)i);
             
             /* Check if point is connected to any polygon */
-            int is_connected = CadCore_IsPointConnected((CadCore*)core, i);
+            int is_connected = CadCore_IsPointConnected((CadCore*)core, (int16_t)i);
             
             /* Only render selected points (red) or orphaned points (blue) */
             if (is_selected || !is_connected) {
                 int x, y;
-                CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz, &x, &y, viewport_w, viewport_h);
+                CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz,
+                                     &x, &y, logical_w, logical_h);
                 
                 RG_Color color;
                 if (is_selected) {
@@ -317,8 +300,8 @@ void CadView_Render(const CadView* view, const CadCore* core,
     glLoadIdentity();
     {
         const double depth_range = 10000.0;
-        glOrtho(-viewport_w / 2.0, viewport_w / 2.0,
-                -viewport_h / 2.0, viewport_h / 2.0,
+        glOrtho(-logical_w / 2.0, logical_w / 2.0,
+                -logical_h / 2.0, logical_h / 2.0,
                 -depth_range, depth_range);
     }
 
@@ -369,7 +352,7 @@ void CadView_Render(const CadView* view, const CadCore* core,
        Draw polygons (solid)
        ----------------------------- */
     for (int i = 0; i < data->polygonCount; i++) {
-        CadPolygon* poly = CadCore_GetPolygon((CadCore*)core, i);
+        CadPolygon* poly = CadCore_GetPolygon((CadCore*)core, (int16_t)i);
         if (!poly || poly->flags == 0) continue;
 
         int16_t point_idx = poly->firstPoint;
@@ -427,24 +410,21 @@ void CadView_Render(const CadView* view, const CadCore* core,
             if (!pt || pt->flags == 0) break; /* Invalid point */
 
             CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz,
-                                 &x_coords[count], &y_coords[count], viewport_w, viewport_h);
+                                 &x_coords[count], &y_coords[count], logical_w, logical_h);
 
             /* View-space-ish depth (your existing approach) */
-            double px, py, pz;
+            double pz;
             if (view->type == CAD_VIEW_3D) {
                 double rx = view->rot_x * M_PI / 180.0;
                 double ry = view->rot_y * M_PI / 180.0;
-                double y1 = pt->pointy * cos(rx) - pt->pointz * sin(rx);
                 double z1 = pt->pointy * sin(rx) + pt->pointz * cos(rx);
-                px = pt->pointx * cos(ry) + z1 * sin(ry);
-                py = y1;
                 pz = -pt->pointx * sin(ry) + z1 * cos(ry);
             } else {
                 switch (view->type) {
-                case CAD_VIEW_TOP:   px = pt->pointx; py = -pt->pointz; pz = pt->pointy;  break;
-                case CAD_VIEW_FRONT: px = pt->pointx; py = -pt->pointy; pz = pt->pointz;  break;
-                case CAD_VIEW_RIGHT: px = pt->pointz; py = -pt->pointy; pz = -pt->pointx; break;
-                default:             px = pt->pointx; py = pt->pointy;  pz = pt->pointz;  break;
+                case CAD_VIEW_TOP:   pz = pt->pointy;  break;
+                case CAD_VIEW_FRONT: pz = pt->pointz;  break;
+                case CAD_VIEW_RIGHT: pz = -pt->pointx; break;
+                default:             pz = pt->pointz;  break;
                 }
             }
 
@@ -462,9 +442,9 @@ void CadView_Render(const CadView* view, const CadCore* core,
             
             glBegin(GL_LINES);
             for (int j = 0; j < count; j++) {
-                int gl_y = viewport_h - y_coords[j];
-                glVertex3d((double)x_coords[j] - viewport_w / 2.0,
-                           (double)gl_y - viewport_h / 2.0,
+                int gl_y = logical_h - y_coords[j];
+                glVertex3d((double)x_coords[j] - logical_w / 2.0,
+                           (double)gl_y - logical_h / 2.0,
                            z_coords[j]);
             }
             glEnd();
@@ -472,16 +452,16 @@ void CadView_Render(const CadView* view, const CadCore* core,
             /* Compute normal in the SAME space as the vertices we draw (fixes �weird shading�) */
             double nx = 0.0, ny = 0.0, nz = 1.0;
             {
-                double x1 = (double)x_coords[0] - viewport_w / 2.0;
-                double y1 = (double)(viewport_h - y_coords[0]) - viewport_h / 2.0;
+                double x1 = (double)x_coords[0] - logical_w / 2.0;
+                double y1 = (double)(logical_h - y_coords[0]) - logical_h / 2.0;
                 double z1 = z_coords[0];
 
-                double x2 = (double)x_coords[1] - viewport_w / 2.0;
-                double y2 = (double)(viewport_h - y_coords[1]) - viewport_h / 2.0;
+                double x2 = (double)x_coords[1] - logical_w / 2.0;
+                double y2 = (double)(logical_h - y_coords[1]) - logical_h / 2.0;
                 double z2 = z_coords[1];
 
-                double x3 = (double)x_coords[2] - viewport_w / 2.0;
-                double y3 = (double)(viewport_h - y_coords[2]) - viewport_h / 2.0;
+                double x3 = (double)x_coords[2] - logical_w / 2.0;
+                double y3 = (double)(logical_h - y_coords[2]) - logical_h / 2.0;
                 double z3 = z_coords[2];
 
                 double v1x = x2 - x1, v1y = y2 - y1, v1z = z2 - z1;
@@ -501,9 +481,9 @@ void CadView_Render(const CadView* view, const CadCore* core,
 
             glBegin(GL_POLYGON);
             for (int j = 0; j < count; j++) {
-                int gl_y = viewport_h - y_coords[j];
-                glVertex3d((double)x_coords[j] - viewport_w / 2.0,
-                           (double)gl_y - viewport_h / 2.0,
+                int gl_y = logical_h - y_coords[j];
+                glVertex3d((double)x_coords[j] - logical_w / 2.0,
+                           (double)gl_y - logical_h / 2.0,
                            z_coords[j]);
             }
             glEnd();
@@ -515,15 +495,15 @@ void CadView_Render(const CadView* view, const CadCore* core,
             glBegin(GL_LINES);
             for (int j = 0; j < count; j++) {
                 int next = (j + 1) % count;
-                int gl_y1 = viewport_h - y_coords[j];
-                int gl_y2 = viewport_h - y_coords[next];
+                int gl_y1 = logical_h - y_coords[j];
+                int gl_y2 = logical_h - y_coords[next];
 
-                glVertex3d((double)x_coords[j] - viewport_w / 2.0,
-                           (double)gl_y1 - viewport_h / 2.0,
+                glVertex3d((double)x_coords[j] - logical_w / 2.0,
+                           (double)gl_y1 - logical_h / 2.0,
                            z_coords[j]);
 
-                glVertex3d((double)x_coords[next] - viewport_w / 2.0,
-                           (double)gl_y2 - viewport_h / 2.0,
+                glVertex3d((double)x_coords[next] - logical_w / 2.0,
+                           (double)gl_y2 - logical_h / 2.0,
                            z_coords[next]);
             }
             glEnd();
@@ -548,7 +528,7 @@ void CadView_Render(const CadView* view, const CadCore* core,
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();
     glLoadIdentity();
-    glOrtho(0.0, (double)viewport_w, (double)viewport_h, 0.0, -1.0, 1.0);
+    glOrtho(0.0, (double)logical_w, (double)logical_h, 0.0, -1.0, 1.0);
 
     glMatrixMode(GL_MODELVIEW);
     glPushMatrix();
@@ -556,19 +536,20 @@ void CadView_Render(const CadView* view, const CadCore* core,
 
     /* Render all points: selected = red, orphaned = blue */
     for (int i = 0; i < core->data.pointCount; i++) {
-        CadPoint* pt = CadCore_GetPoint((CadCore*)core, i);
+        CadPoint* pt = CadCore_GetPoint((CadCore*)core, (int16_t)i);
         if (!pt || pt->flags == 0) continue;
         
         /* Check if point is selected */
-        int is_selected = CadCore_IsPointSelected((CadCore*)core, i);
+        int is_selected = CadCore_IsPointSelected((CadCore*)core, (int16_t)i);
         
         /* Check if point is connected to any polygon */
-        int is_connected = CadCore_IsPointConnected((CadCore*)core, i);
+        int is_connected = CadCore_IsPointConnected((CadCore*)core, (int16_t)i);
         
         /* Only render selected points (red) or orphaned points (blue) */
         if (is_selected || !is_connected) {
             int x, y;
-            CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz, &x, &y, viewport_w, viewport_h);
+            CadView_ProjectPoint(view, pt->pointx, pt->pointy, pt->pointz,
+                                 &x, &y, logical_w, logical_h);
             
             RG_Color color;
             if (is_selected) {
@@ -592,9 +573,9 @@ void CadView_Render(const CadView* view, const CadCore* core,
     /* Keep scissor clipped to viewport */
     glEnable(GL_SCISSOR_TEST);
     {
-        int sc_y = win_h - (viewport_y + viewport_h);
+        int sc_y = framebuffer_h - (pixel_y + pixel_h);
         if (sc_y < 0) sc_y = 0;
-        glScissor(viewport_x, sc_y, viewport_w, viewport_h);
+        glScissor(pixel_x, sc_y, pixel_w, pixel_h);
     }
 }
 
@@ -702,6 +683,9 @@ void CadView_UnprojectDelta(const CadView* view, int screen_dx, int screen_dy,
                             int viewport_w, int viewport_h,
                             double* out_dx, double* out_dy, double* out_dz) {
     if (!view || !out_dx || !out_dy || !out_dz) return;
+
+    (void)viewport_w;
+    (void)viewport_h;
     
     /* Convert screen delta to viewport space (accounting for zoom) */
     double vp_dx = (double)screen_dx / view->zoom;

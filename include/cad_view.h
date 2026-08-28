@@ -92,6 +92,9 @@ void CadView_UnprojectPoint(const CadView* view, int screen_x, int screen_y,
 /* ----------------------------------------------------------------------------
    Rendering
    ---------------------------------------------------------------------------- */
-void CadView_Render(const CadView* view, const CadCore* core, 
-                    int viewport_x, int viewport_y, int viewport_w, int viewport_h, int win_h);
+/* Pixel bounds select the framebuffer region; logical dimensions keep model
+   projection aligned with DPI-independent GUI input coordinates. */
+void CadView_Render(const CadView* view, const CadCore* core,
+                    int pixel_x, int pixel_y, int pixel_w, int pixel_h,
+                    int framebuffer_h, int logical_w, int logical_h);
 

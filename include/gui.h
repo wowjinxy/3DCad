@@ -18,8 +18,14 @@ typedef struct GuiInput {
 
 typedef struct GuiState GuiState;
 
+typedef enum GuiCommand {
+    GUI_COMMAND_NONE = 0,
+    GUI_COMMAND_QUIT
+} GuiCommand;
+
 GuiState* gui_create(void);
 void gui_destroy(GuiState* g);
+GuiCommand gui_take_command(GuiState* g);
 
 void gui_set_font(GuiState* g, FontWin32* font);
 void gui_load_tool_icons(GuiState* g, const char* resource_path);

@@ -2,7 +2,8 @@
 
 #include "font_win32.h"
 
-#include <stdio.h>
+#include <SDL3/SDL_opengl.h>
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,14 +18,6 @@
 #include <wingdi.h>
 #endif
 
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-#ifdef _WIN32
-#define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3native.h>
-#endif
-#include <GL/gl.h>
-
 struct FontWin32 {
     GLuint base;
     int ascent;
@@ -32,134 +25,161 @@ struct FontWin32 {
     int widths[96]; /* ASCII 32..127 */
 };
 
-static int get_widths(HDC hdc, int* out_widths, int fallback) {
-    int w[96] = { 0 };
-    if (!GetCharWidth32A(hdc, 32, 127, w)) {
-        for (int i = 0; i < 96; i++) out_widths[i] = fallback;
-        return 0;
+#ifdef _WIN32
+
+static int to_logical_pixels(int physical_pixels, float display_scale) {
+    if (display_scale <= 0.0f) {
+        display_scale = 1.0f;
     }
-    for (int i = 0; i < 96; i++) out_widths[i] = w[i];
-    return 1;
+
+    const int logical_pixels = (int)((float)physical_pixels / display_scale + 0.5f);
+    return logical_pixels > 0 ? logical_pixels : 1;
 }
 
-static HFONT create_font(HDC hdc, const char* face, int pointSize) {
-    /* pointSize is already adjusted for DPI in font_create_helvetica */
-    int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
-    int height = -MulDiv(pointSize, dpi, 72);
-    return CreateFontA(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        ANSI_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-        FF_DONTCARE, face);
+static void get_widths(HDC hdc, int* out_widths, int fallback, float display_scale) {
+    int physical_widths[96] = {0};
+    if (!GetCharWidth32A(hdc, 32, 127, physical_widths)) {
+        for (int i = 0; i < 96; ++i) {
+            out_widths[i] = to_logical_pixels(fallback, display_scale);
+        }
+        return;
+    }
+
+    for (int i = 0; i < 96; ++i) {
+        out_widths[i] = to_logical_pixels(physical_widths[i], display_scale);
+    }
 }
 
-FontWin32* font_create_helvetica_12(void* glfw_window) {
-    return font_create_helvetica(glfw_window, 12);
+static HFONT create_font(const char* face, int point_size, float display_scale) {
+    if (display_scale <= 0.0f) {
+        display_scale = 1.0f;
+    }
+
+    /* GDI's screen DC reports the system DPI on many per-monitor-aware setups.
+       SDL's window display scale tracks the monitor that actually owns the
+       window, so use it for both bitmap size and logical metric conversion. */
+    const float pixel_height = (float)point_size * (96.0f / 72.0f) * display_scale;
+    const int height = -(int)(pixel_height + 0.5f);
+    return CreateFontA(height,
+                       0,
+                       0,
+                       0,
+                       FW_NORMAL,
+                       FALSE,
+                       FALSE,
+                       FALSE,
+                       ANSI_CHARSET,
+                       OUT_TT_PRECIS,
+                       CLIP_DEFAULT_PRECIS,
+                       ANTIALIASED_QUALITY,
+                       FF_DONTCARE,
+                       face);
 }
 
-FontWin32* font_create_helvetica(void* glfw_window, int pointSize) {
+#endif
+
+FontWin32* font_create_helvetica(int point_size, float display_scale) {
 #ifndef _WIN32
-    (void)glfw_window;
-    (void)pointSize;
+    (void)point_size;
+    (void)display_scale;
     return NULL;
 #else
-    GLFWwindow* win = (GLFWwindow*)glfw_window;
-    if (!win) return NULL;
+    if (point_size <= 0) {
+        return NULL;
+    }
 
-    /* Ensure context current, then use wglGetCurrentDC */
+    /* SDL owns the window and context. WGL exposes the current context's DC,
+       so the font layer does not need a window-system handle. */
     HDC hdc = wglGetCurrentDC();
-    HWND hwnd = NULL;
-    int gotHdcFromWgl = (hdc != NULL);
-
     if (!hdc) {
-        hwnd = glfwGetWin32Window(win);
-        if (!hwnd) return NULL;
-        hdc = GetDC(hwnd);
-        if (!hdc) return NULL;
+        return NULL;
     }
 
-    /* Get actual DPI from device context - Windows might return scaled DPI */
-    int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
-    int base_dpi = 96;
-    float dpi_ratio = (float)dpi / (float)base_dpi;
-    
-    /* Scale down point size to compensate for Windows DPI scaling */
-    /* If DPI is 192 (200% scaling), we need to pass 6pt to get 12pt visual size */
-    int adjusted_point_size = (int)((float)pointSize / dpi_ratio);
-    if (adjusted_point_size < 1) adjusted_point_size = 1;
-    
-    fprintf(stdout, "Font DPI: %d, ratio: %.2f, requested: %dpt, adjusted: %dpt\n", 
-            dpi, dpi_ratio, pointSize, adjusted_point_size);
-
-    HFONT font = create_font(hdc, "Helvetica", adjusted_point_size);
-    if (!font) font = create_font(hdc, "Arial", adjusted_point_size);
+    HFONT font = create_font("Helvetica", point_size, display_scale);
     if (!font) {
-        if (!gotHdcFromWgl && hwnd) ReleaseDC(hwnd, hdc);
+        font = create_font("Arial", point_size, display_scale);
+    }
+    if (!font) {
         return NULL;
     }
 
-    HFONT old = (HFONT)SelectObject(hdc, font);
-    TEXTMETRICA tm;
-    memset(&tm, 0, sizeof(tm));
-    GetTextMetricsA(hdc, &tm);
-
-    FontWin32* f = (FontWin32*)calloc(1, sizeof(FontWin32));
-    if (!f) {
-        SelectObject(hdc, old);
+    HFONT old_font = (HFONT)SelectObject(hdc, font);
+    TEXTMETRICA metrics;
+    memset(&metrics, 0, sizeof(metrics));
+    if (!GetTextMetricsA(hdc, &metrics)) {
+        SelectObject(hdc, old_font);
         DeleteObject(font);
-        if (!gotHdcFromWgl && hwnd) ReleaseDC(hwnd, hdc);
         return NULL;
     }
 
-    f->base = glGenLists(96);
-    f->ascent = (int)tm.tmAscent;
-    f->height = (int)(tm.tmHeight + tm.tmExternalLeading);
-    get_widths(hdc, f->widths, (int)tm.tmAveCharWidth);
-
-    if (f->base == 0 || !wglUseFontBitmapsA(hdc, 32, 96, f->base)) {
-        if (f->base) glDeleteLists(f->base, 96);
-        free(f);
-        SelectObject(hdc, old);
+    FontWin32* result = (FontWin32*)calloc(1, sizeof(*result));
+    if (!result) {
+        SelectObject(hdc, old_font);
         DeleteObject(font);
-        if (!gotHdcFromWgl && hwnd) ReleaseDC(hwnd, hdc);
         return NULL;
     }
 
-    SelectObject(hdc, old);
+    result->base = glGenLists(96);
+    result->ascent = to_logical_pixels((int)metrics.tmAscent, display_scale);
+    result->height = to_logical_pixels((int)(metrics.tmHeight + metrics.tmExternalLeading),
+                                       display_scale);
+    get_widths(hdc, result->widths, (int)metrics.tmAveCharWidth, display_scale);
+
+    if (result->base == 0 || !wglUseFontBitmapsA(hdc, 32, 96, result->base)) {
+        if (result->base != 0) {
+            glDeleteLists(result->base, 96);
+        }
+        free(result);
+        result = NULL;
+    }
+
+    SelectObject(hdc, old_font);
     DeleteObject(font);
-    if (!gotHdcFromWgl && hwnd) ReleaseDC(hwnd, hdc);
-    return f;
+    return result;
 #endif
 }
 
-void font_destroy(FontWin32* f) {
-    if (!f) return;
-    if (f->base) glDeleteLists(f->base, 96);
-    free(f);
-}
-
-int font_height(const FontWin32* f) {
-    return (f && f->height > 0) ? f->height : 16;
-}
-
-int font_measure(const FontWin32* f, const char* text) {
-    if (!text) return 0;
-    if (!f) return (int)strlen(text) * 8;
-    int w = 0;
-    for (const unsigned char* p = (const unsigned char*)text; *p; p++) {
-        unsigned c = *p;
-        if (c < 32 || c > 127) { w += f->widths['?' - 32]; continue; }
-        w += f->widths[c - 32];
+void font_destroy(FontWin32* font) {
+    if (!font) {
+        return;
     }
-    return w;
+    if (font->base != 0) {
+        glDeleteLists(font->base, 96);
+    }
+    free(font);
 }
 
-void font_draw(const FontWin32* f, int x, int y, const char* text, uint8_t gray) {
-    if (!f || !text) return;
-    float g = gray / 255.0f;
-    glColor3f(g, g, g);
-    glRasterPos2i(x, y + f->ascent);
-    glListBase(f->base - 32);
+int font_height(const FontWin32* font) {
+    return (font && font->height > 0) ? font->height : 16;
+}
+
+int font_measure(const FontWin32* font, const char* text) {
+    if (!text) {
+        return 0;
+    }
+    if (!font) {
+        return (int)strlen(text) * 8;
+    }
+
+    int width = 0;
+    for (const unsigned char* cursor = (const unsigned char*)text; *cursor; ++cursor) {
+        unsigned int character = *cursor;
+        if (character < 32 || character > 127) {
+            character = '?';
+        }
+        width += font->widths[character - 32];
+    }
+    return width;
+}
+
+void font_draw(const FontWin32* font, int x, int y, const char* text, uint8_t gray) {
+    if (!font || !text) {
+        return;
+    }
+
+    const float value = (float)gray / 255.0f;
+    glColor3f(value, value, value);
+    glRasterPos2i(x, y + font->ascent);
+    glListBase(font->base - 32);
     glCallLists((GLsizei)strlen(text), GL_UNSIGNED_BYTE, (const GLubyte*)text);
 }
-
-
-
