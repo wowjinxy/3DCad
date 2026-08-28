@@ -1043,14 +1043,22 @@ static int cad_paired_member_is_hidden(const CadView* view,
     return normal >= 0.0;
 }
 
-static double cad_gl_depth(double camera_depth)
+double CadView_NormalizedDepth(double camera_depth)
 {
     double depth;
+    if (!isfinite(camera_depth)) return 1.0;
     if (camera_depth < CAD_NEAR_PLANE) camera_depth = CAD_NEAR_PLANE;
-    depth = 1.0 - (2.0 * CAD_NEAR_PLANE / camera_depth);
-    if (depth < -1.0) depth = -1.0;
-    if (depth > 0.999999) depth = 0.999999;
+    depth = 1.0 - (CAD_NEAR_PLANE / camera_depth);
+    if (depth < 0.0) depth = 0.0;
+    if (depth > 0.9999995) depth = 0.9999995;
     return depth;
+}
+
+static double cad_gl_vertex_z(double camera_depth)
+{
+    /* glOrtho(..., -1, 1) negates the supplied Z coordinate.  Convert the
+       desired normalized window depth back through that transform. */
+    return 1.0 - 2.0 * CadView_NormalizedDepth(camera_depth);
 }
 
 static double cad_cross_2d(double ax, double ay, double bx, double by,
@@ -1074,7 +1082,28 @@ static int cad_point_in_triangle(double px, double py,
 static void cad_emit_projected_vertex(const ProjectedPolygon* polygon, int index)
 {
     glVertex3d(polygon->x[index], polygon->y[index],
-               cad_gl_depth(polygon->camera_depth[index]));
+               cad_gl_vertex_z(polygon->camera_depth[index]));
+}
+
+static void cad_fill_point_handle(int screen_x, int screen_y,
+                                  double camera_depth, RG_Color color,
+                                  int use_depth)
+{
+    if (!use_depth) {
+        rg_fill_rect(screen_x - 3, screen_y - 3, 7, 7, color);
+        return;
+    }
+    glColor4ub(color.r, color.g, color.b, color.a);
+    glBegin(GL_QUADS);
+    glVertex3d(screen_x - 3, screen_y - 3,
+               cad_gl_vertex_z(camera_depth));
+    glVertex3d(screen_x + 4, screen_y - 3,
+               cad_gl_vertex_z(camera_depth));
+    glVertex3d(screen_x + 4, screen_y + 4,
+               cad_gl_vertex_z(camera_depth));
+    glVertex3d(screen_x - 3, screen_y + 4,
+               cad_gl_vertex_z(camera_depth));
+    glEnd();
 }
 
 static void cad_fill_projected(const ProjectedPolygon* polygon, RG_Color color)
@@ -1190,6 +1219,7 @@ static void cad_render_geometry(const CadView* view,
     uint8_t connected_points[CAD_MAX_POINTS];
     uint8_t hidden_pair_member[CAD_MAX_POLYGONS];
     int polygon_count = 0;
+    int handles_use_depth;
     int i;
     const RG_Color background = { 250, 250, 248, 255 };
     const RG_Color edge = { 32, 61, 190, 255 };
@@ -1269,9 +1299,17 @@ static void cad_render_geometry(const CadView* view,
                               view->type == CAD_VIEW_3D);
     }
 
-    /* Selection/orphan handles are an editor overlay and remain visible even
-       when the selected point lies behind a shaded face. */
-    glDisable(GL_DEPTH_TEST);
+    /* Solid-mode handles participate in the same depth buffer as the model so
+       selecting everything does not make hidden vertices show through opaque
+       faces.  Orthographic and wireframe handles remain editor overlays. */
+    handles_use_depth = view->type == CAD_VIEW_3D && !view->wireframe;
+    if (handles_use_depth) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_FALSE);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
 
     for (i = 0; i < geometry->data->pointCount && i < CAD_MAX_POINTS; ++i) {
         const CadPoint* point = &geometry->data->points[i];
@@ -1291,7 +1329,12 @@ static void cad_render_geometry(const CadView* view,
         if (!cad_round_screen_coordinate(x, &screen_x) ||
             !cad_round_screen_coordinate(y, &screen_y)) continue;
         color = selected ? (RG_Color){ 220, 45, 45, 255 } : (RG_Color){ 20, 80, 220, 255 };
-        rg_fill_rect(screen_x - 3, screen_y - 3, 7, 7, color);
+        cad_fill_point_handle(screen_x, screen_y, depth, color,
+                              handles_use_depth);
+    }
+    if (handles_use_depth) {
+        glDepthMask(GL_TRUE);
+        glDisable(GL_DEPTH_TEST);
     }
 }
 

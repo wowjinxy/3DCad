@@ -104,7 +104,9 @@ ctest --test-dir build/core --output-on-failure
 
 - `Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`: document operations
 - `Ctrl+Z`, `Ctrl+Shift+Z`/`Ctrl+Y`: undo and redo
-- `Ctrl+A`, `Ctrl+C`, `Ctrl+V`: selection and clipboard
+- `Ctrl+A`: select all points or faces in the active selection mode
+- `Ctrl+Shift+A` or idle `Escape`: deselect everything
+- `Ctrl+C`, `Ctrl+V`: copy and paste the selection
 - `Delete`: delete the active point/face selection
 - `Escape`: cancel the current placement, selection rectangle, or drag
 - 3D left-drag: rotate X/Y; Shift+left-drag: roll Z

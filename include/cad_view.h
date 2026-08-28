@@ -79,6 +79,11 @@ int CadView_ProjectPointDepth(const CadView* view, double x, double y, double z,
                               double* out_x, double* out_y, double* out_depth,
                               int viewport_w, int viewport_h);
 
+/* Map the positive camera depth returned above to the normalized depth-buffer
+   range.  Nearer geometry produces smaller values.  This is shared by the
+   solid renderer and depth-aware editor overlays. */
+double CadView_NormalizedDepth(double camera_depth);
+
 /* ----------------------------------------------------------------------------
    Point selection (find nearest point to screen coordinates)
    Returns point index or -1 if none found within threshold

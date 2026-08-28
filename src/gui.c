@@ -319,7 +319,8 @@ static const CadMenuItemDescriptor windowMenuItems[] = {
 
 static const CadMenuItemDescriptor optionMenuItems[] = {
     { CAD_COMMAND_OPTION_AREA_SELECT, "Area Select", 0 },
-    { CAD_COMMAND_OPTION_SELECT_ALL, "Select All", 0 },
+    { CAD_COMMAND_OPTION_SELECT_ALL, "Select All (Ctrl+A)", 0 },
+    { CAD_COMMAND_OPTION_DESELECT_ALL, "Deselect All (Ctrl+Shift+A)", 0 },
     { CAD_COMMAND_OPTION_CHANGE_FIRST_POINT, "Change First Point", 0 },
     { CAD_COMMAND_OPTION_FLAT_CHECK, "Flat Check", 0 },
     { CAD_COMMAND_OPTION_FACE_SUPPORT, "F.Support", 0 },
@@ -1187,6 +1188,10 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
         gui_set_status(g, "Drag a rectangle in an orthographic view; Escape cancels");
         break;
     case CAD_COMMAND_OPTION_SELECT_ALL: CadCore_SelectAll(g->cad); gui_set_status(g, "Selected all"); break;
+    case CAD_COMMAND_OPTION_DESELECT_ALL:
+        CadCore_ClearSelection(g->cad);
+        gui_set_status(g, "Deselected all");
+        break;
     case CAD_COMMAND_OPTION_CHANGE_FIRST_POINT: editor_change_first_point(g); break;
     case CAD_COMMAND_OPTION_FLAT_CHECK: editor_flat_check(g); break;
     case CAD_COMMAND_OPTION_FACE_SUPPORT: editor_face_support(g); break;
@@ -1885,12 +1890,19 @@ void gui_handle_key(GuiState* g, int key, unsigned modifiers, int pressed) {
         const int had_operation = g->point_pending || g->area_select_armed ||
                                   g->area_select_active || g->point_move_active ||
                                   g->selected_tool == CAD_TOOL_FACE_CREATE;
+        const int had_menu = g->menu_open >= 0 || g->submenu_open;
+        const int had_selection = g->cad->selection.pointCount > 0 ||
+                                  g->cad->selection.polygonCount > 0;
         if (g->document.transactionBefore) history_cancel(g);
         reset_interaction(g);
         g->menu_open = -1;
         g->submenu_open = 0;
         if (g->selected_tool == CAD_TOOL_FACE_CREATE) CadCore_ClearSelection(g->cad);
         if (had_operation) gui_set_status(g, "Operation cancelled");
+        else if (!had_menu && had_selection) {
+            CadCore_ClearSelection(g->cad);
+            gui_set_status(g, "Deselected all");
+        }
         return;
     }
 
@@ -1905,7 +1917,11 @@ void gui_handle_key(GuiState* g, int key, unsigned modifiers, int pressed) {
                                             ? CAD_COMMAND_EDIT_REDO
                                             : CAD_COMMAND_EDIT_UNDO); return;
         case 'y': execute_editor_command(g, CAD_COMMAND_EDIT_REDO); return;
-        case 'a': execute_editor_command(g, CAD_COMMAND_OPTION_SELECT_ALL); return;
+        case 'a': execute_editor_command(
+                      g, (modifiers & GUI_MOD_SHIFT)
+                             ? CAD_COMMAND_OPTION_DESELECT_ALL
+                             : CAD_COMMAND_OPTION_SELECT_ALL);
+                  return;
         case 'c': execute_editor_command(g, CAD_COMMAND_EDIT_COPY); return;
         case 'v': execute_editor_command(g, CAD_COMMAND_EDIT_PASTE); return;
         case 'q': gui_request_quit(g); return;

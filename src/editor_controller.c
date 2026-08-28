@@ -82,6 +82,7 @@ static const char* command_shortcut(CadCommandId command) {
     case CAD_COMMAND_EDIT_COPY: return "Ctrl+C";
     case CAD_COMMAND_EDIT_PASTE: return "Ctrl+V";
     case CAD_COMMAND_OPTION_SELECT_ALL: return "Ctrl+A";
+    case CAD_COMMAND_OPTION_DESELECT_ALL: return "Ctrl+Shift+A";
     case CAD_COMMAND_WINDOW_HOME: return "Home";
     default: return "";
     }
@@ -109,7 +110,7 @@ CadCommandState EditorController_GetCommandState(
     const CadDocument* document = controller ? controller->document : NULL;
     state.shortcut = command_shortcut(command);
     if (command <= CAD_COMMAND_NONE ||
-        command > CAD_COMMAND_FILE_EXPORT_ANM_3DGI) {
+        command > CAD_COMMAND_OPTION_DESELECT_ALL) {
         disable(&state, "Unknown editor command");
         return state;
     }
@@ -137,6 +138,11 @@ CadCommandState EditorController_GetCommandState(
     case CAD_COMMAND_EDIT_PASTE:
         if (!context || !context->clipboardHasData)
             disable(&state, "The editor clipboard is empty");
+        break;
+    case CAD_COMMAND_OPTION_DESELECT_ALL:
+        if (!context || (!context->selectedPointCount &&
+                         !context->selectedPolygonCount))
+            disable(&state, "Nothing is selected");
         break;
     case CAD_COMMAND_OPTION_CHANGE_FIRST_POINT:
     case CAD_COMMAND_OPTION_FACE_SUPPORT:

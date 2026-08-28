@@ -73,6 +73,13 @@ static void test_perspective_projection(void)
     require_close(x, 420.0, 1e-9, "512/z perspective scale");
     require_close(y, 240.0, 1e-9, "perspective center Y");
     require_close(depth, 512.0, 1e-9, "perspective depth");
+    require_close(CadView_NormalizedDepth(16.0), 0.0, 1e-12,
+                  "near plane maps to the nearest depth-buffer value");
+    require_close(CadView_NormalizedDepth(512.0), 0.96875, 1e-12,
+                  "camera depth maps to normalized depth");
+    require_true(CadView_NormalizedDepth(512.0) <
+                     CadView_NormalizedDepth(1024.0),
+                 "near surfaces win the depth test over far surfaces");
     require_true(!CadView_ProjectPointDepth(&view, 0.0, 0.0, -500.0,
                                              &x, &y, &depth, 640, 480),
                  "near-plane clipping");

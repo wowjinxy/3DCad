@@ -51,7 +51,8 @@ typedef enum CadCommandId {
     /* New IDs are appended so existing command values remain stable. */
     CAD_COMMAND_FILE_IMPORT_ANM,
     CAD_COMMAND_FILE_EXPORT_ANM_3DAN,
-    CAD_COMMAND_FILE_EXPORT_ANM_3DGI
+    CAD_COMMAND_FILE_EXPORT_ANM_3DGI,
+    CAD_COMMAND_OPTION_DESELECT_ALL
 } CadCommandId;
 
 enum {

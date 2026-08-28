@@ -34,6 +34,20 @@ int main(void) {
         &controller, CAD_COMMAND_FILE_SAVE_AS, &context);
     CHECK(state.enabled);
     CHECK(strcmp(state.shortcut, "Ctrl+Shift+S") == 0);
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_OPTION_SELECT_ALL, &context);
+    CHECK(state.enabled);
+    CHECK(strcmp(state.shortcut, "Ctrl+A") == 0);
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_OPTION_DESELECT_ALL, &context);
+    CHECK(!state.enabled);
+    CHECK(strstr(state.disabledReason, "Nothing") != NULL);
+    CHECK(strcmp(state.shortcut, "Ctrl+Shift+A") == 0);
+    context.selectedPointCount = 1;
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_OPTION_DESELECT_ALL, &context);
+    CHECK(state.enabled);
+    context.selectedPointCount = 0;
 
     state = EditorController_GetToolState(
         &controller, CAD_TOOL_PRIMITIVE, &context);
