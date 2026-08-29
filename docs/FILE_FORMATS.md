@@ -96,3 +96,66 @@ only when their rounded coordinates match in every frame. Static faces repeat
 their base coordinates across the exported frame range. Quantization and the
 recovered game-coordinate range of -127…127 are reported as warnings before
 the caller writes the buffer.
+
+## COL color tables
+
+A `.COL` file is a 256-entry SNES color table. Its canonical encoded size is
+0x200 bytes. Each entry is one little-endian BGR555 word:
+
+| Bits | Meaning |
+| --- | --- |
+| 0–4 | Red, 0–31 |
+| 5–9 | Green, 0–31 |
+| 10–14 | Blue, 0–31 |
+| 15 | Uninterpreted retained bit |
+
+The display conversion expands the five-bit channels to opaque eight-bit RGB;
+bit 15 does not affect the preview but is preserved by edits and round trips.
+The decoder consumes the historical first 0x200 bytes. It accepts a larger
+buffer with a diagnostic that trailing bytes were ignored; encoding always
+writes the canonical 0x200 bytes.
+
+## PAL material maps
+
+A `.PAL` file is not another color table. It is an exact 0x8200-byte material
+map that refers to entries in an associated `.COL` table:
+
+| Offset | Size | Contents |
+| ---: | ---: | --- |
+| 0x0000 | 0x0200 | 256 two-byte material descriptors |
+| 0x0200 | 0x8000 | 256 material records × 128 raw `.COL` indices |
+
+Descriptor `i` occupies bytes `i * 2` and `i * 2 + 1`. The first byte is the
+material type. In the second byte, the high nibble stores palette number minus
+one and the low nibble stores color count minus one, so both decoded values are
+in the range 1–16. The 128 sample indices for material `i` begin at
+`0x0200 + i * 0x80`.
+
+Recovered material types are:
+
+| Value | Type |
+| ---: | --- |
+| 0 | Normal |
+| 1 | Depth Cue |
+| 2 | Light Source |
+| 3 | Light Depth |
+| 4 | Animation |
+| 5 | Texture Map |
+
+Unknown type values are retained and reported rather than discarded. The
+runtime meaning and timing/axis of the 128 entries is not yet established, so
+the editor deliberately presents them as numbered samples. New `.PAL` files
+use the recovered default descriptor—Light Depth, palette 4, 16 colors—and
+initialize all sample indices to zero.
+
+For preview, a face or two-point line's 0–255 color index selects a material
+record. The currently displayed sample supplies a raw `.COL` index, which is
+then converted from BGR555. Without a loaded `.PAL`, the geometry index selects
+the `.COL` entry directly; without a `.COL`, the material/sample values remain
+editable and are visualized as indices rather than invented colors.
+
+Both palette codecs are buffer-based and validate into temporary resources
+before replacing live state. The document keeps native CAD, `.COL`, and `.PAL`
+source/save paths and dirty revisions independently. All three use the shared
+bounded UTF-8 and atomic-save platform services, and none may silently
+overwrite an associated resource of the other format.

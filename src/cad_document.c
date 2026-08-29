@@ -1,5 +1,6 @@
 #include "cad_document.h"
 #include "cad_anm_codec.h"
+#include "cad_palette.h"
 #include "platform_fs.h"
 
 #include <stddef.h>
@@ -14,9 +15,19 @@ struct CadDocumentSnapshot {
     size_t paletteDataSize;
     CadRgba palette[256];
     int paletteValid;
-    char* paletteSourcePath;
     uint64_t revision;
     uint64_t nextRevision;
+    uint64_t colRevision;
+    uint64_t nextColRevision;
+    uint64_t palRevision;
+    uint64_t nextPalRevision;
+    /* Paths are retained only so a cancelled/rejected edit can restore
+       resource associations. Undo/redo intentionally applies content and
+       revisions without rewinding the user's current save destinations. */
+    char* colSourcePath;
+    char* colSavePath;
+    char* palSourcePath;
+    char* palSavePath;
     char label[CAD_DOCUMENT_HISTORY_LABEL_CAPACITY];
 };
 
@@ -59,10 +70,27 @@ static int replace_string(char** destination, const char* value) {
     return 1;
 }
 
-static int strings_equal(const char* left, const char* right) {
-    if (left == right) return 1;
-    if (!left || !right) return 0;
-    return strcmp(left, right) == 0;
+static int path_matches(const char* candidate, const char* ownedPath) {
+    return candidate && ownedPath &&
+           CadPlatform_PathsEqual(candidate, ownedPath);
+}
+
+static int path_matches_palette_resource(const CadDocument* document,
+                                         const char* candidate) {
+    return document &&
+           (path_matches(candidate, document->colSourcePath) ||
+            path_matches(candidate, document->colSavePath) ||
+            path_matches(candidate, document->palSourcePath) ||
+            path_matches(candidate, document->palSavePath));
+}
+
+static int path_matches_model_resource(const CadDocument* document,
+                                       const char* candidate) {
+    return document &&
+           (path_matches(candidate, document->sourcePath) ||
+            path_matches(candidate, document->savePath) ||
+            path_matches(candidate, document->lastImportPath) ||
+            path_matches(candidate, document->lastExportPath));
 }
 
 static void clear_original_native_bytes(CadDocument* document) {
@@ -108,13 +136,24 @@ static int document_matches_original_native(const CadDocument* document) {
 
 static void snapshot_destroy(CadDocumentSnapshot* snapshot) {
     if (!snapshot) return;
-    free(snapshot->paletteSourcePath);
+    free(snapshot->colSourcePath);
+    free(snapshot->colSavePath);
+    free(snapshot->palSourcePath);
+    free(snapshot->palSavePath);
     free(snapshot);
 }
 
 static void update_dirty_state(CadDocument* document) {
     if (!document) return;
     document->isDirty = document->revision != document->savedRevision;
+    /* An undo may return to the state before a resource was created/opened.
+       Absence is not a savable modified resource and must never trigger a
+       Save prompt that cannot succeed. */
+    document->colDirty = document->paletteValid &&
+        document->colorDataSize == CAD_COL_FILE_SIZE &&
+        document->colRevision != document->colSavedRevision;
+    document->palDirty = document->paletteDataSize == CAD_PAL_FILE_SIZE &&
+        document->palRevision != document->palSavedRevision;
     document->core.isDirty = document->isDirty;
 }
 
@@ -168,14 +207,23 @@ static CadDocumentSnapshot* snapshot_create(const CadDocument* document,
     snapshot->paletteDataSize = document->paletteDataSize;
     memcpy(snapshot->palette, document->palette, sizeof(snapshot->palette));
     snapshot->paletteValid = document->paletteValid;
-    snapshot->paletteSourcePath =
-        duplicate_string(document->paletteSourcePath);
-    if (document->paletteSourcePath && !snapshot->paletteSourcePath) {
-        free(snapshot);
-        return NULL;
-    }
     snapshot->revision = document->revision;
     snapshot->nextRevision = document->nextRevision;
+    snapshot->colRevision = document->colRevision;
+    snapshot->nextColRevision = document->nextColRevision;
+    snapshot->palRevision = document->palRevision;
+    snapshot->nextPalRevision = document->nextPalRevision;
+    snapshot->colSourcePath = duplicate_string(document->colSourcePath);
+    snapshot->colSavePath = duplicate_string(document->colSavePath);
+    snapshot->palSourcePath = duplicate_string(document->palSourcePath);
+    snapshot->palSavePath = duplicate_string(document->palSavePath);
+    if ((document->colSourcePath && !snapshot->colSourcePath) ||
+        (document->colSavePath && !snapshot->colSavePath) ||
+        (document->palSourcePath && !snapshot->palSourcePath) ||
+        (document->palSavePath && !snapshot->palSavePath)) {
+        snapshot_destroy(snapshot);
+        return NULL;
+    }
     copy_history_label(snapshot->label, label);
     return snapshot;
 }
@@ -192,17 +240,12 @@ static int snapshot_matches(const CadDocumentSnapshot* snapshot,
                   sizeof(snapshot->palette)) == 0 &&
            snapshot->colorDataSize == document->colorDataSize &&
            snapshot->paletteDataSize == document->paletteDataSize &&
-           snapshot->paletteValid == document->paletteValid &&
-           strings_equal(snapshot->paletteSourcePath,
-                         document->paletteSourcePath);
+           snapshot->paletteValid == document->paletteValid;
 }
 
 static int snapshot_apply(CadDocument* document,
                           const CadDocumentSnapshot* snapshot) {
-    char* paletteSourcePath;
     if (!document || !snapshot) return 0;
-    paletteSourcePath = duplicate_string(snapshot->paletteSourcePath);
-    if (snapshot->paletteSourcePath && !paletteSourcePath) return 0;
     document->core = snapshot->core;
     memcpy(document->colorData, snapshot->colorData,
            sizeof(document->colorData));
@@ -212,9 +255,9 @@ static int snapshot_apply(CadDocument* document,
     document->paletteDataSize = snapshot->paletteDataSize;
     memcpy(document->palette, snapshot->palette, sizeof(document->palette));
     document->paletteValid = snapshot->paletteValid;
-    free(document->paletteSourcePath);
-    document->paletteSourcePath = paletteSourcePath;
     document->revision = snapshot->revision;
+    document->colRevision = snapshot->colRevision;
+    document->palRevision = snapshot->palRevision;
     update_dirty_state(document);
     return 1;
 }
@@ -223,7 +266,7 @@ static int snapshot_apply(CadDocument* document,
    allocator.  A cancelled or rejected transaction is different: it must
    restore every bit of revision bookkeeping that existed before the edit. */
 static void snapshot_rollback(CadDocument* document,
-                              CadDocumentSnapshot* snapshot) {
+                               CadDocumentSnapshot* snapshot) {
     if (!document || !snapshot) return;
     document->core = snapshot->core;
     memcpy(document->colorData, snapshot->colorData,
@@ -234,11 +277,24 @@ static void snapshot_rollback(CadDocument* document,
     document->paletteDataSize = snapshot->paletteDataSize;
     memcpy(document->palette, snapshot->palette, sizeof(document->palette));
     document->paletteValid = snapshot->paletteValid;
-    free(document->paletteSourcePath);
-    document->paletteSourcePath = snapshot->paletteSourcePath;
-    snapshot->paletteSourcePath = NULL;
     document->revision = snapshot->revision;
     document->nextRevision = snapshot->nextRevision;
+    document->colRevision = snapshot->colRevision;
+    document->nextColRevision = snapshot->nextColRevision;
+    document->palRevision = snapshot->palRevision;
+    document->nextPalRevision = snapshot->nextPalRevision;
+    free(document->colSourcePath);
+    free(document->colSavePath);
+    free(document->palSourcePath);
+    free(document->palSavePath);
+    document->colSourcePath = snapshot->colSourcePath;
+    document->colSavePath = snapshot->colSavePath;
+    document->palSourcePath = snapshot->palSourcePath;
+    document->palSavePath = snapshot->palSavePath;
+    snapshot->colSourcePath = NULL;
+    snapshot->colSavePath = NULL;
+    snapshot->palSourcePath = NULL;
+    snapshot->palSavePath = NULL;
     update_dirty_state(document);
 }
 
@@ -272,6 +328,12 @@ void CadDocument_Init(CadDocument* document) {
     document->revision = 0;
     document->savedRevision = 0;
     document->nextRevision = 0;
+    document->colRevision = 0;
+    document->colSavedRevision = 0;
+    document->nextColRevision = 0;
+    document->palRevision = 0;
+    document->palSavedRevision = 0;
+    document->nextPalRevision = 0;
     initial = snapshot_create(document, "");
     if (initial) history_append(document, initial);
 }
@@ -291,11 +353,15 @@ void CadDocument_Destroy(CadDocument* document) {
     free(document->savePath);
     free(document->lastImportPath);
     free(document->lastExportPath);
-    free(document->paletteSourcePath);
+    free(document->colSourcePath);
+    free(document->colSavePath);
+    free(document->palSourcePath);
+    free(document->palSavePath);
     clear_original_native_bytes(document);
     document->sourcePath = document->savePath = NULL;
     document->lastImportPath = document->lastExportPath = NULL;
-    document->paletteSourcePath = NULL;
+    document->colSourcePath = document->colSavePath = NULL;
+    document->palSourcePath = document->palSavePath = NULL;
     CadCore_Destroy(&document->core);
     memset(document, 0, sizeof(*document));
 }
@@ -330,12 +396,21 @@ void CadDocument_New(CadDocument* document) {
     document->revision = 0;
     document->savedRevision = 0;
     document->nextRevision = 0;
+    document->colRevision = 0;
+    document->colSavedRevision = 0;
+    document->nextColRevision = 0;
+    document->palRevision = 0;
+    document->palSavedRevision = 0;
+    document->nextPalRevision = 0;
     update_dirty_state(document);
     free(document->sourcePath); document->sourcePath = NULL;
     free(document->savePath); document->savePath = NULL;
     free(document->lastImportPath); document->lastImportPath = NULL;
     free(document->lastExportPath); document->lastExportPath = NULL;
-    free(document->paletteSourcePath); document->paletteSourcePath = NULL;
+    free(document->colSourcePath); document->colSourcePath = NULL;
+    free(document->colSavePath); document->colSavePath = NULL;
+    free(document->palSourcePath); document->palSourcePath = NULL;
+    free(document->palSavePath); document->palSavePath = NULL;
     clear_original_native_bytes(document);
     CadDocument_ClearHistory(document);
 }
@@ -414,7 +489,10 @@ CadResult CadDocument_Load(CadDocument* document, const char* utf8Path) {
     free(document->savePath); document->savePath = save;
     free(document->lastImportPath); document->lastImportPath = importPath;
     free(document->lastExportPath); document->lastExportPath = NULL;
-    free(document->paletteSourcePath); document->paletteSourcePath = NULL;
+    free(document->colSourcePath); document->colSourcePath = NULL;
+    free(document->colSavePath); document->colSavePath = NULL;
+    free(document->palSourcePath); document->palSourcePath = NULL;
+    free(document->palSavePath); document->palSavePath = NULL;
     clear_original_native_bytes(document);
     document->originalNativeBytes = originalNativeBytes;
     document->originalNativeByteCount = originalNativeByteCount;
@@ -423,6 +501,12 @@ CadResult CadDocument_Load(CadDocument* document, const char* utf8Path) {
     document->nextRevision = 0;
     document->savedRevision = result.format == CAD_FORMAT_LEGACY_PACKED
         ? CAD_DOCUMENT_NO_SAVED_REVISION : 0;
+    document->colRevision = 0;
+    document->colSavedRevision = 0;
+    document->nextColRevision = 0;
+    document->palRevision = 0;
+    document->palSavedRevision = 0;
+    document->nextPalRevision = 0;
     update_dirty_state(document);
     CadDocument_ClearHistory(document);
     return result;
@@ -480,15 +564,42 @@ CadResult CadDocument_ImportAnm(CadDocument* document,
     free(document->savePath); document->savePath = NULL;
     free(document->lastImportPath); document->lastImportPath = importPath;
     free(document->lastExportPath); document->lastExportPath = NULL;
-    free(document->paletteSourcePath); document->paletteSourcePath = NULL;
+    free(document->colSourcePath); document->colSourcePath = NULL;
+    free(document->colSavePath); document->colSavePath = NULL;
+    free(document->palSourcePath); document->palSourcePath = NULL;
+    free(document->palSavePath); document->palSavePath = NULL;
     clear_original_native_bytes(document);
     document->sourceFormat = result.format;
     document->revision = 0;
     document->nextRevision = 0;
     document->savedRevision = CAD_DOCUMENT_NO_SAVED_REVISION;
+    document->colRevision = 0;
+    document->colSavedRevision = 0;
+    document->nextColRevision = 0;
+    document->palRevision = 0;
+    document->palSavedRevision = 0;
+    document->nextPalRevision = 0;
     update_dirty_state(document);
     CadDocument_ClearHistory(document);
     return result;
+}
+
+CadResult CadDocument_ValidateExportPath(const CadDocument* document,
+                                         const char* utf8Path) {
+    if (!document || !utf8Path)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Export requires a document and path");
+    if (document->transactionBefore)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Finish or cancel the active edit before exporting");
+    if (path_matches(utf8Path, document->lastImportPath) ||
+        path_matches(utf8Path, document->sourcePath) ||
+        path_matches(utf8Path, document->savePath) ||
+        path_matches_palette_resource(document, utf8Path))
+        return document_error(
+            CAD_STATUS_INVALID_ARGUMENT,
+            "Choose a different export path; open source and palette resources are never overwritten");
+    return CadResult_Ok(CAD_FORMAT_AUTO);
 }
 
 CadResult CadDocument_ExportAnm(CadDocument* document,
@@ -499,17 +610,8 @@ CadResult CadDocument_ExportAnm(CadDocument* document,
     CadResult result;
     CadResult writeResult;
     char* pathCopy;
-    if (!document || !utf8Path)
-        return document_error(CAD_STATUS_INVALID_ARGUMENT,
-                              "ANM export requires a path");
-    if (document->transactionBefore)
-        return document_error(CAD_STATUS_INVALID_ARGUMENT,
-                              "Finish or cancel the active edit before exporting");
-    if (document->lastImportPath &&
-        CadPlatform_PathsEqual(utf8Path, document->lastImportPath))
-        return document_error(
-            CAD_STATUS_INVALID_ARGUMENT,
-            "Choose a different export path; imported source files are never overwritten");
+    result = CadDocument_ValidateExportPath(document, utf8Path);
+    if (!CadResult_IsSuccess(&result)) return result;
     result = CadAnmCodec_Encode(&document->core.data, format,
                                 &bytes, &byteCount);
     if (!CadResult_IsSuccess(&result)) return result;
@@ -546,11 +648,12 @@ CadResult CadDocument_Save(CadDocument* document, const char* utf8Path) {
     if (document->transactionBefore)
         return document_error(CAD_STATUS_INVALID_ARGUMENT,
                               "Finish or cancel the active edit before saving");
-    if (document->lastImportPath &&
-        CadPlatform_PathsEqual(utf8Path, document->lastImportPath))
+    if (path_matches(utf8Path, document->lastImportPath) ||
+        path_matches(utf8Path, document->lastExportPath) ||
+        path_matches_palette_resource(document, utf8Path))
         return document_error(
             CAD_STATUS_INVALID_ARGUMENT,
-            "Choose a different native Save As path; imported source files are never overwritten");
+            "Choose a different native Save As path; import, export, and palette resources are never overwritten");
     source = duplicate_string(utf8Path);
     save = duplicate_string(utf8Path);
     if (!source || !save) {
@@ -661,6 +764,8 @@ CadResult CadDocument_CommitEdit(CadDocument* document) {
     CadDocumentSnapshot* current;
     CadResult validation;
     int nativeContentChanged;
+    int colContentChanged;
+    int palContentChanged;
     if (!document || !document->transactionBefore)
         return document_error(CAD_STATUS_INVALID_ARGUMENT,
                               "No document edit is active");
@@ -682,10 +787,33 @@ CadResult CadDocument_CommitEdit(CadDocument* document) {
     nativeContentChanged = memcmp(&document->transactionBefore->core.data,
                                   &document->core.data,
                                   sizeof(document->core.data)) != 0;
+    colContentChanged =
+        document->transactionBefore->colorDataSize !=
+            document->colorDataSize ||
+        document->transactionBefore->paletteValid !=
+            document->paletteValid ||
+        memcmp(document->transactionBefore->colorData,
+               document->colorData, sizeof(document->colorData)) != 0 ||
+        memcmp(document->transactionBefore->palette,
+               document->palette, sizeof(document->palette)) != 0;
+    palContentChanged =
+        document->transactionBefore->paletteDataSize !=
+            document->paletteDataSize ||
+        memcmp(document->transactionBefore->paletteData,
+               document->paletteData,
+               sizeof(document->paletteData)) != 0;
     if (nativeContentChanged)
         document->revision = ++document->nextRevision;
     else
         document->revision = document->transactionBefore->revision;
+    if (colContentChanged)
+        document->colRevision = ++document->nextColRevision;
+    else
+        document->colRevision = document->transactionBefore->colRevision;
+    if (palContentChanged)
+        document->palRevision = ++document->nextPalRevision;
+    else
+        document->palRevision = document->transactionBefore->palRevision;
     update_dirty_state(document);
     current = snapshot_create(document, document->transactionLabel);
     if (!current) {
@@ -778,24 +906,466 @@ int CadDocument_SetLastExportPath(CadDocument* document,
     return document && replace_string(&document->lastExportPath, utf8Path);
 }
 
+static void document_install_col(CadDocument* document,
+                                 const CadPaletteFile* palette) {
+    unsigned index;
+    if (!document || !palette) return;
+    memset(document->colorData, 0, sizeof(document->colorData));
+    for (index = 0; index < CAD_PALETTE_ENTRY_COUNT; ++index) {
+        const uint16_t word = palette->colWords[index];
+        const CadPaletteRgba8 rgba = CadPalette_Bgr555ToRgba8(word);
+        document->colorData[index * 2u] = (uint8_t)(word & 0xffu);
+        document->colorData[index * 2u + 1u] = (uint8_t)(word >> 8);
+        document->palette[index].r = rgba.r;
+        document->palette[index].g = rgba.g;
+        document->palette[index].b = rgba.b;
+        document->palette[index].a = rgba.a;
+    }
+    document->colorDataSize = CAD_COL_FILE_SIZE;
+    document->paletteValid = 1;
+}
+
+static void document_install_pal(CadDocument* document,
+                                 const CadPaletteFile* palette) {
+    unsigned recordIndex;
+    if (!document || !palette) return;
+    memset(document->paletteData, 0, sizeof(document->paletteData));
+    for (recordIndex = 0; recordIndex < CAD_PAL_RECORD_COUNT;
+         ++recordIndex) {
+        const CadPalRecord* record = &palette->palRecords[recordIndex];
+        const size_t descriptor = (size_t)recordIndex * 2u;
+        const size_t payload = CAD_PAL_DESCRIPTOR_SIZE +
+            (size_t)recordIndex * CAD_PAL_INDEX_COUNT;
+        document->paletteData[descriptor] = record->type;
+        document->paletteData[descriptor + 1u] = (uint8_t)(
+            ((record->paletteNumber - 1u) << 4) |
+            (record->colorCount - 1u));
+        memcpy(document->paletteData + payload, record->indices,
+               CAD_PAL_INDEX_COUNT);
+    }
+    document->paletteDataSize = CAD_PAL_FILE_SIZE;
+}
+
+static CadResult document_extract_palette(const CadDocument* document,
+                                          CadPaletteFormat format,
+                                          CadPaletteFile* output) {
+    if (!document || !output)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Palette extraction requires a document and output");
+    if (format == CAD_PALETTE_FORMAT_COL) {
+        if (document->colorDataSize != CAD_COL_FILE_SIZE)
+            return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                                  "No COL palette is loaded or created");
+        return CadPalette_Decode(document->colorData,
+                                 document->colorDataSize,
+                                 CAD_PALETTE_FORMAT_COL, output);
+    }
+    if (format == CAD_PALETTE_FORMAT_PAL) {
+        if (document->paletteDataSize != CAD_PAL_FILE_SIZE)
+            return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                                  "No PAL material map is loaded or created");
+        return CadPalette_Decode(document->paletteData,
+                                 document->paletteDataSize,
+                                 CAD_PALETTE_FORMAT_PAL, output);
+    }
+    return document_error(CAD_STATUS_UNSUPPORTED_FORMAT,
+                          "Choose COL or PAL for this palette operation");
+}
+
+CadResult CadDocument_NewPalette(CadDocument* document,
+                                 CadPaletteFormat format) {
+    CadPaletteFile palette = {0};
+    CadResult result;
+    if (!document)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Palette creation requires a document");
+    result = CadPalette_Create(format, &palette);
+    if (!CadResult_IsSuccess(&result)) return result;
+    format = palette.format;
+    if (format == CAD_PALETTE_FORMAT_COL) {
+        /* A compact 3-3-2 RGB cube gives a new editor immediate, useful
+           coverage while remaining deterministic and fully BGR555. */
+        unsigned index;
+        for (index = 0; index < CAD_PALETTE_ENTRY_COUNT; ++index) {
+            const unsigned red = ((index >> 5) & 7u) * 31u / 7u;
+            const unsigned green = ((index >> 2) & 7u) * 31u / 7u;
+            const unsigned blue = (index & 3u) * 31u / 3u;
+            palette.colWords[index] = (uint16_t)(
+                red | (green << 5) | (blue << 10));
+        }
+    }
+    result = CadDocument_BeginEditNamed(
+        document, format == CAD_PALETTE_FORMAT_COL
+                      ? "New COL Palette" : "New PAL Material Map");
+    if (!CadResult_IsSuccess(&result)) return result;
+    if (format == CAD_PALETTE_FORMAT_COL)
+        document_install_col(document, &palette);
+    else
+        document_install_pal(document, &palette);
+    result = CadDocument_CommitEdit(document);
+    if (!CadResult_IsSuccess(&result)) return result;
+    if (format == CAD_PALETTE_FORMAT_COL) {
+        free(document->colSourcePath); document->colSourcePath = NULL;
+        free(document->colSavePath); document->colSavePath = NULL;
+        document->colSavedRevision = CAD_DOCUMENT_NO_SAVED_REVISION;
+    } else {
+        free(document->palSourcePath); document->palSourcePath = NULL;
+        free(document->palSavePath); document->palSavePath = NULL;
+        document->palSavedRevision = CAD_DOCUMENT_NO_SAVED_REVISION;
+    }
+    update_dirty_state(document);
+    return result;
+}
+
+CadResult CadDocument_OpenPalette(CadDocument* document,
+                                  const char* utf8Path,
+                                  CadPaletteFormat format) {
+    CadPaletteFile palette = {0};
+    CadResult result;
+    CadResult commitResult;
+    uint8_t* bytes = NULL;
+    size_t size = 0;
+    char* source;
+    char* save;
+    if (!document || !utf8Path)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Palette open requires a document and path");
+    if (document->transactionBefore)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Finish or cancel the active edit before opening a palette");
+    if (path_matches_model_resource(document, utf8Path))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "A model, import, or export path cannot also be opened as a palette resource");
+    result = CadPlatform_ReadFile(utf8Path, CAD_PLATFORM_DEFAULT_FILE_LIMIT,
+                                  &bytes, &size);
+    if (CadResult_IsSuccess(&result)) {
+        const CadPaletteFormat requestedFormat = format;
+        result = CadPalette_Decode(bytes, size, CAD_PALETTE_FORMAT_AUTO,
+                                   &palette);
+        if (CadResult_IsSuccess(&result) &&
+            requestedFormat != CAD_PALETTE_FORMAT_AUTO &&
+            palette.format != requestedFormat) {
+            result = document_error(
+                CAD_STATUS_UNSUPPORTED_FORMAT,
+                requestedFormat == CAD_PALETTE_FORMAT_COL
+                    ? "The selected file is a PAL material map, not a COL color palette"
+                    : "The selected file is a COL color palette, not a PAL material map");
+        }
+    }
+    CadPlatform_Free(bytes);
+    if (!CadResult_IsSuccess(&result)) return result;
+    format = palette.format;
+    if ((format == CAD_PALETTE_FORMAT_COL &&
+         (path_matches(utf8Path, document->palSourcePath) ||
+          path_matches(utf8Path, document->palSavePath))) ||
+        (format == CAD_PALETTE_FORMAT_PAL &&
+         (path_matches(utf8Path, document->colSourcePath) ||
+          path_matches(utf8Path, document->colSavePath))))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "COL and PAL resources must use different paths");
+    source = duplicate_string(utf8Path);
+    save = duplicate_string(utf8Path);
+    if (!source || !save) {
+        free(source); free(save);
+        return document_error(CAD_STATUS_OUT_OF_MEMORY,
+                              "Could not retain the palette path");
+    }
+    commitResult = CadDocument_BeginEditNamed(
+        document, format == CAD_PALETTE_FORMAT_COL
+                      ? "Open COL Palette" : "Open PAL Material Map");
+    if (CadResult_IsSuccess(&commitResult)) {
+        if (format == CAD_PALETTE_FORMAT_COL)
+            document_install_col(document, &palette);
+        else
+            document_install_pal(document, &palette);
+        commitResult = CadDocument_CommitEdit(document);
+    }
+    if (!CadResult_IsSuccess(&commitResult)) {
+        free(source); free(save);
+        return commitResult;
+    }
+    if (format == CAD_PALETTE_FORMAT_COL) {
+        free(document->colSourcePath); document->colSourcePath = source;
+        free(document->colSavePath); document->colSavePath = save;
+        document->colSavedRevision = document->colRevision;
+    } else {
+        free(document->palSourcePath); document->palSourcePath = source;
+        free(document->palSavePath); document->palSavePath = save;
+        document->palSavedRevision = document->palRevision;
+    }
+    update_dirty_state(document);
+    return result;
+}
+
+CadResult CadDocument_SavePalette(CadDocument* document,
+                                  const char* utf8Path,
+                                  CadPaletteFormat format) {
+    CadPaletteFile palette = {0};
+    CadResult result;
+    CadResult writeResult;
+    uint8_t* bytes = NULL;
+    size_t size = 0;
+    char* source;
+    char* save;
+    if (!document || !utf8Path)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Palette save requires a document and path");
+    if (document->transactionBefore)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Finish or cancel the active edit before saving a palette");
+    if (format != CAD_PALETTE_FORMAT_COL &&
+        format != CAD_PALETTE_FORMAT_PAL)
+        return document_error(CAD_STATUS_UNSUPPORTED_FORMAT,
+                              "Palette save requires COL or PAL");
+    if (path_matches_model_resource(document, utf8Path))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Choose a different palette path; model, import, and export resources are never overwritten");
+    if (format == CAD_PALETTE_FORMAT_COL &&
+        ((document->palSourcePath &&
+          CadPlatform_PathsEqual(utf8Path, document->palSourcePath)) ||
+         (document->palSavePath &&
+          CadPlatform_PathsEqual(utf8Path, document->palSavePath))))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "A COL save cannot overwrite the PAL resource");
+    if (format == CAD_PALETTE_FORMAT_PAL &&
+        ((document->colSourcePath &&
+          CadPlatform_PathsEqual(utf8Path, document->colSourcePath)) ||
+         (document->colSavePath &&
+          CadPlatform_PathsEqual(utf8Path, document->colSavePath))))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "A PAL save cannot overwrite the COL resource");
+    result = document_extract_palette(document, format, &palette);
+    if (CadResult_IsSuccess(&result))
+        result = CadPalette_Encode(&palette, format, &bytes, &size);
+    if (!CadResult_IsSuccess(&result)) return result;
+    source = duplicate_string(utf8Path);
+    save = duplicate_string(utf8Path);
+    if (!source || !save) {
+        free(source); free(save);
+        CadPalette_FreeBuffer(bytes);
+        return document_error(CAD_STATUS_OUT_OF_MEMORY,
+                              "Could not retain the palette save path");
+    }
+    writeResult = CadPlatform_WriteFileAtomic(utf8Path, bytes, size);
+    CadPalette_FreeBuffer(bytes);
+    if (!CadResult_IsSuccess(&writeResult)) {
+        free(source); free(save);
+        return writeResult;
+    }
+    if (format == CAD_PALETTE_FORMAT_COL) {
+        free(document->colSourcePath); document->colSourcePath = source;
+        free(document->colSavePath); document->colSavePath = save;
+        document->colSavedRevision = document->colRevision;
+    } else {
+        free(document->palSourcePath); document->palSourcePath = source;
+        free(document->palSavePath); document->palSavePath = save;
+        document->palSavedRevision = document->palRevision;
+    }
+    update_dirty_state(document);
+    result.bytesConsumed = size;
+    return result;
+}
+
+CadResult CadDocument_SavePaletteCurrent(CadDocument* document,
+                                         CadPaletteFormat format) {
+    const char* path;
+    if (!document)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Palette save requires a document");
+    path = format == CAD_PALETTE_FORMAT_COL ? document->colSavePath
+         : format == CAD_PALETTE_FORMAT_PAL ? document->palSavePath : NULL;
+    if (!path)
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "This palette resource requires Save As");
+    return CadDocument_SavePalette(document, path, format);
+}
+
+int CadDocument_HasPalette(const CadDocument* document,
+                           CadPaletteFormat format) {
+    if (!document) return 0;
+    if (format == CAD_PALETTE_FORMAT_COL)
+        return document->paletteValid &&
+               document->colorDataSize == CAD_COL_FILE_SIZE;
+    if (format == CAD_PALETTE_FORMAT_PAL)
+        return document->paletteDataSize == CAD_PAL_FILE_SIZE;
+    if (format == CAD_PALETTE_FORMAT_AUTO)
+        return CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_COL) ||
+               CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL);
+    return 0;
+}
+
+int CadDocument_HasUnsavedPaletteChanges(const CadDocument* document) {
+    return document && (document->colDirty || document->palDirty);
+}
+
+uint16_t CadDocument_GetColWord(const CadDocument* document, unsigned index) {
+    if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_COL) ||
+        index >= CAD_PALETTE_ENTRY_COUNT) return 0;
+    return (uint16_t)((uint16_t)document->colorData[index * 2u] |
+                      ((uint16_t)document->colorData[index * 2u + 1u] << 8));
+}
+
+CadResult CadDocument_SetColWord(CadDocument* document, unsigned index,
+                                 uint16_t bgr555) {
+    CadResult result;
+    CadPaletteRgba8 rgba;
+    if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_COL))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Create or open a COL palette before editing colors");
+    if (index >= CAD_PALETTE_ENTRY_COUNT)
+        return document_error(CAD_STATUS_INDEX_OUT_OF_RANGE,
+                              "COL color index is out of range");
+    result = CadDocument_BeginEditNamed(document, "Edit COL Color");
+    if (!CadResult_IsSuccess(&result)) return result;
+    document->colorData[index * 2u] = (uint8_t)(bgr555 & 0xffu);
+    document->colorData[index * 2u + 1u] = (uint8_t)(bgr555 >> 8);
+    rgba = CadPalette_Bgr555ToRgba8(bgr555);
+    document->palette[index].r = rgba.r;
+    document->palette[index].g = rgba.g;
+    document->palette[index].b = rgba.b;
+    document->palette[index].a = rgba.a;
+    return CadDocument_CommitEdit(document);
+}
+
+int CadDocument_GetPalDescriptor(const CadDocument* document, unsigned index,
+                                 uint8_t* type, uint8_t* paletteNumber,
+                                 uint8_t* colorCount) {
+    uint8_t packed;
+    if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL) ||
+        index >= CAD_PAL_RECORD_COUNT) return 0;
+    packed = document->paletteData[index * 2u + 1u];
+    if (type) *type = document->paletteData[index * 2u];
+    if (paletteNumber) *paletteNumber = (uint8_t)((packed >> 4) + 1u);
+    if (colorCount) *colorCount = (uint8_t)((packed & 0x0fu) + 1u);
+    return 1;
+}
+
+CadResult CadDocument_SetPalDescriptor(CadDocument* document, unsigned index,
+                                       uint8_t type, uint8_t paletteNumber,
+                                       uint8_t colorCount) {
+    CadResult result;
+    if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Create or open a PAL map before editing materials");
+    if (index >= CAD_PAL_RECORD_COUNT)
+        return document_error(CAD_STATUS_INDEX_OUT_OF_RANGE,
+                              "PAL material index is out of range");
+    if (paletteNumber < 1 || paletteNumber > 16 ||
+        colorCount < 1 || colorCount > 16)
+        return document_error(CAD_STATUS_INVALID_NUMBER,
+                              "PAL palette number and color count must be 1-16");
+    result = CadDocument_BeginEditNamed(document, "Edit PAL Material");
+    if (!CadResult_IsSuccess(&result)) return result;
+    document->paletteData[index * 2u] = type;
+    document->paletteData[index * 2u + 1u] = (uint8_t)(
+        ((paletteNumber - 1u) << 4) | (colorCount - 1u));
+    return CadDocument_CommitEdit(document);
+}
+
+int CadDocument_GetPalSample(const CadDocument* document, unsigned material,
+                             unsigned sample, uint8_t* colorIndex) {
+    size_t offset;
+    if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL) ||
+        material >= CAD_PAL_RECORD_COUNT || sample >= CAD_PAL_INDEX_COUNT)
+        return 0;
+    offset = CAD_PAL_DESCRIPTOR_SIZE +
+             (size_t)material * CAD_PAL_INDEX_COUNT + sample;
+    if (colorIndex) *colorIndex = document->paletteData[offset];
+    return 1;
+}
+
+CadResult CadDocument_SetPalSample(CadDocument* document, unsigned material,
+                                   unsigned sample, uint8_t colorIndex) {
+    CadResult result;
+    size_t offset;
+    if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL))
+        return document_error(CAD_STATUS_INVALID_ARGUMENT,
+                              "Create or open a PAL map before editing samples");
+    if (material >= CAD_PAL_RECORD_COUNT || sample >= CAD_PAL_INDEX_COUNT)
+        return document_error(CAD_STATUS_INDEX_OUT_OF_RANGE,
+                              "PAL material or sample index is out of range");
+    result = CadDocument_BeginEditNamed(document, "Edit PAL Sample");
+    if (!CadResult_IsSuccess(&result)) return result;
+    offset = CAD_PAL_DESCRIPTOR_SIZE +
+             (size_t)material * CAD_PAL_INDEX_COUNT + sample;
+    document->paletteData[offset] = colorIndex;
+    return CadDocument_CommitEdit(document);
+}
+
+int CadDocument_ResolvePaletteColor(const CadDocument* document,
+                                    unsigned material, unsigned sample,
+                                    CadRgba* output) {
+    unsigned colorIndex = material;
+    uint8_t mapped;
+    if (!output || material >= CAD_PALETTE_ENTRY_COUNT ||
+        !CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_COL)) return 0;
+    if (CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL) &&
+        CadDocument_GetPalSample(document, material,
+                                 sample % CAD_PAL_INDEX_COUNT, &mapped))
+        colorIndex = mapped;
+    *output = document->palette[colorIndex];
+    return 1;
+}
+
 int CadDocument_SetPalette(CadDocument* document,
                            const CadRgba entries[256],
                            const char* utf8SourcePath) {
+    CadPaletteFile palette;
+    CadResult result;
     char* source;
+    char* save;
+    int ownsTransaction;
+    unsigned index;
     if (!document || !entries) return 0;
     source = duplicate_string(utf8SourcePath);
-    if (utf8SourcePath && !source) return 0;
-    memcpy(document->palette, entries, sizeof(document->palette));
-    document->paletteValid = 1;
-    free(document->paletteSourcePath);
-    document->paletteSourcePath = source;
+    save = duplicate_string(utf8SourcePath);
+    if (utf8SourcePath && (!source || !save)) {
+        free(source); free(save);
+        return 0;
+    }
+    memset(&palette, 0, sizeof(palette));
+    palette.format = CAD_PALETTE_FORMAT_COL;
+    for (index = 0; index < CAD_PALETTE_ENTRY_COUNT; ++index) {
+        CadPaletteRgba8 rgba = { entries[index].r, entries[index].g,
+                                 entries[index].b, entries[index].a };
+        palette.colWords[index] = CadPalette_Rgba8ToBgr555(rgba);
+    }
+    ownsTransaction = document->transactionBefore == NULL;
+    if (ownsTransaction) {
+        result = CadDocument_BeginEditNamed(document, "Install COL Palette");
+        if (!CadResult_IsSuccess(&result)) {
+            free(source); free(save);
+            return 0;
+        }
+    }
+    /* Install from the quantized words so the preview always matches what a
+       save/reopen cycle will display. */
+    document_install_col(document, &palette);
+    free(document->colSourcePath);
+    free(document->colSavePath);
+    document->colSourcePath = source;
+    document->colSavePath = save;
+    if (ownsTransaction) {
+        result = CadDocument_CommitEdit(document);
+        if (!CadResult_IsSuccess(&result)) return 0;
+    }
     return 1;
 }
 
 void CadDocument_ClearPalette(CadDocument* document) {
+    CadResult result;
+    int ownsTransaction;
     if (!document) return;
+    ownsTransaction = document->transactionBefore == NULL;
+    if (ownsTransaction) {
+        result = CadDocument_BeginEditNamed(document, "Clear COL Palette");
+        if (!CadResult_IsSuccess(&result)) return;
+    }
+    memset(document->colorData, 0, sizeof(document->colorData));
+    document->colorDataSize = 0;
     memset(document->palette, 0, sizeof(document->palette));
     document->paletteValid = 0;
-    free(document->paletteSourcePath);
-    document->paletteSourcePath = NULL;
+    free(document->colSourcePath); document->colSourcePath = NULL;
+    free(document->colSavePath); document->colSavePath = NULL;
+    if (ownsTransaction) (void)CadDocument_CommitEdit(document);
 }

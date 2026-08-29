@@ -31,9 +31,11 @@ baseline.
   indices and exports two-point faces as lines; 3DG1 preserves 2–16 point faces
   without repeated round-trip growth. Recovered `CLIP_PLANE` helpers preview as
   colored two-point normal guides with an explicit runtime-semantics warning.
-- Historical `.COL` and `.PAL` loading, full 0–255 polygon color indices, and a
-  BGR555 palette preview. `.COL` consumes the historical first 0x200 bytes and
-  tolerates trailing data; `.PAL` uses the exact recovered 0x8200-byte layout.
+- A palette editor can create, open, inspect, edit, and save both recovered
+  color resources. `.COL` stores 256 little-endian SNES BGR555 colors; `.PAL`
+  is the separate 0x8200-byte material map with 256 descriptors and 128 `.COL`
+  indices per material. The editor exposes the complete 0–255 color/material
+  range and previews a model through the active `.PAL` sample and `.COL` table.
 
 ## Native compatibility
 
@@ -118,6 +120,9 @@ ctest --test-dir build/core --output-on-failure
   and Escape cancels
 - Color tool: left-click increases a face or line's palette index; right-click
   decreases it. Indices wrap between 0 and 255; right-drag still pans the view
+- Palette Editor: create or open `.COL` and `.PAL` resources, select entries in
+  the 16x16 grids, edit BGR555 channels or material descriptors/sample indices,
+  and apply the selected index to selected faces or two-point lines
 - `F`: frame the active selection; Home frames the complete document
 - Timeline: scrub the zero-based strip, use Play/Pause/Stop and frame controls,
   and toggle interpolation, looping, or All Frames
@@ -165,13 +170,15 @@ normal guides rather than emulating the game runtime's plane-slot behavior.
 ## Core API
 
 `ThreeDCadCore` is independent of SDL and Win32 GUI code. `CadDocument` owns
-model state, paths, dirty tracking, palette data, and the 64-entry named
-undo/redo history. `CadCodec_*` and `CadAnmCodec_*` operate on caller-provided
-buffers and return `CadResult` with structured diagnostics; bounded UTF-8 file
-access and atomic replacement live in platform services. `EditorController`
-provides one capability/disabled-reason source and the shared begin/update/
-commit/cancel mutation boundary. Invalid geometry rolls back without changing
-history, revision, or dirty state.
+model state, paths, dirty tracking, palette resources, and the 64-entry named
+undo/redo history. Native CAD, `.COL`, and `.PAL` resources have independent
+source/save paths, revisions, and dirty state; saving one never marks either of
+the others clean. `CadCodec_*`, `CadAnmCodec_*`, and `CadPalette_*` operate on
+caller-provided buffers and return `CadResult` with structured diagnostics;
+bounded UTF-8 file access and atomic replacement live in platform services.
+`EditorController` provides one capability/disabled-reason source and the
+shared begin/update/commit/cancel mutation boundary. Invalid geometry rolls
+back without changing history, revision, or dirty state.
 
 `CadAnimation_*`, `CadPose`, `CadScene`, and `CadAnimationSession` provide the
 fixed-topology authoring and allocation-free playback path. Stable static point

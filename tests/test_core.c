@@ -588,10 +588,10 @@ static void test_document_undo_redo_and_palette(void) {
         palette[i].b = (uint8_t)(i ^ 0x55);
         palette[i].a = 255;
     }
-    CHECK(CadDocument_SetPalette(document, palette, "palette-test.pal"));
+    CHECK(CadDocument_SetPalette(document, palette, "palette-test.col"));
     CHECK(document->paletteValid);
     CHECK(document->palette[255].r == 255);
-    CHECK(document->paletteSourcePath != NULL);
+    CHECK(document->colSourcePath != NULL);
     CHECK(!document->isDirty);
     CadDocument_ClearPalette(document);
     CHECK(!document->paletteValid);
@@ -599,28 +599,37 @@ static void test_document_undo_redo_and_palette(void) {
 
     result = CadDocument_BeginEditNamed(document, "Load Palette A");
     CHECK(CadResult_IsSuccess(&result));
-    CHECK(CadDocument_SetPalette(document, palette, "palette-a.pal"));
+    CHECK(CadDocument_SetPalette(document, palette, "palette-a.col"));
     result = CadDocument_CommitEdit(document);
     CHECK(CadResult_IsSuccess(&result));
-    CHECK(strcmp(document->paletteSourcePath, "palette-a.pal") == 0);
+    CHECK(strcmp(document->colSourcePath, "palette-a.col") == 0);
     CHECK(document->palette[0].r == 0);
 
-    palette[0].r = 77;
+    palette[0].r = 82; /* exactly representable after BGR555 quantization */
+    result = CadDocument_BeginEditNamed(document, "Cancelled Palette");
+    CHECK(CadResult_IsSuccess(&result));
+    CHECK(CadDocument_SetPalette(document, palette, "palette-cancelled.col"));
+    CadDocument_CancelEdit(document);
+    CHECK(strcmp(document->colSourcePath, "palette-a.col") == 0);
+    CHECK(document->palette[0].r == 0);
+
     result = CadDocument_BeginEditNamed(document, "Load Palette B");
     CHECK(CadResult_IsSuccess(&result));
-    CHECK(CadDocument_SetPalette(document, palette, "palette-b.pal"));
+    CHECK(CadDocument_SetPalette(document, palette, "palette-b.col"));
     result = CadDocument_CommitEdit(document);
     CHECK(CadResult_IsSuccess(&result));
-    CHECK(strcmp(document->paletteSourcePath, "palette-b.pal") == 0);
-    CHECK(document->palette[0].r == 77);
+    CHECK(strcmp(document->colSourcePath, "palette-b.col") == 0);
+    CHECK(document->palette[0].r == 82);
     result = CadDocument_Undo(document);
     CHECK(CadResult_IsSuccess(&result));
-    CHECK(strcmp(document->paletteSourcePath, "palette-a.pal") == 0);
+    /* File associations are resource state rather than undoable content;
+       undo restores colors while retaining the current save destination. */
+    CHECK(strcmp(document->colSourcePath, "palette-b.col") == 0);
     CHECK(document->palette[0].r == 0);
     result = CadDocument_Redo(document);
     CHECK(CadResult_IsSuccess(&result));
-    CHECK(strcmp(document->paletteSourcePath, "palette-b.pal") == 0);
-    CHECK(document->palette[0].r == 77);
+    CHECK(strcmp(document->colSourcePath, "palette-b.col") == 0);
+    CHECK(document->palette[0].r == 82);
 
     CadDocument_MakeUnnamed(document);
     CHECK(document->sourcePath == NULL);

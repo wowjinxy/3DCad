@@ -28,6 +28,7 @@ typedef struct EditorCommandContext {
     int toolPaletteVisible;
     int statePanelVisible;
     int animationPanelVisible;
+    int palettePanelVisible;
     int wireframe3D;
 } EditorCommandContext;
 

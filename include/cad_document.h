@@ -2,6 +2,7 @@
 
 #include "cad_codec.h"
 #include "cad_core.h"
+#include "cad_palette.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -37,7 +38,14 @@ typedef struct CadDocument {
     char* savePath;
     char* lastImportPath;
     char* lastExportPath;
-    char* paletteSourcePath;
+    /* The recovered color resources are separate files.  COL is the actual
+       256-entry BGR555 hardware palette; PAL is a 256-material lookup map.
+       Neither resource is serialized by native CAD saves, so each keeps its
+       own source/save association and dirty revision. */
+    char* colSourcePath;
+    char* colSavePath;
+    char* palSourcePath;
+    char* palSavePath;
     /* Retained only for a validated native X11 load.  An unchanged document
        can therefore be saved byte-for-byte, including recovered fields that
        have no editable in-memory representation. */
@@ -60,6 +68,14 @@ typedef struct CadDocument {
     size_t paletteDataSize;
     CadRgba palette[256];
     int paletteValid;
+    int colDirty;
+    int palDirty;
+    uint64_t colRevision;
+    uint64_t colSavedRevision;
+    uint64_t nextColRevision;
+    uint64_t palRevision;
+    uint64_t palSavedRevision;
+    uint64_t nextPalRevision;
 
     CadDocumentSnapshot* history[CAD_DOCUMENT_HISTORY_LIMIT];
     unsigned historyCount;
@@ -84,6 +100,11 @@ CadResult CadDocument_ImportAnm(CadDocument* document,
 CadResult CadDocument_ExportAnm(CadDocument* document,
                                 const char* utf8Path,
                                 CadFormat format);
+/* Rejects an export target that aliases the native source/save path, the
+   current import source, or an attached COL/PAL resource.  A previous export
+   path remains writable so repeated exports work normally. */
+CadResult CadDocument_ValidateExportPath(const CadDocument* document,
+                                         const char* utf8Path);
 CadResult CadDocument_Save(CadDocument* document, const char* utf8Path);
 CadResult CadDocument_SaveCurrent(CadDocument* document);
 
@@ -114,8 +135,48 @@ void CadDocument_ClearHistory(CadDocument* document);
 int CadDocument_SetLastImportPath(CadDocument* document, const char* utf8Path);
 int CadDocument_SetLastExportPath(CadDocument* document, const char* utf8Path);
 
-/* Integration point for .COL/.PAL parsers: parse externally, then install all
-   256 entries transactionally.  Polygon colors remain full uint8 indices. */
+/* Independent recovered color-resource lifecycle.  Open is transactional;
+   New creates a useful deterministic COL table or the recovered PAL defaults.
+   Save writes only the requested resource and never changes native CAD dirty
+   state.  Palette edits remain part of the document's named undo timeline. */
+CadResult CadDocument_NewPalette(CadDocument* document,
+                                 CadPaletteFormat format);
+CadResult CadDocument_OpenPalette(CadDocument* document,
+                                  const char* utf8Path,
+                                  CadPaletteFormat format);
+CadResult CadDocument_SavePalette(CadDocument* document,
+                                  const char* utf8Path,
+                                  CadPaletteFormat format);
+CadResult CadDocument_SavePaletteCurrent(CadDocument* document,
+                                         CadPaletteFormat format);
+int CadDocument_HasPalette(const CadDocument* document,
+                           CadPaletteFormat format);
+int CadDocument_HasUnsavedPaletteChanges(const CadDocument* document);
+
+/* COL words remain authoritative so untouched bit 15 round-trips exactly. */
+uint16_t CadDocument_GetColWord(const CadDocument* document, unsigned index);
+CadResult CadDocument_SetColWord(CadDocument* document, unsigned index,
+                                 uint16_t bgr555);
+
+/* PAL descriptors expose the recovered semantics without inventing runtime
+   interpolation rules.  Payload samples are raw COL indices (0-255). */
+int CadDocument_GetPalDescriptor(const CadDocument* document, unsigned index,
+                                 uint8_t* type, uint8_t* paletteNumber,
+                                 uint8_t* colorCount);
+CadResult CadDocument_SetPalDescriptor(CadDocument* document, unsigned index,
+                                       uint8_t type, uint8_t paletteNumber,
+                                       uint8_t colorCount);
+int CadDocument_GetPalSample(const CadDocument* document, unsigned material,
+                             unsigned sample, uint8_t* colorIndex);
+CadResult CadDocument_SetPalSample(CadDocument* document, unsigned material,
+                                   unsigned sample, uint8_t colorIndex);
+int CadDocument_ResolvePaletteColor(const CadDocument* document,
+                                    unsigned material, unsigned sample,
+                                    CadRgba* output);
+
+/* Legacy integration point retained for callers that already decoded COL.
+   Values are quantized through BGR555 and installed as one undoable edit;
+   polygon colors remain full uint8 indices. */
 int CadDocument_SetPalette(CadDocument* document,
                            const CadRgba entries[256],
                            const char* utf8SourcePath);

@@ -7,6 +7,7 @@
 #include "file_dialog.h"
 #include "cad_view.h"
 #include "animation_panel.h"
+#include "palette_panel.h"
 #include "desktop_layout.h"
 #include "cad_export_obj.h"
 #include "cad_export_3dg1.h"
@@ -87,7 +88,8 @@ typedef enum GuiPointerOwner {
     GUI_POINTER_COLOR,
     GUI_POINTER_SHAPE_BROWSER,
     GUI_POINTER_SCROLLBAR,
-    GUI_POINTER_ANIMATION
+    GUI_POINTER_ANIMATION,
+    GUI_POINTER_PALETTE_EDITOR
 } GuiPointerOwner;
 
 /* Auxiliary editor windows form one desktop layer above the modeling views.
@@ -97,6 +99,7 @@ typedef enum GuiAuxWindowId {
     GUI_AUX_COORDINATES,
     GUI_AUX_ANIMATION,
     GUI_AUX_SHAPE_BROWSER,
+    GUI_AUX_PALETTE_EDITOR,
     GUI_AUX_COUNT
 } GuiAuxWindowId;
 
@@ -124,6 +127,7 @@ struct GuiState {
     GuiWin view[4];          /* 4 view windows */
     GuiWin coordBox;         /* coordinates/info */
     GuiWin animationWindow;  /* Animation window */
+    GuiWin paletteWindow;    /* COL/PAL editor and viewer */
     GuiWin stateWindow;      /* Numeric STATE / TenKey transform panel */
 
     /* Menu bar */
@@ -156,6 +160,10 @@ struct GuiState {
     int coordinates_visible;
     int animation_visible;
     int animation_docked;
+    int palette_visible;
+    CadPalettePanelTab palette_tab;
+    int palette_selected_index;
+    int palette_sample_index;
 
     /* Numeric transform panel. */
     int state_visible;
@@ -276,8 +284,11 @@ static const CadMenuItemDescriptor fileMenuItems[] = {
     { CAD_COMMAND_NONE, "Import >", CAD_MENU_ITEM_SUBMENU },
     { CAD_COMMAND_NONE, "Export >", CAD_MENU_ITEM_SUBMENU },
     { CAD_COMMAND_NONE, "-", CAD_MENU_ITEM_SEPARATOR },
-    { CAD_COMMAND_FILE_LOAD_COLOR, "Load Color...", 0 },
-    { CAD_COMMAND_FILE_LOAD_PALETTE, "Load Palette...", 0 },
+    { CAD_COMMAND_PALETTE_NEW_COL, "New Color Palette (.COL)", 0 },
+    { CAD_COMMAND_PALETTE_OPEN_COL, "Open Color Palette...", 0 },
+    { CAD_COMMAND_PALETTE_NEW_PAL, "New Material Map (.PAL)", 0 },
+    { CAD_COMMAND_PALETTE_OPEN_PAL, "Open Material Map...", 0 },
+    { CAD_COMMAND_WINDOW_PALETTE_EDITOR, "Palette Editor...", 0 },
     { CAD_COMMAND_FILE_ANIMATION, "Animation data...", 0 },
     { CAD_COMMAND_FILE_OPEN_SHAPE_FOLDER, "Open Shape Folder...", 0 },
     { CAD_COMMAND_NONE, "-", CAD_MENU_ITEM_SEPARATOR },
@@ -315,6 +326,7 @@ static const CadMenuItemDescriptor windowMenuItems[] = {
     { CAD_COMMAND_NONE, "-", CAD_MENU_ITEM_SEPARATOR },
     { CAD_COMMAND_WINDOW_COORDINATES, "(C)Coordinates", 0 },
     { CAD_COMMAND_WINDOW_TOOL_PALETTE, "Tool palette", 0 },
+    { CAD_COMMAND_WINDOW_PALETTE_EDITOR, "Palette editor", 0 },
     { CAD_COMMAND_WINDOW_TEN_KEY, "TenKey", 0 },
     { CAD_COMMAND_NONE, "-", CAD_MENU_ITEM_SEPARATOR },
     { CAD_COMMAND_WINDOW_CLEAN_UP, "Clean Up", 0 },
@@ -413,6 +425,7 @@ static EditorCommandContext editor_command_context(const GuiState* g) {
     context.coordinatesVisible = g->coordinates_visible;
     context.toolPaletteVisible = g->tool_palette_visible;
     context.animationPanelVisible = g->animation_visible;
+    context.palettePanelVisible = g->palette_visible;
     context.statePanelVisible = g->state_visible;
     context.wireframe3D = g->views[1].wireframe;
     context.activeTool = g->selected_tool;
@@ -476,18 +489,26 @@ static void gui_set_status(GuiState* g, const char* format, ...) {
 
 static void apply_document_palette(GuiState* g) {
     if (!g) return;
-    if (!g->document.paletteValid) {
+    if (!CadDocument_HasPalette(&g->document, CAD_PALETTE_FORMAT_COL)) {
         for (int i = 0; i < 4; ++i) CadView_ClearPalette(&g->views[i]);
+        CadView_ClearPalette(&g->shape_preview_view);
         return;
     }
     uint8_t rgba[256][4];
     for (int i = 0; i < 256; ++i) {
-        rgba[i][0] = g->document.palette[i].r;
-        rgba[i][1] = g->document.palette[i].g;
-        rgba[i][2] = g->document.palette[i].b;
-        rgba[i][3] = g->document.palette[i].a;
+        CadRgba color;
+        if (!CadDocument_ResolvePaletteColor(
+                &g->document, (unsigned)i,
+                (unsigned)g->palette_sample_index, &color)) {
+            color = g->document.palette[i];
+        }
+        rgba[i][0] = color.r;
+        rgba[i][1] = color.g;
+        rgba[i][2] = color.b;
+        rgba[i][3] = color.a;
     }
     for (int i = 0; i < 4; ++i) CadView_SetPalette(&g->views[i], &rgba[0][0]);
+    CadView_SetPalette(&g->shape_preview_view, &rgba[0][0]);
 }
 
 static const char* cad_result_message(const CadResult* result) {
@@ -798,17 +819,106 @@ static int save_document(GuiState* g) {
     return 1;
 }
 
-static int confirm_replace_document(GuiState* g, const char* action) {
-    if (!g || !g->cad || !g->document.isDirty) return 1;
+static int save_palette_as(GuiState* g, CadPaletteFormat format) {
+    char filename[GUI_PATH_CAPACITY];
+    const int is_col = format == CAD_PALETTE_FORMAT_COL;
+    CadResult result;
+    if (!g || !CadDocument_HasPalette(&g->document, format)) return 0;
+    if (!FileDialog_Save(filename, sizeof(filename),
+                         is_col
+                             ? "Color Palette Files\0*.col\0All Files\0*.*\0"
+                             : "Material Map Files\0*.pal\0All Files\0*.*\0",
+                         is_col ? "Save BGR555 Color Palette"
+                                : "Save Software Material Map"))
+        return 0;
+    result = CadDocument_SavePalette(&g->document, filename, format);
+    if (!CadResult_IsSuccess(&result)) {
+        gui_set_status(g, "Could not save %s: %s", filename,
+                       cad_result_message(&result));
+        return 0;
+    }
+    if (result.warningCount)
+        gui_set_status(g, "Saved %s %s; warning: %s",
+                       is_col ? "COL palette" : "PAL map", filename,
+                       cad_result_message(&result));
+    else
+        gui_set_status(g, "Saved %s %s",
+                       is_col ? "COL palette" : "PAL map", filename);
+    return 1;
+}
+
+static int save_palette(GuiState* g, CadPaletteFormat format) {
+    const char* path;
+    CadResult result;
+    if (!g || !CadDocument_HasPalette(&g->document, format)) return 0;
+    path = format == CAD_PALETTE_FORMAT_COL
+               ? g->document.colSavePath : g->document.palSavePath;
+    if (!path) return save_palette_as(g, format);
+    result = CadDocument_SavePaletteCurrent(&g->document, format);
+    if (!CadResult_IsSuccess(&result)) {
+        gui_set_status(g, "Could not save %s: %s", path,
+                       cad_result_message(&result));
+        return 0;
+    }
+    if (result.warningCount)
+        gui_set_status(g, "Saved %s; warning: %s", path,
+                       cad_result_message(&result));
+    else
+        gui_set_status(g, "Saved %s", path);
+    return 1;
+}
+
+static int confirm_replace_palette(GuiState* g, CadPaletteFormat format,
+                                   const char* action) {
+    const int dirty = format == CAD_PALETTE_FORMAT_COL
+                          ? g && g->document.colDirty
+                          : g && g->document.palDirty;
+    if (!dirty) return 1;
 #ifdef _WIN32
     char prompt[512];
     snprintf(prompt, sizeof(prompt),
-             "Save changes before %s?\n\nYes: save\nNo: discard\nCancel: keep editing",
+             "Save changes to the %s before %s?\n\n"
+             "Yes: save\nNo: discard\nCancel: keep editing",
+             format == CAD_PALETTE_FORMAT_COL ? "COL color palette"
+                                               : "PAL material map",
+             action ? action : "continuing");
+    int answer = MessageBoxA(GetActiveWindow(), prompt,
+                             "3DCad - Unsaved palette changes",
+                             MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+    if (answer == IDCANCEL || answer == 0) return 0;
+    if (answer == IDYES) return save_palette(g, format);
+    return answer == IDNO;
+#else
+    gui_set_status(g, "Unsaved palette changes: save before %s",
+                   action ? action : "continuing");
+    return 0;
+#endif
+}
+
+static int confirm_replace_document(GuiState* g, const char* action) {
+    int model_dirty;
+    int col_dirty;
+    int pal_dirty;
+    if (!g || !g->cad) return 1;
+    model_dirty = g->document.isDirty;
+    col_dirty = g->document.colDirty;
+    pal_dirty = g->document.palDirty;
+    if (!model_dirty && !col_dirty && !pal_dirty) return 1;
+#ifdef _WIN32
+    char prompt[512];
+    snprintf(prompt, sizeof(prompt),
+             "Save modified model/color resources before %s?\n\n"
+             "Yes: save each modified resource\nNo: discard\nCancel: keep editing",
              action ? action : "continuing");
     int answer = MessageBoxA(GetActiveWindow(), prompt, "3DCad - Unsaved changes",
                              MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
     if (answer == IDCANCEL || answer == 0) return 0;
-    if (answer == IDYES) return save_document(g);
+    if (answer == IDYES) {
+        if (model_dirty && !save_document(g)) return 0;
+        if (col_dirty && !save_palette(g, CAD_PALETTE_FORMAT_COL)) return 0;
+        if (pal_dirty && !save_palette(g, CAD_PALETTE_FORMAT_PAL)) return 0;
+        return 1;
+    }
     return answer == IDNO;
 #else
     gui_set_status(g, "Unsaved changes: save before %s", action ? action : "continuing");
@@ -861,6 +971,9 @@ static void state_panel_close(GuiState* g);
 static int state_panel_apply(GuiState* g);
 static void state_panel_key(GuiState* g, int key, unsigned modifiers);
 static void gui_draw_interaction_overlays(GuiState* g, int view_index);
+static int apply_palette_index_to_selection(GuiState* g, uint8_t index);
+static void handle_palette_panel(GuiState* g, const GuiInput* in);
+static void draw_palette_panel(GuiState* g);
 
 #ifdef _WIN32
 static int gui_utf8_to_wide(const char* source, wchar_t* target, int capacity) {
@@ -878,7 +991,19 @@ static int gui_wide_to_utf8(const wchar_t* source, char* target, int capacity) {
 
 static void execute_editor_command(GuiState* g, CadCommandId command) {
     char filename[GUI_PATH_CAPACITY];
+    EditorCommandContext context;
+    CadCommandState state;
     if (!g || !g->cad) return;
+
+    context = editor_command_context(g);
+    state = EditorController_GetCommandState(&g->controller, command,
+                                              &context);
+    if (!state.enabled) {
+        gui_set_status(g, "%s", state.disabledReason[0]
+                                   ? state.disabledReason
+                                   : "That command is unavailable");
+        return;
+    }
 
     if (EditorController_IsEditing(&g->controller) || g->document.transactionBefore)
         reset_interaction(g);
@@ -892,6 +1017,7 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
             animation_invalidate(g);
             reset_interaction(g);
             for (int i = 0; i < 4; ++i) CadView_Reset(&g->views[i]);
+            apply_document_palette(g);
             gui_set_status(g, "New document");
         }
         break;
@@ -957,6 +1083,7 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
                 animation_invalidate(g);
                 reset_interaction(g);
                 for (int i = 0; i < 4; ++i) CadView_Reset(&g->views[i]);
+                apply_document_palette(g);
                 g->animation_visible = 1;
                 g->animation_docked = 1;
                 raise_aux(g, GUI_AUX_ANIMATION);
@@ -1009,11 +1136,11 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
                                    : "3DG1 Files\0*.3dg1\0All Files\0*.*\0",
                             is_obj ? "Export OBJ" : "Export 3DG1")) {
             int ok;
-            if (g->document.lastImportPath &&
-                CadPlatform_PathsEqual(filename,
-                                       g->document.lastImportPath)) {
-                gui_set_status(
-                    g, "Export cancelled: imported source files are never overwritten");
+            CadResult pathResult = CadDocument_ValidateExportPath(
+                &g->document, filename);
+            if (!CadResult_IsSuccess(&pathResult)) {
+                gui_set_status(g, "Export cancelled: %s",
+                               cad_result_message(&pathResult));
                 break;
             }
             ok = is_obj ? CadExport_OBJ(g->cad, filename)
@@ -1074,68 +1201,107 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
         }
         break;
     }
-    case CAD_COMMAND_FILE_LOAD_COLOR:
-    case CAD_COMMAND_FILE_LOAD_PALETTE: {
-        int palette = command == CAD_COMMAND_FILE_LOAD_PALETTE;
-        if (FileDialog_Open(filename, sizeof(filename),
-                            palette ? "Palette Files\0*.pal\0All Files\0*.*\0"
-                                    : "Color Files\0*.col\0All Files\0*.*\0",
-                             palette ? "Load Palette" : "Load Color")) {
-            uint8_t* bytes = NULL;
-            size_t size = 0;
-            size_t required = palette ? sizeof(g->document.paletteData)
-                                      : sizeof(g->document.colorData);
-            CadResult read_result = CadPlatform_ReadFile(
-                filename, CAD_PALETTE_DATA_SIZE, &bytes, &size);
-            if (!CadResult_IsSuccess(&read_result)) {
-                gui_set_status(g, "Could not load %s: %s", filename,
-                               cad_result_message(&read_result));
-            } else if ((palette && size != required) ||
-                       (!palette && size < required)) {
-                gui_set_status(g, palette
-                    ? "%s must be exactly 0x%zX bytes"
-                    : "%s must contain at least 0x%zX bytes",
-                    filename, required);
-            } else {
-                CadRgba entries[256];
-                for (int i = 0; i < 256; ++i) {
-                    unsigned word = (unsigned)bytes[i * 2] |
-                                    ((unsigned)bytes[i * 2 + 1] << 8);
-                    entries[i].r = (uint8_t)(((word >> 0) & 31u) * 255u / 31u);
-                    entries[i].g = (uint8_t)(((word >> 5) & 31u) * 255u / 31u);
-                    entries[i].b = (uint8_t)(((word >> 10) & 31u) * 255u / 31u);
-                    entries[i].a = 255;
-                }
-                if (history_push_named(g, palette ? "Load Palette" : "Load Color")) {
-                    if (palette) {
-                        memcpy(g->document.paletteData, bytes, required);
-                        g->document.paletteDataSize = required;
-                    } else {
-                        memcpy(g->document.colorData, bytes, required);
-                        g->document.colorDataSize = required;
-                    }
-                    if (!CadDocument_SetPalette(&g->document, entries,
-                                                filename)) {
-                        history_cancel(g);
-                        gui_set_status(g,
-                                       "Could not retain the palette source path");
-                    } else if (history_commit(g)) {
-                        apply_document_palette(g);
-                        if (!palette && size > required) {
-                            gui_set_status(g,
-                                "Loaded first %zu color bytes from %s; %zu trailing byte(s) ignored",
-                                required, filename, size - required);
-                        } else {
-                            gui_set_status(g, "Loaded %zu bytes from %s",
-                                           required, filename);
-                        }
-                    }
-                }
+    case CAD_COMMAND_PALETTE_NEW_COL:
+        if (confirm_replace_palette(g, CAD_PALETTE_FORMAT_COL,
+                                    "creating a new color palette")) {
+            CadResult result = CadDocument_NewPalette(
+                &g->document, CAD_PALETTE_FORMAT_COL);
+            if (!CadResult_IsSuccess(&result))
+                gui_set_status(g, "Could not create COL palette: %s",
+                               cad_result_message(&result));
+            else {
+                g->palette_tab = CAD_PALETTE_PANEL_TAB_COL;
+                g->palette_visible = 1;
+                raise_aux(g, GUI_AUX_PALETTE_EDITOR);
+                apply_document_palette(g);
+                gui_set_status(g, "Created an unnamed 256-color BGR555 palette");
             }
-            CadPlatform_Free(bytes);
         }
         break;
-    }
+    case CAD_COMMAND_FILE_LOAD_COLOR: /* compatibility command alias */
+    case CAD_COMMAND_PALETTE_OPEN_COL:
+        if (confirm_replace_palette(g, CAD_PALETTE_FORMAT_COL,
+                                    "opening another color palette") &&
+            FileDialog_Open(filename, sizeof(filename),
+                            "Color Palette Files\0*.col\0All Files\0*.*\0",
+                            "Open BGR555 Color Palette")) {
+            CadResult result = CadDocument_OpenPalette(
+                &g->document, filename, CAD_PALETTE_FORMAT_COL);
+            if (!CadResult_IsSuccess(&result))
+                gui_set_status(g, "Could not open COL palette: %s",
+                               cad_result_message(&result));
+            else {
+                g->palette_tab = CAD_PALETTE_PANEL_TAB_COL;
+                g->palette_visible = 1;
+                raise_aux(g, GUI_AUX_PALETTE_EDITOR);
+                apply_document_palette(g);
+                if (result.warningCount) {
+                    gui_set_status(g, "Opened %s with %u warning(s): %s",
+                                   filename, result.warningCount,
+                                   cad_result_message(&result));
+                } else {
+                    gui_set_status(g, "Opened BGR555 color palette %s",
+                                   filename);
+                }
+            }
+        }
+        break;
+    case CAD_COMMAND_PALETTE_NEW_PAL:
+        if (confirm_replace_palette(g, CAD_PALETTE_FORMAT_PAL,
+                                    "creating a new material map")) {
+            CadResult result = CadDocument_NewPalette(
+                &g->document, CAD_PALETTE_FORMAT_PAL);
+            if (!CadResult_IsSuccess(&result))
+                gui_set_status(g, "Could not create PAL map: %s",
+                               cad_result_message(&result));
+            else {
+                g->palette_tab = CAD_PALETTE_PANEL_TAB_PAL;
+                g->palette_visible = 1;
+                raise_aux(g, GUI_AUX_PALETTE_EDITOR);
+                apply_document_palette(g);
+                gui_set_status(g, "Created an unnamed PAL material map with recovered defaults");
+            }
+        }
+        break;
+    case CAD_COMMAND_FILE_LOAD_PALETTE: /* compatibility command alias */
+    case CAD_COMMAND_PALETTE_OPEN_PAL:
+        if (confirm_replace_palette(g, CAD_PALETTE_FORMAT_PAL,
+                                    "opening another material map") &&
+            FileDialog_Open(filename, sizeof(filename),
+                            "Material Map Files\0*.pal\0All Files\0*.*\0",
+                            "Open Software Material Map")) {
+            CadResult result = CadDocument_OpenPalette(
+                &g->document, filename, CAD_PALETTE_FORMAT_PAL);
+            if (!CadResult_IsSuccess(&result))
+                gui_set_status(g, "Could not open PAL map: %s",
+                               cad_result_message(&result));
+            else {
+                g->palette_tab = CAD_PALETTE_PANEL_TAB_PAL;
+                g->palette_visible = 1;
+                raise_aux(g, GUI_AUX_PALETTE_EDITOR);
+                apply_document_palette(g);
+                if (result.warningCount) {
+                    gui_set_status(
+                        g, "Opened %s with %u preserved unknown material type(s)",
+                        filename, result.warningCount);
+                } else {
+                    gui_set_status(g, "Opened PAL material map %s", filename);
+                }
+            }
+        }
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_COL:
+        save_palette(g, CAD_PALETTE_FORMAT_COL);
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_COL_AS:
+        save_palette_as(g, CAD_PALETTE_FORMAT_COL);
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_PAL:
+        save_palette(g, CAD_PALETTE_FORMAT_PAL);
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_PAL_AS:
+        save_palette_as(g, CAD_PALETTE_FORMAT_PAL);
+        break;
     case CAD_COMMAND_FILE_ANIMATION:
         g->animation_visible = !g->animation_visible;
         if (g->animation_visible && g->animationWindow.r.w <= 0)
@@ -1166,6 +1332,16 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
         g->tool_palette_visible = !g->tool_palette_visible;
         if (g->tool_palette_visible) raise_aux(g, GUI_AUX_TOOL_PALETTE);
         g->auto_layout = 1;
+        break;
+    case CAD_COMMAND_WINDOW_PALETTE_EDITOR:
+        g->palette_visible = !g->palette_visible;
+        if (g->palette_visible) raise_aux(g, GUI_AUX_PALETTE_EDITOR);
+        gui_set_status(g, "Palette editor %s",
+                       g->palette_visible ? "shown" : "hidden");
+        break;
+    case CAD_COMMAND_PALETTE_APPLY_SELECTED:
+        apply_palette_index_to_selection(
+            g, (uint8_t)g->palette_selected_index);
         break;
     case CAD_COMMAND_WINDOW_TEN_KEY:
         if (g->state_visible) state_panel_close(g);
@@ -1270,6 +1446,10 @@ GuiState* gui_create(void) {
     g->coordinates_visible = 1;
     g->animation_visible = 1;
     g->animation_docked = 1;
+    g->palette_visible = 0;
+    g->palette_tab = CAD_PALETTE_PANEL_TAB_COL;
+    g->palette_selected_index = 0;
+    g->palette_sample_index = 0;
     for (int i = 0; i < 4; ++i) {
         g->view_visible[i] = 1;
         g->view_z_order[i] = i;
@@ -1328,6 +1508,7 @@ GuiState* gui_create(void) {
 
     g->coordBox = (GuiWin){ "COORDINATES", { 20, 860, 425, 80 }, 1 };
     g->animationWindow = (GuiWin){ "ANIMATION", { 180, 680, 900, 126 }, 1 };
+    g->paletteWindow = (GuiWin){ "PALETTE EDITOR", { 260, 90, 720, 520 }, 1 };
     g->stateWindow = (GuiWin){ "STATE / TENKEY", { 260, 90, 620, 350 }, 1 };
 
     g->shapeBrowserWindow = (GuiWin){ "SHAPE BROWSER", { 600, 300, 400, 500 }, 1 };
@@ -1981,7 +2162,8 @@ const char* gui_window_title(GuiState* g) {
     if (slash && slash[1]) name = slash + 1;
     if (backslash && backslash[1] && backslash + 1 > name) name = backslash + 1;
     snprintf(g->title_text, sizeof(g->title_text), "3DCad - %s%s",
-             name, g->document.isDirty ? " *" : "");
+             name, (g->document.isDirty || g->document.colDirty ||
+                    g->document.palDirty) ? " *" : "");
     return g->title_text;
 }
 
@@ -2234,6 +2416,8 @@ static void clamp_manual_layout(GuiState* g, int win_w, int win_h) {
         clamp_window_reachable(&g->coordBox, win_w, win_h);
     if (g->animation_visible && !g->animation_docked)
         clamp_window_reachable(&g->animationWindow, win_w, win_h);
+    if (g->palette_visible)
+        clamp_window_reachable(&g->paletteWindow, win_w, win_h);
     if (g->shapeBrowserWindow.r.w > 0 && g->shapeBrowserWindow.r.h > 0)
         clamp_window_reachable(&g->shapeBrowserWindow, win_w, win_h);
     if (g->state_visible)
@@ -3137,6 +3321,30 @@ static int adjust_face_color_at(GuiState* g, int view_index,
         g, find_polygon_at(g, view_index, screen_x, screen_y, NULL), delta);
 }
 
+static int apply_palette_index_to_selection(GuiState* g, uint8_t index) {
+    int changed = 0;
+    int selected;
+    if (!g || !g->cad) return 0;
+    selected = g->cad->selection.polygonCount;
+    if (selected <= 0) {
+        gui_set_status(g, "Select one or more faces or two-point lines first");
+        return 0;
+    }
+    if (!history_push_named(g, "Assign Palette Index")) return 0;
+    for (int i = 0; i < selected; ++i) {
+        int16_t polygon = g->cad->selection.selectedPolygons[i];
+        if (!CadCore_IsPolygonValid(g->cad, polygon) ||
+            g->cad->data.polygons[polygon].color == index) continue;
+        g->cad->data.polygons[polygon].color = index;
+        changed = 1;
+    }
+    if (changed) g->cad->isDirty = 1;
+    if (!history_commit(g)) return 0;
+    gui_set_status(g, "Assigned palette/material index %u to %d selected face(s)",
+                   (unsigned)index, selected);
+    return 1;
+}
+
 static void update_face_creation_status(GuiState* g, int view_index) {
     double coords[CAD_MAX_FACE_POINTS][3];
     int count;
@@ -3785,6 +3993,7 @@ static const GuiWin* aux_window(const GuiState* g, int aux_id) {
     case GUI_AUX_COORDINATES: return &g->coordBox;
     case GUI_AUX_ANIMATION: return &g->animationWindow;
     case GUI_AUX_SHAPE_BROWSER: return &g->shapeBrowserWindow;
+    case GUI_AUX_PALETTE_EDITOR: return &g->paletteWindow;
     default: return NULL;
     }
 }
@@ -3804,6 +4013,9 @@ static int aux_window_visible(const GuiState* g, int aux_id) {
     case GUI_AUX_SHAPE_BROWSER:
         return g->shapeBrowserWindow.r.w > 0 &&
                g->shapeBrowserWindow.r.h > 0;
+    case GUI_AUX_PALETTE_EDITOR:
+        return g->palette_visible && g->paletteWindow.r.w > 0 &&
+               g->paletteWindow.r.h > 0;
     default:
         return 0;
     }
@@ -4521,6 +4733,232 @@ static void handle_animation_panel(GuiState* g, const GuiInput* in) {
     }
 }
 
+static CadPalettePanelLayout palette_panel_layout(const GuiState* g) {
+    CadPalettePanelLayout layout;
+    CadPalettePanelRect panel = {0, 0, 0, 0};
+    if (g) {
+        panel.x = g->paletteWindow.r.x;
+        panel.y = g->paletteWindow.r.y;
+        panel.w = g->paletteWindow.r.w;
+        panel.h = g->paletteWindow.r.h;
+    }
+    CadPalettePanel_ComputeLayout(panel, &layout);
+    return layout;
+}
+
+static int palette_channel_step(GuiState* g, int channel, int delta) {
+    uint16_t word;
+    uint16_t preserved;
+    CadPaletteRgba5 color;
+    CadResult result;
+    uint8_t* value;
+    if (!g || !CadDocument_HasPalette(&g->document,
+                                      CAD_PALETTE_FORMAT_COL)) {
+        gui_set_status(g, "Create or open a COL palette before editing RGB");
+        return 0;
+    }
+    word = CadDocument_GetColWord(&g->document,
+                                  (unsigned)g->palette_selected_index);
+    preserved = (uint16_t)(word & 0x8000u);
+    color = CadPalette_Bgr555ToRgba5(word);
+    value = channel == 0 ? &color.r : channel == 1 ? &color.g : &color.b;
+    if (delta < 0 && *value > 0) --*value;
+    if (delta > 0 && *value < 31) ++*value;
+    result = CadDocument_SetColWord(
+        &g->document, (unsigned)g->palette_selected_index,
+        (uint16_t)(preserved | CadPalette_Rgba5ToBgr555(color)));
+    if (!CadResult_IsSuccess(&result)) {
+        gui_set_status(g, "Color edit failed: %s", cad_result_message(&result));
+        return 0;
+    }
+    apply_document_palette(g);
+    gui_set_status(g, "COL index %d = R%u G%u B%u ($%04X)",
+                   g->palette_selected_index, (unsigned)color.r,
+                   (unsigned)color.g, (unsigned)color.b,
+                   (unsigned)CadDocument_GetColWord(
+                       &g->document, (unsigned)g->palette_selected_index));
+    return 1;
+}
+
+static int palette_descriptor_step(GuiState* g,
+                                   CadPalettePanelAction action) {
+    uint8_t type = 0;
+    uint8_t palette_number = 1;
+    uint8_t color_count = 1;
+    CadResult result;
+    if (!g || !CadDocument_GetPalDescriptor(
+            &g->document, (unsigned)g->palette_selected_index,
+            &type, &palette_number, &color_count)) {
+        gui_set_status(g, "Create or open a PAL material map before editing it");
+        return 0;
+    }
+    switch (action) {
+    case CAD_PALETTE_PANEL_PAL_TYPE_MINUS:
+        type = type == 0 ? UINT8_MAX : (uint8_t)(type - 1u);
+        break;
+    case CAD_PALETTE_PANEL_PAL_TYPE_PLUS:
+        type = type == UINT8_MAX ? 0 : (uint8_t)(type + 1u);
+        break;
+    case CAD_PALETTE_PANEL_PAL_PALETTE_NUMBER_MINUS:
+        if (palette_number > 1) --palette_number;
+        break;
+    case CAD_PALETTE_PANEL_PAL_PALETTE_NUMBER_PLUS:
+        if (palette_number < 16) ++palette_number;
+        break;
+    case CAD_PALETTE_PANEL_PAL_COLOR_COUNT_MINUS:
+        if (color_count > 1) --color_count;
+        break;
+    case CAD_PALETTE_PANEL_PAL_COLOR_COUNT_PLUS:
+        if (color_count < 16) ++color_count;
+        break;
+    default:
+        return 0;
+    }
+    result = CadDocument_SetPalDescriptor(
+        &g->document, (unsigned)g->palette_selected_index,
+        type, palette_number, color_count);
+    if (!CadResult_IsSuccess(&result)) {
+        gui_set_status(g, "PAL descriptor edit failed: %s",
+                       cad_result_message(&result));
+        return 0;
+    }
+    gui_set_status(g, "PAL material %d: type %u, palette %u, %u colors",
+                   g->palette_selected_index, (unsigned)type,
+                   (unsigned)palette_number, (unsigned)color_count);
+    return 1;
+}
+
+static int palette_sample_value_step(GuiState* g, int delta) {
+    uint8_t value = 0;
+    CadResult result;
+    if (!g || !CadDocument_GetPalSample(
+            &g->document, (unsigned)g->palette_selected_index,
+            (unsigned)g->palette_sample_index, &value)) {
+        gui_set_status(g, "Create or open a PAL material map before editing samples");
+        return 0;
+    }
+    if (delta < 0) value = value == 0 ? UINT8_MAX : (uint8_t)(value - 1u);
+    else value = value == UINT8_MAX ? 0 : (uint8_t)(value + 1u);
+    result = CadDocument_SetPalSample(
+        &g->document, (unsigned)g->palette_selected_index,
+        (unsigned)g->palette_sample_index, value);
+    if (!CadResult_IsSuccess(&result)) {
+        gui_set_status(g, "PAL sample edit failed: %s",
+                       cad_result_message(&result));
+        return 0;
+    }
+    apply_document_palette(g);
+    gui_set_status(g, "PAL material %d sample %d references COL index %u",
+                   g->palette_selected_index, g->palette_sample_index,
+                   (unsigned)value);
+    return 1;
+}
+
+static void handle_palette_panel(GuiState* g, const GuiInput* in) {
+    CadPalettePanelLayout layout;
+    CadPalettePanelHit hit;
+    if (!g || !in || !in->mouse_pressed) return;
+    layout = palette_panel_layout(g);
+    if (!layout.usable) {
+        gui_set_status(g, "Enlarge the palette editor to use its controls");
+        return;
+    }
+    hit = CadPalettePanel_HitTest(&layout, g->palette_tab,
+                                  in->mouse_x, in->mouse_y);
+    switch (hit.action) {
+    case CAD_PALETTE_PANEL_TAB_COL_ACTION:
+        g->palette_tab = CAD_PALETTE_PANEL_TAB_COL;
+        break;
+    case CAD_PALETTE_PANEL_TAB_PAL_ACTION:
+        g->palette_tab = CAD_PALETTE_PANEL_TAB_PAL;
+        break;
+    case CAD_PALETTE_PANEL_NEW:
+        execute_editor_command(
+            g, g->palette_tab == CAD_PALETTE_PANEL_TAB_COL
+                   ? CAD_COMMAND_PALETTE_NEW_COL
+                   : CAD_COMMAND_PALETTE_NEW_PAL);
+        break;
+    case CAD_PALETTE_PANEL_OPEN:
+        execute_editor_command(
+            g, g->palette_tab == CAD_PALETTE_PANEL_TAB_COL
+                   ? CAD_COMMAND_PALETTE_OPEN_COL
+                   : CAD_COMMAND_PALETTE_OPEN_PAL);
+        break;
+    case CAD_PALETTE_PANEL_SAVE:
+        execute_editor_command(
+            g, g->palette_tab == CAD_PALETTE_PANEL_TAB_COL
+                   ? CAD_COMMAND_PALETTE_SAVE_COL
+                   : CAD_COMMAND_PALETTE_SAVE_PAL);
+        break;
+    case CAD_PALETTE_PANEL_SAVE_AS:
+        execute_editor_command(
+            g, g->palette_tab == CAD_PALETTE_PANEL_TAB_COL
+                   ? CAD_COMMAND_PALETTE_SAVE_COL_AS
+                   : CAD_COMMAND_PALETTE_SAVE_PAL_AS);
+        break;
+    case CAD_PALETTE_PANEL_PRIMARY_GRID:
+        if (hit.primaryIndex >= 0) {
+            g->palette_selected_index = hit.primaryIndex;
+            gui_set_status(g, "%s index %d selected",
+                           g->palette_tab == CAD_PALETTE_PANEL_TAB_COL
+                               ? "COL color" : "PAL material",
+                           hit.primaryIndex);
+        }
+        break;
+    case CAD_PALETTE_PANEL_COL_RED_MINUS:
+    case CAD_PALETTE_PANEL_COL_RED_PLUS:
+        palette_channel_step(g, 0,
+            hit.action == CAD_PALETTE_PANEL_COL_RED_MINUS ? -1 : 1);
+        break;
+    case CAD_PALETTE_PANEL_COL_GREEN_MINUS:
+    case CAD_PALETTE_PANEL_COL_GREEN_PLUS:
+        palette_channel_step(g, 1,
+            hit.action == CAD_PALETTE_PANEL_COL_GREEN_MINUS ? -1 : 1);
+        break;
+    case CAD_PALETTE_PANEL_COL_BLUE_MINUS:
+    case CAD_PALETTE_PANEL_COL_BLUE_PLUS:
+        palette_channel_step(g, 2,
+            hit.action == CAD_PALETTE_PANEL_COL_BLUE_MINUS ? -1 : 1);
+        break;
+    case CAD_PALETTE_PANEL_COL_APPLY_SELECTED:
+    case CAD_PALETTE_PANEL_PAL_APPLY_SELECTED:
+        execute_editor_command(g, CAD_COMMAND_PALETTE_APPLY_SELECTED);
+        break;
+    case CAD_PALETTE_PANEL_PAL_TYPE_MINUS:
+    case CAD_PALETTE_PANEL_PAL_TYPE_PLUS:
+    case CAD_PALETTE_PANEL_PAL_PALETTE_NUMBER_MINUS:
+    case CAD_PALETTE_PANEL_PAL_PALETTE_NUMBER_PLUS:
+    case CAD_PALETTE_PANEL_PAL_COLOR_COUNT_MINUS:
+    case CAD_PALETTE_PANEL_PAL_COLOR_COUNT_PLUS:
+        palette_descriptor_step(g, hit.action);
+        break;
+    case CAD_PALETTE_PANEL_PAL_SAMPLE_MINUS:
+        if (g->palette_sample_index > 0) --g->palette_sample_index;
+        apply_document_palette(g);
+        break;
+    case CAD_PALETTE_PANEL_PAL_SAMPLE_PLUS:
+        if (g->palette_sample_index + 1 < CAD_PAL_INDEX_COUNT)
+            ++g->palette_sample_index;
+        apply_document_palette(g);
+        break;
+    case CAD_PALETTE_PANEL_PAL_INDEX_MINUS:
+    case CAD_PALETTE_PANEL_PAL_INDEX_PLUS:
+        palette_sample_value_step(
+            g, hit.action == CAD_PALETTE_PANEL_PAL_INDEX_MINUS ? -1 : 1);
+        break;
+    case CAD_PALETTE_PANEL_SAMPLE_GRID:
+        if (hit.sampleIndex >= 0) {
+            g->palette_sample_index = hit.sampleIndex;
+            apply_document_palette(g);
+            gui_set_status(g, "PAL representative sample %d selected",
+                           hit.sampleIndex);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     if (!g || !in) return;
     if (g->auto_layout) {
@@ -4550,6 +4988,11 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
         return;
     }
     animation_update_scene(g, g->animation_now);
+    if (g->pointer_owner == GUI_POINTER_PALETTE_EDITOR) {
+        if (in->mouse_released || !in->mouse_down)
+            g->pointer_owner = GUI_POINTER_NONE;
+        return;
+    }
 
     /* Complete or update an existing pointer capture before hit-testing any
        other layer.  This prevents drags crossing overlapping windows from
@@ -4600,8 +5043,12 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             Rect* r = &g->resize_win->r;
             int right = g->resize_window_x + g->resize_start_w;
             int bottom = g->resize_window_y + g->resize_start_h;
-            int minimum_width = g->resize_win == &g->animationWindow ? 380 : 120;
-            int minimum_height = g->resize_win == &g->animationWindow ? 124 : 90;
+            int minimum_width = g->resize_win == &g->animationWindow ? 380
+                                : g->resize_win == &g->paletteWindow ? 720
+                                                                    : 120;
+            int minimum_height = g->resize_win == &g->animationWindow ? 124
+                                 : g->resize_win == &g->paletteWindow ? 520
+                                                                     : 90;
             r->x = g->resize_window_x;
             r->y = g->resize_window_y;
             r->w = g->resize_start_w;
@@ -4823,6 +5270,32 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
                 }
                 break;
             }
+            return;
+        case GUI_AUX_PALETTE_EDITOR:
+            if (in->mouse_pressed && in->mouse_down &&
+                !in->mouse_released) {
+                int edge = get_resize_edge(in->mouse_x, in->mouse_y,
+                                           g->paletteWindow.r, 6);
+                if (edge) {
+                    g->resize_win = &g->paletteWindow;
+                    g->resize_edge = edge;
+                    g->resize_start_x = in->mouse_x;
+                    g->resize_start_y = in->mouse_y;
+                    g->resize_window_x = g->paletteWindow.r.x;
+                    g->resize_window_y = g->paletteWindow.r.y;
+                    g->resize_start_w = g->paletteWindow.r.w;
+                    g->resize_start_h = g->paletteWindow.r.h;
+                    g->pointer_owner = GUI_POINTER_WINDOW;
+                    g->auto_layout = 0;
+                    return;
+                }
+            }
+            if (in->mouse_pressed &&
+                begin_title_drag(g, &g->paletteWindow, in)) return;
+            handle_palette_panel(g, in);
+            if (in->mouse_pressed && in->mouse_down &&
+                !in->mouse_released)
+                g->pointer_owner = GUI_POINTER_PALETTE_EDITOR;
             return;
         default:
             return;
@@ -5496,6 +5969,58 @@ static void gui_draw_interaction_overlays(GuiState* g, int view_index) {
     }
 }
 
+static size_t utf8_previous_boundary(const char* text, size_t length) {
+    if (!text || length == 0) return 0;
+    --length;
+    while (length > 0 &&
+           (((unsigned char)text[length] & 0xc0u) == 0x80u)) --length;
+    return length;
+}
+
+static const char* fit_text_to_width(const FontWin32* font, const char* text,
+                                     int max_width, char* buffer,
+                                     size_t capacity) {
+    size_t length;
+    if (!text) text = "";
+    if (!font || max_width <= 0 || !buffer || capacity < 4) return text;
+    if (font_measure(font, text) <= max_width) return text;
+    length = strlen(text);
+    if (length > capacity - 4) {
+        length = capacity - 4;
+        while (length > 0 &&
+               (((unsigned char)text[length] & 0xc0u) == 0x80u)) --length;
+    }
+    for (;;) {
+        snprintf(buffer, capacity, "%.*s...", (int)length, text);
+        if (font_measure(font, buffer) <= max_width) return buffer;
+        if (length == 0) break;
+        length = utf8_previous_boundary(text, length);
+    }
+    buffer[0] = '\0';
+    return buffer;
+}
+
+static void draw_fitted_text(const FontWin32* font, int x, int y,
+                             int max_width, const char* text, uint8_t gray) {
+    char fitted[256];
+    const char* visible;
+    if (!font || max_width <= 0) return;
+    visible = fit_text_to_width(font, text, max_width, fitted,
+                                sizeof(fitted));
+    font_draw(font, x, y, visible, gray);
+}
+
+static const char* path_leaf_name(const char* path) {
+    const char* leaf;
+    if (!path || !path[0]) return "";
+    leaf = path;
+    for (const char* cursor = path; *cursor; ++cursor) {
+        if ((cursor[0] == '/' || cursor[0] == '\\') && cursor[1])
+            leaf = cursor + 1;
+    }
+    return leaf;
+}
+
 static void draw_animation_button(GuiState* g, Rect rect, const char* text,
                                   int checked, int enabled) {
     RG_Color fill = !enabled ? (RG_Color){218,218,218,255}
@@ -5507,10 +6032,13 @@ static void draw_animation_button(GuiState* g, Rect rect, const char* text,
     rg_fill_rect(rect.x, rect.y, rect.w, rect.h, fill);
     rg_stroke_rect(rect.x, rect.y, rect.w, rect.h, edge);
     if (g->font && text) {
-        int width = font_measure(g->font, text);
+        char fitted[256];
+        const char* visible = fit_text_to_width(
+            g->font, text, rect.w - 4, fitted, sizeof(fitted));
+        int width = font_measure(g->font, visible);
         int x = rect.x + (rect.w - width) / 2;
         if (x < rect.x + 2) x = rect.x + 2;
-        font_draw(g->font, x, rect.y + 3, text, enabled ? 0 : 1);
+        font_draw(g->font, x, rect.y + 3, visible, enabled ? 0 : 1);
     }
 }
 
@@ -5673,6 +6201,263 @@ static void draw_animation_panel(GuiState* g) {
         if (layout.static_copy.w > 0 &&
             x < layout.inner.x + layout.inner.w - 20)
             font_draw(g->font, x, layout.static_copy.y + 3, summary, 0);
+    }
+}
+
+static Rect palette_draw_rect(CadPalettePanelRect rect) {
+    return (Rect){rect.x, rect.y, rect.w, rect.h};
+}
+
+static const char* pal_type_name(uint8_t type) {
+    switch (type) {
+    case CAD_PAL_TYPE_NORMAL: return "Normal";
+    case CAD_PAL_TYPE_DEPTH_CUE: return "Depth Cue";
+    case CAD_PAL_TYPE_LIGHT_SOURCE: return "Light Source";
+    case CAD_PAL_TYPE_LIGHT_DEPTH: return "Light Depth";
+    case CAD_PAL_TYPE_ANIMATION: return "Animation";
+    case CAD_PAL_TYPE_TEXTURE_MAP: return "Texture Map";
+    default: return "Unknown (preserved)";
+    }
+}
+
+static RG_Color palette_index_draw_color(const GuiState* g,
+                                         unsigned color_index) {
+    if (g && CadDocument_HasPalette(&g->document,
+                                    CAD_PALETTE_FORMAT_COL) &&
+        color_index < CAD_PALETTE_ENTRY_COUNT) {
+        const CadRgba color = g->document.palette[color_index];
+        return (RG_Color){color.r, color.g, color.b, 255};
+    }
+    /* Without the companion COL, luminance is only an index visualization;
+       labels make clear that it is not an invented RGB interpretation. */
+    return (RG_Color){(uint8_t)color_index, (uint8_t)color_index,
+                      (uint8_t)color_index, 255};
+}
+
+static void draw_palette_grid(GuiState* g,
+                              const CadPalettePanelLayout* layout) {
+    CadPalettePanelRect grid;
+    if (!g || !layout) return;
+    grid = layout->primary_grid;
+    if (grid.w <= 0 || grid.h <= 0) return;
+    for (int index = 0; index < CAD_PALETTE_PANEL_PRIMARY_COUNT; ++index) {
+        const int column = index % CAD_PALETTE_PANEL_PRIMARY_COLUMNS;
+        const int row = index / CAD_PALETTE_PANEL_PRIMARY_COLUMNS;
+        const int left = grid.x + column * grid.w /
+                         CAD_PALETTE_PANEL_PRIMARY_COLUMNS;
+        const int right = grid.x + (column + 1) * grid.w /
+                          CAD_PALETTE_PANEL_PRIMARY_COLUMNS;
+        const int top = grid.y + row * grid.h /
+                        CAD_PALETTE_PANEL_PRIMARY_ROWS;
+        const int bottom = grid.y + (row + 1) * grid.h /
+                           CAD_PALETTE_PANEL_PRIMARY_ROWS;
+        RG_Color color = (RG_Color){210,210,210,255};
+        if (g->palette_tab == CAD_PALETTE_PANEL_TAB_COL &&
+            CadDocument_HasPalette(&g->document, CAD_PALETTE_FORMAT_COL)) {
+            color = palette_index_draw_color(g, (unsigned)index);
+        } else if (g->palette_tab == CAD_PALETTE_PANEL_TAB_PAL &&
+                   CadDocument_HasPalette(&g->document,
+                                          CAD_PALETTE_FORMAT_PAL)) {
+            uint8_t mapped = 0;
+            CadDocument_GetPalSample(
+                &g->document, (unsigned)index,
+                (unsigned)g->palette_sample_index, &mapped);
+            color = palette_index_draw_color(g, mapped);
+        }
+        rg_fill_rect(left, top, right - left, bottom - top, color);
+        rg_stroke_rect(left, top, right - left, bottom - top,
+                       index == g->palette_selected_index
+                           ? (RG_Color){245,195,35,255}
+                           : (RG_Color){92,92,92,255});
+        if (index == g->palette_selected_index) {
+            rg_stroke_rect(left + 1, top + 1,
+                           right - left - 2, bottom - top - 2,
+                           (RG_Color){20,20,20,255});
+        }
+    }
+}
+
+static void draw_pal_sample_grid(GuiState* g,
+                                 const CadPalettePanelLayout* layout) {
+    CadPalettePanelRect grid;
+    if (!g || !layout ||
+        !CadDocument_HasPalette(&g->document, CAD_PALETTE_FORMAT_PAL))
+        return;
+    grid = layout->sample_grid;
+    for (int sample = 0; sample < CAD_PALETTE_PANEL_SAMPLE_COUNT; ++sample) {
+        const int column = sample % CAD_PALETTE_PANEL_SAMPLE_COLUMNS;
+        const int row = sample / CAD_PALETTE_PANEL_SAMPLE_COLUMNS;
+        const int left = grid.x + column * grid.w /
+                         CAD_PALETTE_PANEL_SAMPLE_COLUMNS;
+        const int right = grid.x + (column + 1) * grid.w /
+                          CAD_PALETTE_PANEL_SAMPLE_COLUMNS;
+        const int top = grid.y + row * grid.h /
+                        CAD_PALETTE_PANEL_SAMPLE_ROWS;
+        const int bottom = grid.y + (row + 1) * grid.h /
+                           CAD_PALETTE_PANEL_SAMPLE_ROWS;
+        uint8_t mapped = 0;
+        CadDocument_GetPalSample(
+            &g->document, (unsigned)g->palette_selected_index,
+            (unsigned)sample, &mapped);
+        rg_fill_rect(left, top, right - left, bottom - top,
+                     palette_index_draw_color(g, mapped));
+        rg_stroke_rect(left, top, right - left, bottom - top,
+                       sample == g->palette_sample_index
+                           ? (RG_Color){245,195,35,255}
+                           : (RG_Color){110,110,110,255});
+    }
+}
+
+static void draw_palette_adjuster(GuiState* g,
+                                  CadPalettePanelRect minus,
+                                  CadPalettePanelRect value,
+                                  CadPalettePanelRect plus,
+                                  const char* text, int enabled) {
+    draw_animation_button(g, palette_draw_rect(minus), "-", 0, enabled);
+    draw_animation_button(g, palette_draw_rect(value), text, 0, enabled);
+    draw_animation_button(g, palette_draw_rect(plus), "+", 0, enabled);
+}
+
+static void draw_palette_panel(GuiState* g) {
+    CadPalettePanelLayout layout;
+    int has_col;
+    int has_pal;
+    if (!g || !g->palette_visible) return;
+    layout = palette_panel_layout(g);
+    has_col = CadDocument_HasPalette(&g->document, CAD_PALETTE_FORMAT_COL);
+    has_pal = CadDocument_HasPalette(&g->document, CAD_PALETTE_FORMAT_PAL);
+    rg_fill_rect(layout.inner.x, layout.inner.y, layout.inner.w, layout.inner.h,
+                 (RG_Color){242,242,242,255});
+    rg_stroke_rect(layout.inner.x, layout.inner.y, layout.inner.w,
+                   layout.inner.h, (RG_Color){120,120,120,255});
+    if (!layout.usable) {
+        if (g->font)
+            font_draw(g->font, layout.inner.x + 6, layout.inner.y + 4,
+                      "Palette editor: enlarge this window", 0);
+        return;
+    }
+    draw_animation_button(g, palette_draw_rect(layout.new_palette),
+                          "New", 0, 1);
+    draw_animation_button(g, palette_draw_rect(layout.open_palette),
+                          "Open", 0, 1);
+    draw_animation_button(g, palette_draw_rect(layout.save_palette),
+                          "Save", 0,
+                          g->palette_tab == CAD_PALETTE_PANEL_TAB_COL
+                              ? has_col : has_pal);
+    draw_animation_button(g, palette_draw_rect(layout.save_as_palette),
+                          "Save As", 0,
+                          g->palette_tab == CAD_PALETTE_PANEL_TAB_COL
+                              ? has_col : has_pal);
+    draw_animation_button(g, palette_draw_rect(layout.tab_col),
+                          "COL Colors",
+                          g->palette_tab == CAD_PALETTE_PANEL_TAB_COL, 1);
+    draw_animation_button(g, palette_draw_rect(layout.tab_pal),
+                          "PAL Map",
+                          g->palette_tab == CAD_PALETTE_PANEL_TAB_PAL, 1);
+    draw_palette_grid(g, &layout);
+
+    if (g->palette_tab == CAD_PALETTE_PANEL_TAB_COL) {
+        uint16_t word = CadDocument_GetColWord(
+            &g->document, (unsigned)g->palette_selected_index);
+        CadPaletteRgba5 color = CadPalette_Bgr555ToRgba5(word);
+        char red[64], green[64], blue[64];
+        snprintf(red, sizeof(red), "R %u / 31", (unsigned)color.r);
+        snprintf(green, sizeof(green), "G %u / 31", (unsigned)color.g);
+        snprintf(blue, sizeof(blue), "B %u / 31", (unsigned)color.b);
+        draw_palette_adjuster(g, layout.col_red_minus,
+                              layout.col_red_value, layout.col_red_plus,
+                              red, has_col);
+        draw_palette_adjuster(g, layout.col_green_minus,
+                              layout.col_green_value, layout.col_green_plus,
+                              green, has_col);
+        draw_palette_adjuster(g, layout.col_blue_minus,
+                              layout.col_blue_value, layout.col_blue_plus,
+                              blue, has_col);
+        draw_animation_button(
+            g, palette_draw_rect(layout.col_apply_selected),
+            "Apply color to selected", 0,
+            g->cad && g->cad->selection.polygonCount > 0);
+        if (g->font) {
+            char details[160];
+            const char* path = g->document.colSavePath
+                                   ? g->document.colSavePath : "Untitled.COL";
+            snprintf(details, sizeof(details),
+                     "Index %d   BGR555 $%04X%s",
+                     g->palette_selected_index, (unsigned)word,
+                     g->document.colDirty ? "   Modified" : "");
+            draw_fitted_text(
+                g->font, layout.col_apply_selected.x,
+                layout.col_apply_selected.y + 38,
+                layout.inner.x + layout.inner.w -
+                    layout.col_apply_selected.x - 4,
+                details, 0);
+            draw_fitted_text(g->font, layout.inner.x + 4,
+                             layout.inner.y + layout.inner.h - 20,
+                             layout.inner.w - 8, path_leaf_name(path), 0);
+        }
+    } else {
+        uint8_t type = 0, palette_number = 1, color_count = 1, mapped = 0;
+        char type_text[96], palette_text[64], count_text[64];
+        char sample_text[64], index_text[64];
+        CadDocument_GetPalDescriptor(
+            &g->document, (unsigned)g->palette_selected_index,
+            &type, &palette_number, &color_count);
+        CadDocument_GetPalSample(
+            &g->document, (unsigned)g->palette_selected_index,
+            (unsigned)g->palette_sample_index, &mapped);
+        snprintf(type_text, sizeof(type_text), "Type %u: %s",
+                 (unsigned)type, pal_type_name(type));
+        snprintf(palette_text, sizeof(palette_text), "Palette %u / 16",
+                 (unsigned)palette_number);
+        snprintf(count_text, sizeof(count_text), "Colors %u / 16",
+                 (unsigned)color_count);
+        snprintf(sample_text, sizeof(sample_text), "Sample %d / 127",
+                 g->palette_sample_index);
+        snprintf(index_text, sizeof(index_text), "COL index %u",
+                 (unsigned)mapped);
+        draw_palette_adjuster(g, layout.pal_type_minus,
+                              layout.pal_type_value, layout.pal_type_plus,
+                              type_text, has_pal);
+        draw_palette_adjuster(g, layout.pal_palette_number_minus,
+                              layout.pal_palette_number_value,
+                              layout.pal_palette_number_plus,
+                              palette_text, has_pal);
+        draw_palette_adjuster(g, layout.pal_color_count_minus,
+                              layout.pal_color_count_value,
+                              layout.pal_color_count_plus,
+                              count_text, has_pal);
+        draw_palette_adjuster(g, layout.pal_sample_minus,
+                              layout.pal_sample_value, layout.pal_sample_plus,
+                              sample_text, has_pal);
+        draw_palette_adjuster(g, layout.pal_index_minus,
+                              layout.pal_index_value, layout.pal_index_plus,
+                              index_text, has_pal);
+        draw_pal_sample_grid(g, &layout);
+        draw_animation_button(
+            g, palette_draw_rect(layout.pal_apply_selected),
+            "Apply material to selected", 0,
+            g->cad && g->cad->selection.polygonCount > 0);
+        if (g->font) {
+            char details[192];
+            const char* path = g->document.palSavePath
+                                   ? g->document.palSavePath : "Untitled.PAL";
+            snprintf(details, sizeof(details),
+                     "Material %d: 128 raw COL references%s%s",
+                     g->palette_selected_index,
+                     has_col ? "" : " (load COL to resolve RGB)",
+                     g->document.palDirty ? "   Modified" : "");
+            draw_fitted_text(
+                g->font, layout.sample_grid.x,
+                layout.pal_apply_selected.h > 0
+                    ? layout.pal_apply_selected.y +
+                          layout.pal_apply_selected.h + 6
+                    : layout.sample_grid.y + layout.sample_grid.h + 8,
+                layout.inner.x + layout.inner.w - layout.sample_grid.x - 4,
+                details, 0);
+            draw_fitted_text(g->font, layout.inner.x + 4,
+                             layout.inner.y + layout.inner.h - 20,
+                             layout.inner.w - 8, path_leaf_name(path), 0);
+        }
     }
 }
 
@@ -5848,6 +6633,10 @@ static void draw_aux_windows(GuiState* g, int win_w, int win_h,
         case GUI_AUX_SHAPE_BROWSER:
             draw_shape_browser_window(g, win_w, win_h, fb_w, fb_h);
             break;
+        case GUI_AUX_PALETTE_EDITOR:
+            draw_window_chrome(g, &g->paletteWindow, win_h, 1.0f, 1.0f);
+            draw_palette_panel(g);
+            break;
         default:
             break;
         }
@@ -5898,8 +6687,16 @@ void gui_draw(GuiState* g, const GuiInput* in, int win_w, int win_h, int fb_w, i
     rg_line(0, status_y, win_w, status_y, (RG_Color){120,120,120,255});
     if (g->font) {
         font_draw(g->font, 8, status_y + 4, g->status_text, 0);
-        if (g->document.isDirty) {
-            const char* modified = "Modified";
+        if (g->document.isDirty || g->document.colDirty ||
+            g->document.palDirty) {
+            char modified[64];
+            snprintf(modified, sizeof(modified), "%s%s%s",
+                     g->document.isDirty ? "CAD" : "",
+                     g->document.colDirty
+                         ? (g->document.isDirty ? " + COL" : "COL") : "",
+                     g->document.palDirty
+                         ? ((g->document.isDirty || g->document.colDirty)
+                                ? " + PAL" : "PAL") : "");
             int width = font_measure(g->font, modified);
             font_draw(g->font, win_w - width - 10, status_y + 4, modified, 0);
         }

@@ -73,10 +73,12 @@ set(THREEDCAD_CORE_SOURCES
     src/cad_import_3dg1.c
     src/cad_import_asm.c
     src/cad_import_obj.c
+    src/cad_palette.c
     src/desktop_layout.c
     src/editor_controller.c
     src/editor_tool.c
     src/platform_fs.c
+    src/palette_panel.c
 )
 
 add_library(ThreeDCadCore STATIC ${THREEDCAD_CORE_SOURCES})
@@ -192,6 +194,20 @@ if(BUILD_TESTING)
         target_link_libraries(ThreeDCadAnimationPanelTests PRIVATE ThreeDCadCore)
         threedcad_configure_target(ThreeDCadAnimationPanelTests)
         add_test(NAME animation_panel COMMAND ThreeDCadAnimationPanelTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_palette.c")
+        add_executable(ThreeDCadPaletteTests tests/test_palette.c)
+        target_link_libraries(ThreeDCadPaletteTests PRIVATE ThreeDCadCore)
+        threedcad_configure_target(ThreeDCadPaletteTests)
+        add_test(NAME palette_codec_document COMMAND ThreeDCadPaletteTests)
+    endif()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_palette_panel.c")
+        add_executable(ThreeDCadPalettePanelTests tests/test_palette_panel.c)
+        target_link_libraries(ThreeDCadPalettePanelTests PRIVATE ThreeDCadCore)
+        threedcad_configure_target(ThreeDCadPalettePanelTests)
+        add_test(NAME palette_panel COMMAND ThreeDCadPalettePanelTests)
     endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_animation_document.c")

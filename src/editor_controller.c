@@ -110,7 +110,7 @@ CadCommandState EditorController_GetCommandState(
     const CadDocument* document = controller ? controller->document : NULL;
     state.shortcut = command_shortcut(command);
     if (command <= CAD_COMMAND_NONE ||
-        command > CAD_COMMAND_OPTION_DESELECT_ALL) {
+        command > CAD_COMMAND_PALETTE_APPLY_SELECTED) {
         disable(&state, "Unknown editor command");
         return state;
     }
@@ -172,6 +172,29 @@ CadCommandState EditorController_GetCommandState(
         break;
     case CAD_COMMAND_FILE_ANIMATION:
         state.checked = context && context->animationPanelVisible;
+        break;
+    case CAD_COMMAND_WINDOW_PALETTE_EDITOR:
+        state.checked = context && context->palettePanelVisible;
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_COL:
+        if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_COL))
+            disable(&state, "No COL palette is open");
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_COL_AS:
+        if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_COL))
+            disable(&state, "No COL palette is open");
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_PAL:
+        if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL))
+            disable(&state, "No PAL material map is open");
+        break;
+    case CAD_COMMAND_PALETTE_SAVE_PAL_AS:
+        if (!CadDocument_HasPalette(document, CAD_PALETTE_FORMAT_PAL))
+            disable(&state, "No PAL material map is open");
+        break;
+    case CAD_COMMAND_PALETTE_APPLY_SELECTED:
+        if (!context || !context->selectedPolygonCount)
+            disable(&state, "Select one or more faces or lines first");
         break;
     case CAD_COMMAND_OPTION_WIREFRAME:
         state.checked = context && context->wireframe3D;

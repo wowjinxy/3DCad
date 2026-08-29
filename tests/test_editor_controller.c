@@ -77,6 +77,25 @@ int main(void) {
     state = EditorController_GetCommandState(
         &controller, CAD_COMMAND_FILE_ANIMATION, &context);
     CHECK(state.checked);
+    context.palettePanelVisible = 1;
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_WINDOW_PALETTE_EDITOR, &context);
+    CHECK(state.checked);
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_PALETTE_SAVE_COL_AS, &context);
+    CHECK(!state.enabled);
+    CHECK(strstr(state.disabledReason, "No COL") != NULL);
+    result = CadDocument_NewPalette(&document, CAD_PALETTE_FORMAT_COL);
+    CHECK(CadResult_IsSuccess(&result));
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_PALETTE_SAVE_COL, &context);
+    CHECK(state.enabled); /* Save routes an unnamed resource through Save As. */
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_PALETTE_SAVE_COL_AS, &context);
+    CHECK(state.enabled);
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_PALETTE_APPLY_SELECTED, &context);
+    CHECK(!state.enabled);
 
     result = EditorController_BeginEdit(
         &controller, CAD_TOOL_POINT_CREATE, "Create Point");
@@ -98,6 +117,9 @@ int main(void) {
     CHECK(strcmp(CadDocument_GetUndoLabel(&document), "Timeline Edit") == 0);
 
     document.core.data.animationIndices[0].flags = 1;
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_PALETTE_SAVE_COL_AS, &context);
+    CHECK(state.enabled); /* animation does not block palette resources */
     state = EditorController_GetToolState(
         &controller, CAD_TOOL_FACE_CREATE, &context);
     CHECK(!state.enabled);
@@ -111,6 +133,9 @@ int main(void) {
     CHECK(!EditorController_IsEditing(&controller));
     context.selectedPointCount = 1;
     context.selectedPolygonCount = 1;
+    state = EditorController_GetCommandState(
+        &controller, CAD_COMMAND_PALETTE_APPLY_SELECTED, &context);
+    CHECK(state.enabled);
     state = EditorController_GetToolState(
         &controller, CAD_TOOL_POINT_MOVE, &context);
     CHECK(state.enabled);
