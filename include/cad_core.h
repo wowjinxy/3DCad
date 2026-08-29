@@ -86,6 +86,11 @@ int16_t CadCore_AddPolygon(CadCore* core, int16_t firstPoint, uint8_t color, uin
 int CadCore_DeletePolygon(CadCore* core, int16_t polygonIndex);
 CadPolygon* CadCore_GetPolygon(CadCore* core, int16_t index);
 int CadCore_IsPolygonValid(CadCore* core, int16_t index);
+/* Step an active polygon's indexed color with explicit 8-bit wrapping.
+   Positive directions increment, negative directions decrement, and zero is
+   rejected without changing the core.  Returns nonzero on success. */
+int CadCore_StepPolygonColor(CadCore* core, int16_t polygonIndex,
+                             int direction);
 int CadCore_AddPointToPolygon(CadCore* core, int16_t polygonIndex, int16_t pointIndex);
 
 /* ----------------------------------------------------------------------------

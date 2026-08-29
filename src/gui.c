@@ -84,6 +84,7 @@ typedef enum GuiPointerOwner {
     GUI_POINTER_VIEW,
     GUI_POINTER_AREA_SELECT,
     GUI_POINTER_TRANSFORM,
+    GUI_POINTER_COLOR,
     GUI_POINTER_SHAPE_BROWSER,
     GUI_POINTER_SCROLLBAR,
     GUI_POINTER_ANIMATION
@@ -211,6 +212,11 @@ struct GuiState {
     int view_interacting; /* Index of view being interacted with, or -1 */
     int view_right_interacting; /* Index of view being right-click interacted with, or -1 */
     int view_middle_interacting;
+    int color_right_pending;
+    int16_t color_right_polygon;
+    int color_right_view;
+    int color_right_start_x;
+    int color_right_start_y;
     int scrollbar_view;
     int scrollbar_axis; /* 1 = horizontal, 2 = vertical */
     int scrollbar_drag_offset;
@@ -362,7 +368,7 @@ static const CadToolDescriptor toolDescriptors[CAD_TOOL_COUNT] = {
     { CAD_TOOL_POINT_CREATE, "Point", "Define a point from two orthographic views", CAD_TOOL_FLAG_POINT },
     { CAD_TOOL_FACE_CREATE, "Make Face", "Choose ordered points; right-click the final point", CAD_TOOL_FLAG_FACE },
     { CAD_TOOL_FACE_INSERT_POINT, "Insert Point", "Click an edge to insert its midpoint", CAD_TOOL_FLAG_FACE },
-    { CAD_TOOL_FACE_COLOR, "Color", "Click faces to advance their indexed color", CAD_TOOL_FLAG_FACE },
+    { CAD_TOOL_FACE_COLOR, "Color", "Left/right-click faces to increase/decrease their indexed color", CAD_TOOL_FLAG_FACE },
     { CAD_TOOL_POINT_MOVE, "Move Points", "Drag selected points", CAD_TOOL_FLAG_POINT },
     { CAD_TOOL_FACE_MOVE, "Move Faces", "Drag selected faces", CAD_TOOL_FLAG_FACE },
     { CAD_TOOL_POINT_ROTATE, "Rotate Points", "Drag selected points around their center", CAD_TOOL_FLAG_POINT },
@@ -647,6 +653,9 @@ static void reset_interaction(GuiState* g) {
     g->view_interacting = -1;
     g->view_right_interacting = -1;
     g->view_middle_interacting = -1;
+    g->color_right_pending = 0;
+    g->color_right_polygon = INVALID_INDEX;
+    g->color_right_view = -1;
     g->scrollbar_view = -1;
     g->scrollbar_axis = 0;
     g->scrollbar_drag_offset = 0;
@@ -1249,6 +1258,8 @@ GuiState* gui_create(void) {
     g->view_interacting = -1;
     g->view_right_interacting = -1;
     g->view_middle_interacting = -1;
+    g->color_right_polygon = INVALID_INDEX;
+    g->color_right_view = -1;
     g->scrollbar_view = -1;
     g->pointer_view = -1;
     g->point_pending_view = -1;
@@ -2108,6 +2119,20 @@ static void link_orthographic_pan(GuiState* g, int source_index) {
         }
         if (has_z && view->type == CAD_VIEW_TOP) view->pan_y = world_z * view->zoom;
         if (has_z && view->type == CAD_VIEW_RIGHT) view->pan_x = -world_z * view->zoom;
+    }
+}
+
+static void pan_view_by_pointer_delta(GuiState* g, int view_index,
+                                      int dx, int dy) {
+    CadView* view;
+    if (!g || view_index < 0 || view_index >= 4) return;
+    view = &g->views[view_index];
+    if (view->type == CAD_VIEW_3D) {
+        CadView_Pan3DVertical(view, -dy);
+        view->pan_x += dx;
+    } else {
+        CadView_Pan(view, dx, -dy);
+        link_orthographic_pan(g, view_index);
     }
 }
 
@@ -3059,7 +3084,7 @@ static int16_t find_polygon_at(GuiState* g, int view_index, int screen_x, int sc
                                int* nearest_edge) {
     Rect content = view_content_rect(g, view_index);
     int16_t polygon = gui_find_nearest_polygon(g, view_index, screen_x,
-                                                screen_y, content, 8);
+                                                screen_y, content, 10);
     if (nearest_edge) *nearest_edge = -1;
     if (polygon == INVALID_INDEX || !nearest_edge) return polygon;
 
@@ -3086,6 +3111,30 @@ static int16_t find_polygon_at(GuiState* g, int view_index, int screen_x, int sc
         }
     }
     return polygon;
+}
+
+static int adjust_face_color(GuiState* g, int16_t polygon, int delta) {
+    uint8_t adjusted;
+    if (!g || !g->cad || polygon < 0 || polygon >= g->cad->data.polygonCount)
+        return 0;
+    if (!history_push(g)) return 1;
+
+    if (!CadCore_StepPolygonColor(g->cad, polygon, delta)) {
+        history_cancel(g);
+        return 0;
+    }
+    adjusted = g->cad->data.polygons[polygon].color;
+    if (!history_commit(g)) return 1;
+    gui_set_status(g, "Face #%d color index %u (%s)", polygon,
+                   (unsigned)adjusted,
+                   delta < 0 ? "decreased" : "increased");
+    return 1;
+}
+
+static int adjust_face_color_at(GuiState* g, int view_index,
+                                int screen_x, int screen_y, int delta) {
+    return adjust_face_color(
+        g, find_polygon_at(g, view_index, screen_x, screen_y, NULL), delta);
 }
 
 static void update_face_creation_status(GuiState* g, int view_index) {
@@ -4502,8 +4551,6 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
     }
     animation_update_scene(g, g->animation_now);
 
-    if (update_menu_input(g, in)) return;
-
     /* Complete or update an existing pointer capture before hit-testing any
        other layer.  This prevents drags crossing overlapping windows from
        leaking edits into the model beneath them. */
@@ -4606,18 +4653,51 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
         if (in->mouse_released || !in->mouse_down) { g->view_interacting = -1; g->pointer_owner = GUI_POINTER_NONE; }
         return;
     }
-    if (g->view_right_interacting >= 0) {
-        if (in->mouse_right_down) {
-            int dx = in->mouse_x - g->last_mouse_x, dy = in->mouse_y - g->last_mouse_y;
-            CadView* view = &g->views[g->view_right_interacting];
-            if (view->type == CAD_VIEW_3D) {
-                CadView_Pan3DVertical(view, -dy);
-                view->pan_x += dx;
+    if (g->color_right_pending) {
+        const int gesture_x = in->mouse_right_dragged
+                                  ? in->mouse_right_gesture_x : in->mouse_x;
+        const int gesture_y = in->mouse_right_dragged
+                                  ? in->mouse_right_gesture_y : in->mouse_y;
+        const int dx = gesture_x - g->color_right_start_x;
+        const int dy = gesture_y - g->color_right_start_y;
+        const int dragged = in->mouse_right_dragged ||
+                            (double)dx * dx + (double)dy * dy > 16.0;
+        if (dragged) {
+            pan_view_by_pointer_delta(g, g->color_right_view, dx, dy);
+            g->color_right_pending = 0;
+            g->color_right_polygon = INVALID_INDEX;
+            if (in->mouse_right_down && !in->mouse_right_released) {
+                g->view_right_interacting = g->color_right_view;
+                g->last_mouse_x = gesture_x;
+                g->last_mouse_y = gesture_y;
+                g->pointer_owner = GUI_POINTER_VIEW;
             } else {
-                CadView_Pan(view, dx, -dy);
-                link_orthographic_pan(g, g->view_right_interacting);
+                g->pointer_owner = GUI_POINTER_NONE;
             }
-            g->last_mouse_x = in->mouse_x; g->last_mouse_y = in->mouse_y;
+            g->color_right_view = -1;
+        } else if (in->mouse_right_released || !in->mouse_right_down) {
+            const int16_t polygon = g->color_right_polygon;
+            g->color_right_pending = 0;
+            g->color_right_polygon = INVALID_INDEX;
+            g->color_right_view = -1;
+            g->pointer_owner = GUI_POINTER_NONE;
+            (void)adjust_face_color(g, polygon, -1);
+        }
+        return;
+    }
+    if (g->view_right_interacting >= 0) {
+        if (in->mouse_right_down || in->mouse_right_released) {
+            const int gesture_x = in->mouse_right_released &&
+                                  in->mouse_right_dragged
+                                      ? in->mouse_right_gesture_x : in->mouse_x;
+            const int gesture_y = in->mouse_right_released &&
+                                  in->mouse_right_dragged
+                                      ? in->mouse_right_gesture_y : in->mouse_y;
+            int dx = gesture_x - g->last_mouse_x;
+            int dy = gesture_y - g->last_mouse_y;
+            pan_view_by_pointer_delta(g, g->view_right_interacting, dx, dy);
+            g->last_mouse_x = gesture_x;
+            g->last_mouse_y = gesture_y;
         }
         if (in->mouse_right_released || !in->mouse_right_down) { g->view_right_interacting = -1; g->pointer_owner = GUI_POINTER_NONE; }
         return;
@@ -4632,6 +4712,8 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
         if (in->mouse_middle_released || !in->mouse_middle_down) { g->view_middle_interacting = -1; g->pointer_owner = GUI_POINTER_NONE; }
         return;
     }
+
+    if (update_menu_input(g, in)) return;
 
     /* STATE / TenKey is modal over the editor desktop.  Menus are processed
        above it, but every other pointer event is consumed here so a click can
@@ -4802,10 +4884,61 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
             if (point != INVALID_INDEX && !CadCore_IsPointSelected(g->cad, point) &&
                 g->cad->selection.pointCount < CAD_MAX_FACE_POINTS) CadCore_SelectPoint(g->cad, point);
             create_face_from_selection(g);
-        } else {
+        } else if (g->selected_tool == CAD_TOOL_FACE_COLOR) {
+            const int16_t polygon = find_polygon_at(
+                g, hovered_view, in->mouse_x, in->mouse_y, NULL);
+            if (polygon != INVALID_INDEX) {
+                if (in->mouse_right_dragged) {
+                    const int dx = in->mouse_right_gesture_x - in->mouse_x;
+                    const int dy = in->mouse_right_gesture_y - in->mouse_y;
+                    pan_view_by_pointer_delta(g, hovered_view, dx, dy);
+                    if (in->mouse_right_down && !in->mouse_right_released) {
+                        g->view_right_interacting = hovered_view;
+                        g->last_mouse_x = in->mouse_right_gesture_x;
+                        g->last_mouse_y = in->mouse_right_gesture_y;
+                        g->pointer_owner = GUI_POINTER_VIEW;
+                    }
+                } else if (in->mouse_right_released || !in->mouse_right_down) {
+                    (void)adjust_face_color(g, polygon, -1);
+                } else {
+                    g->color_right_pending = 1;
+                    g->color_right_polygon = polygon;
+                    g->color_right_view = hovered_view;
+                    g->color_right_start_x = in->mouse_x;
+                    g->color_right_start_y = in->mouse_y;
+                    g->pointer_owner = GUI_POINTER_COLOR;
+                }
+                return;
+            }
+            /* A miss falls through so the established right-drag view pan
+               remains available while the Color tool is active. */
+            if (in->mouse_right_dragged) {
+                pan_view_by_pointer_delta(
+                    g, hovered_view,
+                    in->mouse_right_gesture_x - in->mouse_x,
+                    in->mouse_right_gesture_y - in->mouse_y);
+            }
             if (in->mouse_right_down && !in->mouse_right_released) {
                 g->view_right_interacting = hovered_view;
-                g->last_mouse_x = in->mouse_x; g->last_mouse_y = in->mouse_y;
+                g->last_mouse_x = in->mouse_right_dragged
+                                      ? in->mouse_right_gesture_x : in->mouse_x;
+                g->last_mouse_y = in->mouse_right_dragged
+                                      ? in->mouse_right_gesture_y : in->mouse_y;
+                g->pointer_owner = GUI_POINTER_VIEW;
+            }
+        } else {
+            if (in->mouse_right_dragged) {
+                pan_view_by_pointer_delta(
+                    g, hovered_view,
+                    in->mouse_right_gesture_x - in->mouse_x,
+                    in->mouse_right_gesture_y - in->mouse_y);
+            }
+            if (in->mouse_right_down && !in->mouse_right_released) {
+                g->view_right_interacting = hovered_view;
+                g->last_mouse_x = in->mouse_right_dragged
+                                      ? in->mouse_right_gesture_x : in->mouse_x;
+                g->last_mouse_y = in->mouse_right_dragged
+                                      ? in->mouse_right_gesture_y : in->mouse_y;
                 g->pointer_owner = GUI_POINTER_VIEW;
             }
         }
@@ -4849,14 +4982,8 @@ void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h) {
         break;
     }
     case CAD_TOOL_FACE_COLOR: {
-        int16_t polygon = find_polygon_at(g, hovered_view, in->mouse_x, in->mouse_y, NULL);
-        if (polygon != INVALID_INDEX) {
-            if (!history_push(g)) break;
-            g->cad->data.polygons[polygon].color++;
-            g->cad->isDirty = 1;
-            if (!history_commit(g)) break;
-            gui_set_status(g, "Face #%d color %u", polygon, g->cad->data.polygons[polygon].color);
-        }
+        (void)adjust_face_color_at(g, hovered_view,
+                                   in->mouse_x, in->mouse_y, 1);
         break;
     }
     default:

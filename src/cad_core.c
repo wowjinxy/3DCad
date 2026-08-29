@@ -330,6 +330,26 @@ int CadCore_IsPolygonValid(CadCore* core, int16_t index) {
     return core->data.polygons[index].flags != 0;
 }
 
+int CadCore_StepPolygonColor(CadCore* core, int16_t polygonIndex,
+                             int direction) {
+    CadPolygon* polygon;
+    if (!core || direction == 0 ||
+        !CadCore_IsPolygonValid(core, polygonIndex)) return 0;
+
+    polygon = &core->data.polygons[polygonIndex];
+    if (direction < 0) {
+        polygon->color = polygon->color == 0
+                             ? UINT8_MAX
+                             : (uint8_t)(polygon->color - 1);
+    } else {
+        polygon->color = polygon->color == UINT8_MAX
+                             ? 0
+                             : (uint8_t)(polygon->color + 1);
+    }
+    core->isDirty = 1;
+    return 1;
+}
+
 int CadCore_AddPointToPolygon(CadCore* core, int16_t polygonIndex, int16_t pointIndex) {
     if (!core || !CadCore_IsPolygonValid(core, polygonIndex) || !CadCore_IsPointValid(core, pointIndex)) {
         return 0;

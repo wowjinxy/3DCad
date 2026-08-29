@@ -358,6 +358,39 @@ static void test_root_and_delete_repair(void) {
     CadCore_Destroy(&core);
 }
 
+static void test_polygon_color_stepping(void) {
+    CadCore core;
+    int16_t polygon;
+    CadCore_Init(&core);
+    polygon = append_triangle(&core, 0.0, 0);
+    CHECK(polygon >= 0);
+    core.isDirty = 0;
+
+    CHECK(!CadCore_StepPolygonColor(NULL, polygon, 1));
+    CHECK(!CadCore_StepPolygonColor(&core, INVALID_INDEX, 1));
+    CHECK(!CadCore_StepPolygonColor(&core, (int16_t)CAD_MAX_POLYGONS, 1));
+    CHECK(!CadCore_StepPolygonColor(&core, (int16_t)(polygon + 1), 1));
+    CHECK(!CadCore_StepPolygonColor(&core, polygon, 0));
+    CHECK(core.data.polygons[polygon].color == 0);
+    CHECK(core.isDirty == 0);
+
+    CHECK(CadCore_StepPolygonColor(&core, polygon, -1));
+    CHECK(core.data.polygons[polygon].color == UINT8_MAX);
+    CHECK(core.isDirty == 1);
+    core.isDirty = 0;
+    CHECK(CadCore_StepPolygonColor(&core, polygon, 1));
+    CHECK(core.data.polygons[polygon].color == 0);
+    CHECK(core.isDirty == 1);
+
+    core.data.polygons[polygon].color = 10;
+    core.isDirty = 0;
+    CHECK(CadCore_StepPolygonColor(&core, polygon, 7));
+    CHECK(core.data.polygons[polygon].color == 11);
+    CHECK(CadCore_StepPolygonColor(&core, polygon, -12));
+    CHECK(core.data.polygons[polygon].color == 10);
+    CadCore_Destroy(&core);
+}
+
 static void test_mutation_topology_guards(void) {
     CadCore core;
     int16_t a;
@@ -928,6 +961,7 @@ int main(void) {
     test_legacy_decode_and_transactionality();
     test_legacy_collinear_leading_side_reconstruction();
     test_root_and_delete_repair();
+    test_polygon_color_stepping();
     test_mutation_topology_guards();
     test_polygon_point_merge();
     test_document_undo_redo_and_palette();

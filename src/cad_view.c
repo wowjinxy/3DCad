@@ -991,13 +991,20 @@ static int cad_polygons_form_reciprocal_pair(const CadViewGeometry* geometry,
 
 static double cad_projected_normal_z(const ProjectedPolygon* polygon)
 {
-    double ax, ay, bx, by;
+    double area = 0.0;
+    int point;
     if (!polygon || polygon->count < 3) return 0.0;
-    ax = polygon->vx[1] - polygon->vx[0];
-    ay = polygon->vy[1] - polygon->vy[0];
-    bx = polygon->vx[2] - polygon->vx[0];
-    by = polygon->vy[2] - polygon->vy[0];
-    return ax * by - ay * bx;
+    /* Use the complete projected chain.  The recovered files legitimately
+       contain faces whose first three points are collinear, so a single
+       cross product can choose the wrong member of a reciprocal pair. */
+    for (point = 0; point < polygon->count; ++point) {
+        const int next = (point + 1) % polygon->count;
+        const double term = polygon->vx[point] * polygon->vy[next] -
+                            polygon->vx[next] * polygon->vy[point];
+        if (!isfinite(term) || !isfinite(area + term)) return 0.0;
+        area += term;
+    }
+    return area;
 }
 
 static double cad_geometry_camera_normal_z(const CadView* view,
@@ -1106,16 +1113,18 @@ static void cad_fill_point_handle(int screen_x, int screen_y,
     glEnd();
 }
 
-static void cad_fill_projected(const ProjectedPolygon* polygon, RG_Color color)
+static int cad_triangulate_projected(
+    const ProjectedPolygon* polygon,
+    int triangles[(CAD_MAX_PROJECTED_FACE_POINTS - 2) * 3])
 {
     int vertices[CAD_MAX_PROJECTED_FACE_POINTS];
-    int triangles[(CAD_MAX_PROJECTED_FACE_POINTS - 2) * 3];
     int vertex_count;
     int triangle_count = 0;
     double area = 0.0;
     double orientation;
     int i;
-    if (!polygon || polygon->count < 3) return;
+    if (!polygon || !triangles || polygon->count < 3 ||
+        polygon->count > CAD_MAX_PROJECTED_FACE_POINTS) return 0;
     vertex_count = polygon->count;
     for (i = 0; i < vertex_count; ++i) {
         int next = (i + 1) % vertex_count;
@@ -1184,6 +1193,17 @@ static void cad_fill_projected(const ProjectedPolygon* polygon, RG_Color color)
         triangles[triangle_count * 3 + 2] = vertices[2];
         triangle_count++;
     }
+    return triangle_count;
+}
+
+static void cad_fill_projected(const ProjectedPolygon* polygon, RG_Color color)
+{
+    int triangles[(CAD_MAX_PROJECTED_FACE_POINTS - 2) * 3];
+    int triangle_count;
+    int i;
+    if (!polygon || polygon->count < 3) return;
+    triangle_count = cad_triangulate_projected(polygon, triangles);
+    if (triangle_count <= 0) return;
 
     glColor4ub(color.r, color.g, color.b, color.a);
     glBegin(GL_TRIANGLES);
@@ -1512,129 +1532,141 @@ static double cad_segment_distance_sq(double px, double py, double ax, double ay
     return dx * dx + dy * dy;
 }
 
-/* Evaluate the surface depth at the cursor instead of using the face's mean
-   vertex depth.  Orthographic depth is affine in screen space; perspective
-   reciprocal depth is affine.  Any non-degenerate projected triangle on a
-   validated coplanar face therefore describes the entire face plane, even
-   when the cursor lies in a different part of a concave polygon. */
-static int cad_projected_depth_at_point(const CadView* view,
-                                        const ProjectedPolygon* polygon,
-                                        double x, double y,
-                                        double* out_depth)
+static int cad_projected_edge_depth_at_point(
+    const CadView* view, const ProjectedPolygon* polygon,
+    int first, int second, double x, double y, double* out_depth)
 {
-    if (!view || !polygon || !out_depth || polygon->count < 2 ||
-        !isfinite(x) || !isfinite(y)) return 0;
-
-    if (polygon->count == 2) {
-        const double dx = polygon->x[1] - polygon->x[0];
-        const double dy = polygon->y[1] - polygon->y[0];
-        const double length_sq = dx * dx + dy * dy;
-        double t = 0.0;
-        double depth;
-        if (isfinite(length_sq) && length_sq > 1e-12) {
-            t = ((x - polygon->x[0]) * dx +
-                 (y - polygon->y[0]) * dy) / length_sq;
-            if (!isfinite(t)) return 0;
-            if (t < 0.0) t = 0.0;
-            if (t > 1.0) t = 1.0;
-        }
-        if (view->type == CAD_VIEW_3D) {
-            const double reciprocal =
-                (1.0 - t) / polygon->camera_depth[0] +
-                t / polygon->camera_depth[1];
-            if (!isfinite(reciprocal) || reciprocal <= 0.0) return 0;
-            depth = 1.0 / reciprocal;
-        } else if (!cad_lerp_finite(polygon->camera_depth[0],
-                                    polygon->camera_depth[1], t, &depth)) {
-            return 0;
-        }
-        if (!isfinite(depth)) return 0;
-        *out_depth = depth;
-        return 1;
+    const double dx = polygon && first >= 0 && second >= 0 &&
+                      first < polygon->count && second < polygon->count
+                          ? polygon->x[second] - polygon->x[first] : 0.0;
+    const double dy = polygon && first >= 0 && second >= 0 &&
+                      first < polygon->count && second < polygon->count
+                          ? polygon->y[second] - polygon->y[first] : 0.0;
+    const double length_sq = dx * dx + dy * dy;
+    double t = 0.0;
+    double depth;
+    if (!view || !polygon || !out_depth || first < 0 || second < 0 ||
+        first >= polygon->count || second >= polygon->count ||
+        !isfinite(x) || !isfinite(y) || !isfinite(length_sq)) return 0;
+    if (length_sq > 1e-12) {
+        t = ((x - polygon->x[first]) * dx +
+             (y - polygon->y[first]) * dy) / length_sq;
+        if (!isfinite(t)) return 0;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
     }
-
-    {
-        int second = -1;
-        int third = -1;
-        double denominator = 0.0;
-        double largest_area = 0.0;
-        double first_weight, second_weight, third_weight;
-        double depth;
-
-        /* Locate the most stable triangle that includes vertex zero. */
-        for (int b = 1; b + 1 < polygon->count; ++b) {
-            for (int c = b + 1; c < polygon->count; ++c) {
-                const double area =
-                    (polygon->y[b] - polygon->y[c]) *
-                        (polygon->x[0] - polygon->x[c]) +
-                    (polygon->x[c] - polygon->x[b]) *
-                        (polygon->y[0] - polygon->y[c]);
-                if (isfinite(area) && fabs(area) > largest_area) {
-                    largest_area = fabs(area);
-                    denominator = area;
-                    second = b;
-                    third = c;
-                }
-            }
-        }
-        if (second < 0 || third < 0 || largest_area <= 1e-12) return 0;
-
-        first_weight =
-            ((polygon->y[second] - polygon->y[third]) *
-                 (x - polygon->x[third]) +
-             (polygon->x[third] - polygon->x[second]) *
-                 (y - polygon->y[third])) / denominator;
-        second_weight =
-            ((polygon->y[third] - polygon->y[0]) *
-                 (x - polygon->x[third]) +
-             (polygon->x[0] - polygon->x[third]) *
-                 (y - polygon->y[third])) / denominator;
-        third_weight = 1.0 - first_weight - second_weight;
-        if (!isfinite(first_weight) || !isfinite(second_weight) ||
-            !isfinite(third_weight)) return 0;
-
-        if (view->type == CAD_VIEW_3D) {
-            const double reciprocal =
-                first_weight / polygon->camera_depth[0] +
-                second_weight / polygon->camera_depth[second] +
-                third_weight / polygon->camera_depth[third];
-            if (!isfinite(reciprocal) || reciprocal <= 0.0) return 0;
-            depth = 1.0 / reciprocal;
-        } else {
-            const double scale = fmax(
-                fabs(polygon->camera_depth[0]),
-                fmax(fabs(polygon->camera_depth[second]),
-                     fabs(polygon->camera_depth[third])));
-            if (!isfinite(scale)) return 0;
-            if (scale == 0.0) {
-                depth = 0.0;
-            } else {
-                depth = (first_weight * (polygon->camera_depth[0] / scale) +
-                         second_weight *
-                             (polygon->camera_depth[second] / scale) +
-                         third_weight *
-                             (polygon->camera_depth[third] / scale)) * scale;
-            }
-        }
-        if (!isfinite(depth)) return 0;
-        *out_depth = depth;
-        return 1;
+    if (view->type == CAD_VIEW_3D) {
+        const double reciprocal =
+            (1.0 - t) / polygon->camera_depth[first] +
+            t / polygon->camera_depth[second];
+        if (!isfinite(reciprocal) || reciprocal <= 0.0) return 0;
+        depth = 1.0 / reciprocal;
+    } else if (!cad_lerp_finite(polygon->camera_depth[first],
+                                polygon->camera_depth[second], t, &depth)) {
+        return 0;
     }
+    if (!isfinite(depth)) return 0;
+    *out_depth = depth;
+    return 1;
 }
 
-static int cad_point_in_polygon(double x, double y, const ProjectedPolygon* polygon)
+static int cad_projected_triangle_depth_at_point(
+    const CadView* view, const ProjectedPolygon* polygon,
+    int first, int second, int third, double x, double y, double* out_depth)
 {
-    int inside = 0;
-    int i, j;
-    for (i = 0, j = polygon->count - 1; i < polygon->count; j = i++) {
-        const double yi = polygon->y[i], yj = polygon->y[j];
-        const double xi = polygon->x[i], xj = polygon->x[j];
-        if (((yi > y) != (yj > y)) &&
-            (x < (xj - xi) * (y - yi) / ((yj - yi) == 0.0 ? 1e-12 : (yj - yi)) + xi)) {
-            inside = !inside;
+    const double denominator = polygon && first >= 0 && second >= 0 &&
+                               third >= 0 && first < polygon->count &&
+                               second < polygon->count && third < polygon->count
+        ? (polygon->y[second] - polygon->y[third]) *
+              (polygon->x[first] - polygon->x[third]) +
+          (polygon->x[third] - polygon->x[second]) *
+              (polygon->y[first] - polygon->y[third])
+        : 0.0;
+    double first_weight;
+    double second_weight;
+    double third_weight;
+    double depth;
+    if (!view || !polygon || !out_depth || !isfinite(denominator) ||
+        fabs(denominator) <= 1e-12) return 0;
+    first_weight =
+        ((polygon->y[second] - polygon->y[third]) *
+             (x - polygon->x[third]) +
+         (polygon->x[third] - polygon->x[second]) *
+             (y - polygon->y[third])) / denominator;
+    second_weight =
+        ((polygon->y[third] - polygon->y[first]) *
+             (x - polygon->x[third]) +
+         (polygon->x[first] - polygon->x[third]) *
+             (y - polygon->y[third])) / denominator;
+    third_weight = 1.0 - first_weight - second_weight;
+    if (!isfinite(first_weight) || !isfinite(second_weight) ||
+        !isfinite(third_weight)) return 0;
+    if (view->type == CAD_VIEW_3D) {
+        const double reciprocal =
+            first_weight / polygon->camera_depth[first] +
+            second_weight / polygon->camera_depth[second] +
+            third_weight / polygon->camera_depth[third];
+        if (!isfinite(reciprocal) || reciprocal <= 0.0) return 0;
+        depth = 1.0 / reciprocal;
+    } else {
+        const double scale = fmax(
+            fabs(polygon->camera_depth[first]),
+            fmax(fabs(polygon->camera_depth[second]),
+                 fabs(polygon->camera_depth[third])));
+        if (!isfinite(scale)) return 0;
+        if (scale == 0.0) {
+            depth = 0.0;
+        } else {
+            depth = (first_weight * (polygon->camera_depth[first] / scale) +
+                     second_weight * (polygon->camera_depth[second] / scale) +
+                     third_weight * (polygon->camera_depth[third] / scale)) * scale;
         }
     }
-    return inside;
+    if (!isfinite(depth)) return 0;
+    *out_depth = depth;
+    return 1;
+}
+
+/* Test the exact triangles submitted by cad_fill_projected.  This keeps
+   picking consistent for concave faces and for imported/animated poses whose
+   vertices are not perfectly coplanar. */
+static int cad_projected_surface_depth_at_point(
+    const CadView* view, const ProjectedPolygon* polygon,
+    double x, double y, double* out_depth)
+{
+    int triangles[(CAD_MAX_PROJECTED_FACE_POINTS - 2) * 3];
+    int triangle_count;
+    int found = 0;
+    double best_depth = HUGE_VAL;
+    if (!view || !polygon || !out_depth || polygon->count < 3 ||
+        !isfinite(x) || !isfinite(y)) return 0;
+    triangle_count = cad_triangulate_projected(polygon, triangles);
+    for (int triangle = 0; triangle < triangle_count; ++triangle) {
+        const int first = triangles[triangle * 3 + 0];
+        const int second = triangles[triangle * 3 + 1];
+        const int third = triangles[triangle * 3 + 2];
+        const double orientation = cad_cross_2d(
+            polygon->x[first], polygon->y[first],
+            polygon->x[second], polygon->y[second],
+            polygon->x[third], polygon->y[third]);
+        double depth;
+        if (!isfinite(orientation) || fabs(orientation) <= 1e-12 ||
+            !cad_point_in_triangle(
+                x, y,
+                polygon->x[first], polygon->y[first],
+                polygon->x[second], polygon->y[second],
+                polygon->x[third], polygon->y[third],
+                orientation >= 0.0 ? 1.0 : -1.0) ||
+            !cad_projected_triangle_depth_at_point(
+                view, polygon, first, second, third, x, y, &depth)) continue;
+        if (!found || depth < best_depth) {
+            best_depth = depth;
+            found = 1;
+        }
+    }
+    if (!found) return 0;
+    *out_depth = best_depth;
+    return 1;
 }
 
 static int16_t cad_find_nearest_polygon(const CadView* view,
@@ -1645,45 +1677,73 @@ static int16_t cad_find_nearest_polygon(const CadView* view,
                                         int threshold_pixels)
 {
     const double threshold_sq = (double)threshold_pixels * threshold_pixels;
-    double best = threshold_sq;
+    const double exact_distance_sq = 2.25;
+    double best_distance = HUGE_VAL;
     double best_depth = HUGE_VAL;
+    int best_rank = 0;
     int16_t nearest = -1;
     int local_x = screen_x - viewport_x;
     int local_y = screen_y - viewport_y;
     int i;
-    if (!view || !geometry || !geometry->data || local_x < 0 || local_y < 0 ||
+    if (!view || !geometry || !geometry->data || threshold_pixels < 0 ||
+        local_x < 0 || local_y < 0 ||
         local_x >= viewport_w || local_y >= viewport_h) return -1;
     for (i = 0; i < geometry->data->polygonCount && i < CAD_MAX_POLYGONS; ++i) {
         ProjectedPolygon polygon;
         double distance = HUGE_VAL;
         double hit_depth;
+        int interior = 0;
+        int hit_rank;
+        int nearest_edge = -1;
         int edge_index;
         if (!cad_collect_polygon(view, geometry, (int16_t)i, &polygon,
                                  viewport_w, viewport_h)) continue;
         if (cad_paired_member_is_hidden(view, geometry, (int16_t)i, &polygon,
                                         viewport_w, viewport_h)) continue;
-        if (polygon.count >= 3 && cad_point_in_polygon(local_x, local_y, &polygon)) {
-            distance = 0.0;
-        } else {
-            for (edge_index = 0; edge_index < polygon.count; ++edge_index) {
-                int next = polygon.count == 2 ? 1 - edge_index : (edge_index + 1) % polygon.count;
-                double candidate = cad_segment_distance_sq(local_x, local_y,
-                                                           polygon.x[edge_index], polygon.y[edge_index],
-                                                           polygon.x[next], polygon.y[next]);
-                if (candidate < distance) distance = candidate;
-                if (polygon.count == 2) break;
+        for (edge_index = 0; edge_index < polygon.count; ++edge_index) {
+            int next = polygon.count == 2
+                           ? 1 - edge_index : (edge_index + 1) % polygon.count;
+            double candidate = cad_segment_distance_sq(
+                local_x, local_y,
+                polygon.x[edge_index], polygon.y[edge_index],
+                polygon.x[next], polygon.y[next]);
+            if (candidate < distance) {
+                distance = candidate;
+                nearest_edge = edge_index;
             }
+            if (polygon.count == 2) break;
         }
         hit_depth = polygon.depth;
-        if (distance <= threshold_sq)
-            (void)cad_projected_depth_at_point(view, &polygon,
-                                               local_x, local_y, &hit_depth);
-        if (distance <= threshold_sq &&
-            (nearest == -1 || hit_depth < best_depth - 1e-9 ||
-             (fabs(hit_depth - best_depth) <= 1e-9 &&
-              distance < best - 1e-9))) {
-            best = distance;
+        if (polygon.count >= 3 && cad_projected_surface_depth_at_point(
+                view, &polygon, local_x, local_y, &hit_depth)) {
+            interior = 1;
+        } else {
+            int next;
+            if (distance > threshold_sq || nearest_edge < 0) continue;
+            next = polygon.count == 2
+                       ? 1 - nearest_edge
+                       : (nearest_edge + 1) % polygon.count;
+            (void)cad_projected_edge_depth_at_point(
+                view, &polygon, nearest_edge, next,
+                local_x, local_y, &hit_depth);
+        }
+        /* Rendered interiors and lines/edges directly beneath the cursor are
+           exact hits.  They outrank the forgiving edge halo, while depth still
+           chooses between actual overlapping geometry. */
+        hit_rank = interior || distance <= exact_distance_sq ? 2 : 1;
+        if (nearest == -1 || hit_rank > best_rank ||
+            (hit_rank == best_rank &&
+             ((hit_rank == 2 &&
+               (hit_depth < best_depth - 1e-9 ||
+                (fabs(hit_depth - best_depth) <= 1e-9 &&
+                 distance < best_distance - 1e-9))) ||
+              (hit_rank == 1 &&
+               (distance < best_distance - 1e-9 ||
+                (fabs(distance - best_distance) <= 1e-9 &&
+                 hit_depth < best_depth - 1e-9)))))) {
+            best_distance = distance;
             best_depth = hit_depth;
+            best_rank = hit_rank;
             nearest = (int16_t)i;
         }
     }

@@ -28,6 +28,14 @@ typedef struct AppState {
     float pending_button_x;
     float pending_button_y;
     bool pending_button_position;
+    float right_press_x;
+    float right_press_y;
+    float right_gesture_x;
+    float right_gesture_y;
+    double right_max_gui_distance_sq;
+    float input_scale_x;
+    float input_scale_y;
+    bool right_gesture_tracking;
     bool vsync_enabled;
     bool font_refresh_pending;
     char current_title[1024];
@@ -161,9 +169,37 @@ static void clear_transient_input(GuiInput* input) {
     input->mouse_released = 0;
     input->mouse_right_pressed = 0;
     input->mouse_right_released = 0;
+    input->mouse_right_dragged = 0;
     input->mouse_middle_pressed = 0;
     input->mouse_middle_released = 0;
     input->wheel_delta = 0;
+}
+
+static void track_right_gesture(AppState* app, float x, float y) {
+    float dx;
+    float dy;
+    double scaled_dx;
+    double scaled_dy;
+    double distance_sq;
+    if (!app || !app->right_gesture_tracking) return;
+    /* SDL may deliver a complete press/drag/release before the next Iterate.
+       Retain the farthest measured excursion and the release endpoint so
+       routing at the press coordinate cannot turn that gesture into a click. */
+    app->right_gesture_x = x;
+    app->right_gesture_y = y;
+    dx = x - app->right_press_x;
+    dy = y - app->right_press_y;
+    scaled_dx = (double)dx * app->input_scale_x;
+    scaled_dy = (double)dy * app->input_scale_y;
+    distance_sq = scaled_dx * scaled_dx + scaled_dy * scaled_dy;
+    if (distance_sq > app->right_max_gui_distance_sq)
+        app->right_max_gui_distance_sq = distance_sq;
+}
+
+static void reset_right_gesture(AppState* app) {
+    if (!app) return;
+    app->right_gesture_tracking = false;
+    app->right_max_gui_distance_sq = 0.0;
 }
 
 static unsigned gui_modifiers(SDL_Keymod modifiers) {
@@ -225,6 +261,8 @@ SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char* argv[]) {
     if (!app) {
         return fail_sdl("application state allocation");
     }
+    app->input_scale_x = 1.0f;
+    app->input_scale_y = 1.0f;
     *appstate = app;
 
     if (!SDL_SetAppMetadata(APP_NAME, APP_VERSION, APP_IDENTIFIER)) {
@@ -319,6 +357,7 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
     case SDL_EVENT_MOUSE_MOTION:
         app->input.mouse_x = (int)event->motion.x;
         app->input.mouse_y = (int)event->motion.y;
+        track_right_gesture(app, event->motion.x, event->motion.y);
         break;
 
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -334,6 +373,12 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
             app->input.mouse_down = 1;
             app->input.mouse_pressed = 1;
         } else if (event->button.button == SDL_BUTTON_RIGHT) {
+            app->right_press_x = event->button.x;
+            app->right_press_y = event->button.y;
+            app->right_gesture_x = event->button.x;
+            app->right_gesture_y = event->button.y;
+            app->right_max_gui_distance_sq = 0.0;
+            app->right_gesture_tracking = true;
             app->input.mouse_right_down = 1;
             app->input.mouse_right_pressed = 1;
         } else if (event->button.button == SDL_BUTTON_MIDDLE) {
@@ -362,6 +407,8 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
             app->input.mouse_down = 0;
             app->input.mouse_released = 1;
         } else if (event->button.button == SDL_BUTTON_RIGHT) {
+            track_right_gesture(app, event->button.x, event->button.y);
+            app->right_gesture_tracking = false;
             app->input.mouse_right_down = 0;
             app->input.mouse_right_released = 1;
         } else if (event->button.button == SDL_BUTTON_MIDDLE) {
@@ -393,6 +440,7 @@ SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event) {
         memset(&app->input, 0, sizeof(app->input));
         app->pending_button_position = false;
         app->pending_wheel = 0.0f;
+        reset_right_gesture(app);
         break;
 
     default:
@@ -435,6 +483,7 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
         (SDL_GetWindowFlags(app->window) & SDL_WINDOW_MINIMIZED) != 0) {
         clear_transient_input(&app->input);
         app->pending_button_position = false;
+        if (!right_down) reset_right_gesture(app);
         SDL_Delay(10);
         return SDL_APP_CONTINUE;
     }
@@ -444,6 +493,15 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
     const int gui_height = (int)((float)pixel_height / display_scale + 0.5f);
     const float mouse_scale_x = (float)gui_width / (float)window_width;
     const float mouse_scale_y = (float)gui_height / (float)window_height;
+    app->input_scale_x = mouse_scale_x;
+    app->input_scale_y = mouse_scale_y;
+
+    app->input.mouse_right_gesture_x =
+        (int)(app->right_gesture_x * mouse_scale_x);
+    app->input.mouse_right_gesture_y =
+        (int)(app->right_gesture_y * mouse_scale_y);
+    app->input.mouse_right_dragged =
+        app->right_max_gui_distance_sq > 16.0;
 
     if (app->pending_button_position) {
         /* SDL_GetMouseState can already have moved by the time Iterate runs.
@@ -495,6 +553,7 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
 
     clear_transient_input(&app->input);
     app->pending_button_position = false;
+    if (!app->input.mouse_right_down) reset_right_gesture(app);
     if (!app->vsync_enabled) {
         SDL_Delay(1);
     }

@@ -13,6 +13,9 @@ typedef struct GuiInput {
     int mouse_right_down;      /* current (right button) */
     int mouse_right_pressed;   /* went down this frame (right button) */
     int mouse_right_released;  /* went up this frame (right button) */
+    int mouse_right_dragged;   /* exceeded the click threshold since press */
+    int mouse_right_gesture_x; /* current/release position even on a routed press */
+    int mouse_right_gesture_y;
     int mouse_middle_down;
     int mouse_middle_pressed;
     int mouse_middle_released;

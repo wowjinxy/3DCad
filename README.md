@@ -116,6 +116,8 @@ ctest --test-dir build/core --output-on-failure
   supply the hidden coordinate
 - Face tool: click vertices in order; Backspace removes the last, Enter closes,
   and Escape cancels
+- Color tool: left-click increases a face or line's palette index; right-click
+  decreases it. Indices wrap between 0 and 255; right-drag still pans the view
 - `F`: frame the active selection; Home frames the complete document
 - Timeline: scrub the zero-based strip, use Play/Pause/Stop and frame controls,
   and toggle interpolation, looping, or All Frames

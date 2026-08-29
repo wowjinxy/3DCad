@@ -227,6 +227,211 @@ static int16_t append_positioned_triangle(CadCore* core,
     return CadCore_AddPolygon(core, points[0], color, 3);
 }
 
+static int16_t append_positioned_polygon(CadCore* core,
+                                         const CadPosition* positions,
+                                         int count, uint8_t color)
+{
+    int16_t points[CAD_MAX_FACE_POINTS];
+    if (!core || !positions || count < 2 || count > CAD_MAX_FACE_POINTS)
+        return -1;
+    for (int point = 0; point < count; ++point) {
+        points[point] = CadCore_AddPoint(core, positions[point].x,
+                                        positions[point].y,
+                                        positions[point].z);
+        if (points[point] < 0) return -1;
+    }
+    for (int point = 0; point < count; ++point)
+        core->data.points[points[point]].nextPoint =
+            point + 1 < count ? points[point + 1] : -1;
+    return CadCore_AddPolygon(core, points[0], color, (uint8_t)count);
+}
+
+static void test_polygon_pick_prefers_exact_interior_over_near_line(void)
+{
+    const CadPosition face_points[3] = {
+        { -20.0, -20.0, 0.0 },
+        { 20.0, -20.0, 0.0 },
+        { 0.0, 20.0, 0.0 }
+    };
+    /* At depth 256, Y=3 projects six pixels above the center cursor. */
+    const CadPosition line_points[2] = {
+        { -20.0, 3.0, -256.0 },
+        { 20.0, 3.0, -256.0 }
+    };
+    CadCore core;
+    CadView view;
+    int16_t face;
+    int16_t line;
+
+    CadCore_Init(&core);
+    face = append_positioned_polygon(&core, face_points, 3, 1);
+    line = append_positioned_polygon(&core, line_points, 2, 2);
+    require_true(face >= 0 && line >= 0,
+                 "interior-versus-line pick geometry created");
+    CadView_Init(&view, CAD_VIEW_3D);
+    view.rot_x = view.rot_y = view.rot_z = 0.0;
+
+    require_true(CadView_FindNearestPolygon(
+                     &view, &core, 320, 240, 0, 0, 640, 480, 8) == face,
+                 "exact face interior beats a nearer line in the hit halo");
+    CadCore_Destroy(&core);
+}
+
+static void test_polygon_pick_prefers_exact_line_over_offset_near_line(void)
+{
+    const CadPosition exact_points[2] = {
+        { -30.0, 0.0, 0.0 }, { 30.0, 0.0, 0.0 }
+    };
+    /* At depth 256, Y=2 projects four pixels above the center cursor. */
+    const CadPosition offset_points[2] = {
+        { -20.0, 2.0, -256.0 }, { 20.0, 2.0, -256.0 }
+    };
+    CadCore core;
+    CadView view;
+    int16_t exact;
+    int16_t offset;
+
+    CadCore_Init(&core);
+    exact = append_positioned_polygon(&core, exact_points, 2, 1);
+    offset = append_positioned_polygon(&core, offset_points, 2, 2);
+    require_true(exact >= 0 && offset >= 0,
+                 "line-distance pick geometry created");
+    CadView_Init(&view, CAD_VIEW_3D);
+    view.rot_x = view.rot_y = view.rot_z = 0.0;
+
+    require_true(CadView_FindNearestPolygon(
+                     &view, &core, 320, 240, 0, 0, 640, 480, 8) == exact,
+                 "exact line beats a nearer offset line in the hit halo");
+    CadCore_Destroy(&core);
+}
+
+static void test_polygon_pick_keeps_exact_front_line_selectable(void)
+{
+    const CadPosition face_points[3] = {
+        { -20.0, -20.0, 0.0 },
+        { 20.0, -20.0, 0.0 },
+        { 0.0, 20.0, 0.0 }
+    };
+    const CadPosition line_points[2] = {
+        { -20.0, 0.0, -256.0 }, { 20.0, 0.0, -256.0 }
+    };
+    CadCore core;
+    CadView view;
+    int16_t face;
+    int16_t line;
+
+    CadCore_Init(&core);
+    face = append_positioned_polygon(&core, face_points, 3, 1);
+    line = append_positioned_polygon(&core, line_points, 2, 2);
+    require_true(face >= 0 && line >= 0,
+                 "face-and-exact-line pick geometry created");
+    CadView_Init(&view, CAD_VIEW_3D);
+    view.rot_x = view.rot_y = view.rot_z = 0.0;
+
+    require_true(CadView_FindNearestPolygon(
+                     &view, &core, 320, 240, 0, 0, 640, 480, 8) == line,
+                 "an exact foreground line remains selectable over a face");
+    CadCore_Destroy(&core);
+}
+
+static void test_nonplanar_polygon_pick_matches_rendered_ear_depth(void)
+{
+    /* Both quads project to the same 80x80 square.  Ear clipping renders the
+       lower-left triangle of the warped quad from D/A/B.  At (290,210), that
+       triangle is at depth 800, while extrapolating the unrelated A/B/C
+       triangle incorrectly reports about depth 221. */
+    const CadPosition warped_points[4] = {
+        { -15.625, -15.625, -312.0 },
+        { 62.5, -62.5, 288.0 },
+        { 62.5, 62.5, 288.0 },
+        { -62.5, 62.5, 288.0 }
+    };
+    const CadPosition flat_points[4] = {
+        { -31.25, -31.25, -112.0 },
+        { 31.25, -31.25, -112.0 },
+        { 31.25, 31.25, -112.0 },
+        { -31.25, 31.25, -112.0 }
+    };
+    CadCore core;
+    CadView view;
+    int16_t warped;
+    int16_t flat;
+
+    CadCore_Init(&core);
+    warped = append_positioned_polygon(&core, warped_points, 4, 1);
+    flat = append_positioned_polygon(&core, flat_points, 4, 2);
+    require_true(warped >= 0 && flat >= 0,
+                 "non-planar depth pick geometry created");
+    CadView_Init(&view, CAD_VIEW_3D);
+    view.rot_x = view.rot_y = view.rot_z = 0.0;
+
+    require_true(CadView_FindNearestPolygon(
+                     &view, &core, 290, 210, 0, 0, 640, 480, 2) == flat,
+                 "picker depth agrees with the rendered ear triangle");
+    CadCore_Destroy(&core);
+}
+
+static void test_concave_polygon_notch_hit_testing(void)
+{
+    /* A rectangle with a 20-pixel-wide notch descending from its top edge. */
+    const CadPosition concave_points[8] = {
+        { -40.0, -40.0, 0.0 }, { 40.0, -40.0, 0.0 },
+        { 40.0, 40.0, 0.0 }, { 10.0, 40.0, 0.0 },
+        { 10.0, -10.0, 0.0 }, { -10.0, -10.0, 0.0 },
+        { -10.0, 40.0, 0.0 }, { -40.0, 40.0, 0.0 }
+    };
+    CadCore core;
+    CadView view;
+    int16_t polygon;
+
+    CadCore_Init(&core);
+    polygon = append_positioned_polygon(&core, concave_points, 8, 7);
+    require_true(polygon >= 0, "concave pick polygon created");
+    CadView_Init(&view, CAD_VIEW_FRONT);
+
+    require_true(CadView_FindNearestPolygon(
+                     &view, &core, 320, 220, 0, 0, 640, 480, 3) == -1,
+                 "concave notch remains a miss");
+    require_true(CadView_FindNearestPolygon(
+                     &view, &core, 345, 220, 0, 0, 640, 480, 3) == polygon,
+                 "concave arm remains an interior hit");
+    CadCore_Destroy(&core);
+}
+
+static void test_reciprocal_pair_with_collinear_prefix(void)
+{
+    const CadPosition away_points[5] = {
+        { -40.0, -20.0, 0.0 }, { 0.0, -20.0, 0.0 },
+        { 40.0, -20.0, 0.0 }, { 40.0, 20.0, 0.0 },
+        { -40.0, 20.0, 0.0 }
+    };
+    const CadPosition facing_points[5] = {
+        { -40.0, -20.0, 0.0 }, { -40.0, 20.0, 0.0 },
+        { 40.0, 20.0, 0.0 }, { 40.0, -20.0, 0.0 },
+        { 0.0, -20.0, 0.0 }
+    };
+    CadCore core;
+    CadView view;
+    int16_t away;
+    int16_t facing;
+
+    CadCore_Init(&core);
+    away = append_positioned_polygon(&core, away_points, 5, 31);
+    facing = append_positioned_polygon(&core, facing_points, 5, 63);
+    require_true(away >= 0 && facing >= 0,
+                 "collinear-prefix reciprocal geometry created");
+    core.data.polygons[away].both = facing;
+    core.data.polygons[facing].both = away;
+    CadView_Init(&view, CAD_VIEW_3D);
+    view.rot_x = view.rot_y = view.rot_z = 0.0;
+    view.wireframe = 0;
+
+    require_true(CadView_FindNearestPolygon(
+                     &view, &core, 320, 240, 0, 0, 640, 480, 3) == facing,
+                 "complete face winding selects the camera-facing pair member");
+    CadCore_Destroy(&core);
+}
+
 static void initialize_pose_from_core(const CadCore* core, CadPose* pose);
 
 static void test_polygon_pick_samples_depth_at_cursor(void)
@@ -626,6 +831,12 @@ int main(void)
     test_polygon_hit_testing();
     test_perspective_depth_and_clipping_hits();
     test_polygon_pick_samples_depth_at_cursor();
+    test_polygon_pick_prefers_exact_interior_over_near_line();
+    test_polygon_pick_prefers_exact_line_over_offset_near_line();
+    test_polygon_pick_keeps_exact_front_line_selectable();
+    test_nonplanar_polygon_pick_matches_rendered_ear_depth();
+    test_concave_polygon_notch_hit_testing();
+    test_reciprocal_pair_with_collinear_prefix();
     test_frame_bounds_orientation_policy();
     test_scene_point_picking_in_every_view();
     test_scene_polygon_and_colored_line_picking();
