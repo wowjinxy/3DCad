@@ -1,27 +1,26 @@
 #pragma once
 
-/* ============================================================================
-   file_dialog.h
-   Native Windows file dialogs
-   ============================================================================ */
+/* SDL3-backed native dialogs. Paths are returned as UTF-8 on desktop
+   platforms. These calls are modal to preserve the editor's transactional
+   command flow while SDL services its asynchronous platform dialog. */
 
-/* Open file dialog
-   Returns 1 if user selected a file, 0 if cancelled
-   filename_out must be at least MAX_PATH characters */
-int FileDialog_Open(char* filename_out, int filename_out_size, const char* filter, const char* title);
+typedef struct SDL_Window SDL_Window;
 
-/* Save file dialog
-   Returns 1 if user selected a file, 0 if cancelled
-   filename_out must be at least MAX_PATH characters */
-int FileDialog_Save(char* filename_out, int filename_out_size, const char* filter, const char* title);
+enum {
+    FILE_DIALOG_CONFIRM_CANCEL = 0,
+    FILE_DIALOG_CONFIRM_SAVE = 1,
+    FILE_DIALOG_CONFIRM_DISCARD = 2
+};
 
-/* Convenience functions for CAD files */
+void FileDialog_SetParent(SDL_Window* window);
+
+int FileDialog_Open(char* filename_out, int filename_out_size,
+                    const char* filter, const char* title);
+int FileDialog_Save(char* filename_out, int filename_out_size,
+                    const char* filter, const char* title);
 int FileDialog_OpenCAD(char* filename_out, int filename_out_size);
 int FileDialog_SaveCAD(char* filename_out, int filename_out_size);
-
-/* Folder selection dialog
-   Returns 1 if user selected a folder, 0 if cancelled
-   folder_path_out must be at least MAX_PATH characters */
 int FileDialog_SelectFolder(char* folder_path_out, int folder_path_out_size);
 
-
+int FileDialog_ConfirmSaveDiscard(const char* title, const char* message);
+int FileDialog_ConfirmContinue(const char* title, const char* message);

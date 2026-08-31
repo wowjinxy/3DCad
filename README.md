@@ -70,37 +70,88 @@ See [docs/FILE_FORMATS.md](docs/FILE_FORMATS.md) for recovered layouts,
 
 ## Requirements
 
-- Windows 10 or later for the SDL3 GUI
-- Visual Studio 2022 with **Desktop development with C++**
-- CMake 3.21 or later
-- [vcpkg](https://github.com/microsoft/vcpkg)
+- Meson 1.6.0 or later and Ninja
+- A C11 compiler: MSVC, MinGW-w64 GCC, GCC, or Clang
+- SDL3 3.2.12 or later and desktop OpenGL when building the GUI
+- Python 3 to run Meson
 
-SDL3 is declared by `vcpkg.json`. OpenGL and the native font/dialog libraries
-come from the Windows SDK.
+The core library, converter, and tests have no SDL or OpenGL dependency. The
+GUI is supported on Windows 10 or later and Linux. SDL3 supplies the portable
+window, input, dialog, and platform services; the editor uses an embedded
+bitmap font and therefore does not require GDI, SDL_ttf, or a system font.
 
 ## Configure and build
 
-```powershell
-cmake -S . -B build\x64 `
-  -G "Visual Studio 17 2022" -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
-  -DVCPKG_TARGET_TRIPLET=x64-windows `
-  -DBUILD_TESTING=ON
-
-cmake --build build\x64 --config Release --parallel
-ctest --test-dir build\x64 -C Release --output-on-failure
-```
-
-The executable and copied resources are written to `build/x64/Release`. Build
-x86 in a separate directory with `-A Win32` and `x86-windows`; never reuse a
-configured directory across architectures.
-
-The core, tools, and tests do not require the Win32 GUI layer:
+With SDL3 and OpenGL installed in the compiler's normal search path, a complete
+build uses the same commands on every platform:
 
 ```sh
-cmake -S . -B build/core -DTHREEDCAD_BUILD_GUI=OFF -DBUILD_TESTING=ON
-cmake --build build/core
-ctest --test-dir build/core --output-on-failure
+meson setup build --buildtype=release \
+  -Dgui=enabled -Dtools=true -Dtests=true
+meson compile -C build
+meson test -C build --print-errorlogs
+```
+
+If SDL3 is not available through the compiler's normal dependency search,
+Meson can build the pinned SDL3 wrap as a static fallback. Pass
+`--wrap-mode=nofallback` during setup when an installed SDL3 is required.
+
+The executable, converter, and copied `resources` directory are written below
+the selected build directory. Keep a separate build directory for each
+compiler, target architecture, and configuration.
+
+### Visual Studio / MSVC
+
+Run these commands from an x64 or x86 Native Tools command prompt. Download an
+official SDL3 VC development archive, extract it, and point `sdl3_root` at the
+directory containing its `include` and `lib` directories:
+
+```powershell
+py -m pip install meson ninja
+meson setup build\msvc --backend=ninja --buildtype=release `
+  -Dgui=enabled -Dtools=true -Dtests=true `
+  -Dsdl3_root="C:\Libraries\SDL3"
+meson compile -C build\msvc
+meson test -C build\msvc --print-errorlogs
+```
+
+Meson copies the matching SDL3 runtime beside the build-tree executables. The
+CI workflow downloads the latest official VC archive and verifies it against
+the SHA-256 digest published by GitHub before using it.
+
+### MinGW-w64 / MSYS2
+
+The UCRT64 environment provides SDL3 directly through its package manager:
+
+```sh
+pacman -S --needed \
+  mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-meson \
+  mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-sdl3
+
+meson setup build/mingw --buildtype=release \
+  -Dgui=enabled -Dtools=true -Dtests=true
+meson compile -C build/mingw
+meson test -C build/mingw --print-errorlogs
+```
+
+### Linux
+
+Install Meson, Ninja, pkg-config, SDL3 development files, and OpenGL development
+files using the distribution package manager. For example, Ubuntu 26.04 uses
+`meson`, `ninja-build`, `pkg-config`, `libsdl3-dev`, and `libgl-dev`. Then run
+the common build commands above.
+
+To prove that the core, tools, and tests do not acquire GUI dependencies, use a
+separate GUI-disabled build:
+
+```sh
+meson setup build/core --buildtype=debugoptimized \
+  -Dgui=disabled -Dtools=true -Dtests=true
+meson compile -C build/core
+meson test -C build/core --print-errorlogs
 ```
 
 ## Controls
@@ -129,20 +180,26 @@ ctest --test-dir build/core --output-on-failure
 
 ## Tests and recovered corpus
 
-CTest covers codecs, topology repair, animation lifecycle and playback,
+`meson test` covers codecs, topology repair, animation lifecycle and playback,
 named/composite history, transactional failures, ANM/OBJ/3DG1 behavior,
 platform filesystem failures, view projection, and hit testing. GitHub Actions
-runs Windows Debug/Release GUI builds and a portable GUI-off Linux Clang build
-under AddressSanitizer and UndefinedBehaviorSanitizer.
+builds and tests the GUI with both MSVC and MinGW-w64, tests a GUI-disabled
+Linux Clang build under AddressSanitizer and UndefinedBehaviorSanitizer, and
+starts the Linux GUI under Xvfb with software OpenGL for a one-frame smoke test.
 
 Recovered assets are not copied into this repository. To enable the optional
 external corpus test, configure with the directory containing the recovered
 `.cad` files:
 
 ```powershell
-cmake -S . -B build\x64 `
-  -DTHREEDCAD_RECOVERY_CORPUS="D:\recovered\watanabe" `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+meson setup build\corpus `
+  -Dgui=disabled -Dtools=true -Dtests=true `
+  -Drecovery_corpus="D:\recovered\watanabe" `
+  -Drecovery_expected_total=500 `
+  -Drecovery_expected_x11=475 `
+  -Drecovery_expected_legacy=25
+meson compile -C build\corpus
+meson test -C build\corpus --print-errorlogs
 ```
 
 The current recovery corpus contains 500 files: 475 later X11 streams and 25
@@ -151,9 +208,14 @@ legacy packed streams. All are expected to decode and validate.
 The optional standalone animation corpus is configured separately:
 
 ```powershell
-cmake -S . -B build\x64 `
-  -DTHREEDCAD_ANM_CORPUS="D:\recovered\animations" `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+meson setup build\anm-corpus `
+  -Dgui=disabled -Dtools=true -Dtests=true `
+  -Danm_corpus="D:\recovered\animations" `
+  -Danm_expected_total=379 `
+  -Danm_expected_3dan=358 `
+  -Danm_expected_3dgi=21
+meson compile -C build\anm-corpus
+meson test -C build\anm-corpus --print-errorlogs
 ```
 
 The recovered ANM corpus contains 379 files: 358 `3DAN` and 21 `3DGI`. The
@@ -169,7 +231,7 @@ normal guides rather than emulating the game runtime's plane-slot behavior.
 
 ## Core API
 
-`ThreeDCadCore` is independent of SDL and Win32 GUI code. `CadDocument` owns
+`ThreeDCadCore` is independent of SDL and native GUI code. `CadDocument` owns
 model state, paths, dirty tracking, palette resources, and the 64-entry named
 undo/redo history. Native CAD, `.COL`, and `.PAL` resources have independent
 source/save paths, revisions, and dirty state; saving one never marks either of
@@ -190,10 +252,10 @@ shared by rendering, picking, and coordinate display each GUI iteration.
 `cad23dg1` converts a native CAD stream to 3DG1 text:
 
 ```powershell
-.\build\x64\Release\cad23dg1.exe input.cad output.txt
+.\build\cad23dg1.exe input.cad output.txt
 ```
 
-Disable it with `-DTHREEDCAD_BUILD_TOOLS=OFF`.
+Disable it with `-Dtools=false`.
 
 ## Deferred historical systems
 

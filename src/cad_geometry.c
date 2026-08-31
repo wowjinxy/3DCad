@@ -10,8 +10,12 @@ static double squared_distance(const double a[3], const double b[3]) {
     return x * x + y * y + z * z;
 }
 
+static const double* coordinate_at(const double* coordinates, int index) {
+    return coordinates + index * 3;
+}
+
 int CadGeometry_ComputePolygonNormal(
-    const double (*coordinates)[3], int count, double normal[3]) {
+    const double* coordinates, int count, double normal[3]) {
     double accumulated[3] = {0.0, 0.0, 0.0};
     double length;
 
@@ -19,9 +23,9 @@ int CadGeometry_ComputePolygonNormal(
     normal[0] = normal[1] = normal[2] = 0.0;
     if (!coordinates || count < 3) return 0;
     for (int i = 0; i < count; ++i) {
-        if (!isfinite(coordinates[i][0]) ||
-            !isfinite(coordinates[i][1]) ||
-            !isfinite(coordinates[i][2])) {
+        const double* current = coordinate_at(coordinates, i);
+        if (!isfinite(current[0]) || !isfinite(current[1]) ||
+            !isfinite(current[2])) {
             return 0;
         }
     }
@@ -31,12 +35,15 @@ int CadGeometry_ComputePolygonNormal(
        while summing every triangle preserves the polygon's winding even when
        an early triangle is collinear. */
     for (int i = 1; i + 1 < count; ++i) {
-        const double ux = coordinates[i][0] - coordinates[0][0];
-        const double uy = coordinates[i][1] - coordinates[0][1];
-        const double uz = coordinates[i][2] - coordinates[0][2];
-        const double vx = coordinates[i + 1][0] - coordinates[0][0];
-        const double vy = coordinates[i + 1][1] - coordinates[0][1];
-        const double vz = coordinates[i + 1][2] - coordinates[0][2];
+        const double* origin = coordinate_at(coordinates, 0);
+        const double* current = coordinate_at(coordinates, i);
+        const double* next = coordinate_at(coordinates, i + 1);
+        const double ux = current[0] - origin[0];
+        const double uy = current[1] - origin[1];
+        const double uz = current[2] - origin[2];
+        const double vx = next[0] - origin[0];
+        const double vy = next[1] - origin[1];
+        const double vz = next[2] - origin[2];
         accumulated[0] += uy * vz - uz * vy;
         accumulated[1] += uz * vx - ux * vz;
         accumulated[2] += ux * vy - uy * vx;
@@ -52,7 +59,7 @@ int CadGeometry_ComputePolygonNormal(
 }
 
 CadPointChainPlanarity CadGeometry_ClassifyPointChain(
-    const double (*coordinates)[3], int count, double coplanarTolerance) {
+    const double* coordinates, int count, double coplanarTolerance) {
     int first = -1;
     int second = -1;
     double normal[3] = {0.0, 0.0, 0.0};
@@ -64,15 +71,17 @@ CadPointChainPlanarity CadGeometry_ClassifyPointChain(
         return CAD_POINT_CHAIN_INVALID;
     }
     for (int i = 0; i < count; ++i) {
-        if (!isfinite(coordinates[i][0]) || !isfinite(coordinates[i][1]) ||
-            !isfinite(coordinates[i][2])) {
+        const double* current = coordinate_at(coordinates, i);
+        if (!isfinite(current[0]) || !isfinite(current[1]) ||
+            !isfinite(current[2])) {
             return CAD_POINT_CHAIN_INVALID;
         }
     }
 
     for (int i = 0; i < count && first < 0; ++i) {
         for (int j = i + 1; j < count; ++j) {
-            if (squared_distance(coordinates[i], coordinates[j]) >
+            if (squared_distance(coordinate_at(coordinates, i),
+                                 coordinate_at(coordinates, j)) >
                 distinctThresholdSquared) {
                 first = i;
                 second = j;
@@ -87,12 +96,15 @@ CadPointChainPlanarity CadGeometry_ClassifyPointChain(
        ordered faces whose first three points happen to be collinear. */
     for (int i = 0; i < count; ++i) {
         if (i == first || i == second) continue;
-        const double ux = coordinates[second][0] - coordinates[first][0];
-        const double uy = coordinates[second][1] - coordinates[first][1];
-        const double uz = coordinates[second][2] - coordinates[first][2];
-        const double vx = coordinates[i][0] - coordinates[first][0];
-        const double vy = coordinates[i][1] - coordinates[first][1];
-        const double vz = coordinates[i][2] - coordinates[first][2];
+        const double* first_point = coordinate_at(coordinates, first);
+        const double* second_point = coordinate_at(coordinates, second);
+        const double* current = coordinate_at(coordinates, i);
+        const double ux = second_point[0] - first_point[0];
+        const double uy = second_point[1] - first_point[1];
+        const double uz = second_point[2] - first_point[2];
+        const double vx = current[0] - first_point[0];
+        const double vy = current[1] - first_point[1];
+        const double vz = current[2] - first_point[2];
         const double nx = uy * vz - uz * vy;
         const double ny = uz * vx - ux * vz;
         const double nz = ux * vy - uy * vx;
@@ -108,10 +120,12 @@ CadPointChainPlanarity CadGeometry_ClassifyPointChain(
     if (normalLength == 0.0) return CAD_POINT_CHAIN_DEGENERATE;
 
     for (int i = 0; i < count; ++i) {
+        const double* first_point = coordinate_at(coordinates, first);
+        const double* current = coordinate_at(coordinates, i);
         const double distance = fabs(
-            normal[0] * (coordinates[i][0] - coordinates[first][0]) +
-            normal[1] * (coordinates[i][1] - coordinates[first][1]) +
-            normal[2] * (coordinates[i][2] - coordinates[first][2])) /
+            normal[0] * (current[0] - first_point[0]) +
+            normal[1] * (current[1] - first_point[1]) +
+            normal[2] * (current[2] - first_point[2])) /
             normalLength;
         if (!isfinite(distance)) return CAD_POINT_CHAIN_INVALID;
         if (distance > coplanarTolerance)

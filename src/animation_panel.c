@@ -51,10 +51,12 @@ void CadAnimationPanel_ComputeLayout(CadAnimationPanelRect panel,
     ADD_CONTROL(stop, 42);
     ADD_CONTROL(next, 28);
     ADD_CONTROL(last, 28);
-    /* The zero-based frame/FPS readout is painted in this gap.  Give the
-       full label room on normal desktop widths, but retain the recovered
-       compact layout (and its useful Loop control) in a narrow float. */
-    x += output->inner.w >= 700 ? 132 : 108;
+    /* The portable UI font advances eight logical pixels per character.  A
+       complete maximum-width readout ("F 63.00 / 64  60 fps") therefore
+       needs 160 pixels.  Keep a bounded, truncated readout in narrow floats
+       so it can never paint through the Loop control. */
+    output->readout = make_rect(x, y, output->inner.w >= 746 ? 160 : 100, 20);
+    x += output->readout.w + 4;
     ADD_CONTROL(loop, 48);
     ADD_CONTROL(interpolation, 60);
     ADD_CONTROL(fps_down, 40);
@@ -67,24 +69,25 @@ void CadAnimationPanel_ComputeLayout(CadAnimationPanelRect panel,
 
     x = output->inner.x + 4;
     y = output->inner.y + 49;
-    ADD_CONTROL(create_all, 72);
-    ADD_CONTROL(create_selected, 80);
-    ADD_CONTROL(count_down, 58);
-    ADD_CONTROL(count_up, 58);
+    ADD_CONTROL(create_all, 84);
+    ADD_CONTROL(create_selected, 84);
+    ADD_CONTROL(count_down, 60);
+    ADD_CONTROL(count_up, 60);
     ADD_CONTROL(insert, 52);
-    ADD_CONTROL(duplicate, 68);
+    ADD_CONTROL(duplicate, 76);
     ADD_CONTROL(delete_frame, 56);
 
     x = output->inner.x + 4;
     y = output->inner.y + 72;
-    ADD_CONTROL(copy_all, 66);
-    ADD_CONTROL(copy_selected, 80);
-    ADD_CONTROL(add_faces, 74);
-    ADD_CONTROL(static_copy, 128);
+    ADD_CONTROL(copy_all, 68);
+    ADD_CONTROL(copy_selected, 68);
+    ADD_CONTROL(add_faces, 76);
+    ADD_CONTROL(static_copy, 132);
 #undef ADD_CONTROL
 
 #define CLIP(field) clip_control(&output->field, output->inner)
     CLIP(first); CLIP(previous); CLIP(play); CLIP(stop); CLIP(next); CLIP(last);
+    CLIP(readout);
     CLIP(loop); CLIP(interpolation); CLIP(fps_down); CLIP(fps_up);
     CLIP(all_frames); CLIP(dock); CLIP(strip);
     CLIP(create_all); CLIP(create_selected); CLIP(count_down); CLIP(count_up);

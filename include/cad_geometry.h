@@ -17,18 +17,19 @@ typedef enum CadPointChainPlanarity {
 } CadPointChainPlanarity;
 
 /* Computes the unnormalized, winding-preserving area normal for an ordered
-   polygon.  The complete chain contributes to the result, so valid faces may
-   start with collinear vertices.  Returns nonzero for a finite,
-   non-degenerate polygon.  On failure, normal is set to {0, 0, 0}. */
+   polygon stored as packed XYZ triples.  The complete chain contributes to
+   the result, so valid faces may start with collinear vertices.  Returns
+   nonzero for a finite, non-degenerate polygon.  On failure, normal is set to
+   {0, 0, 0}. */
 int CadGeometry_ComputePolygonNormal(
-    const double (*coordinates)[3], int count, double normal[3]);
+    const double* coordinates, int count, double normal[3]);
 
 /* Classifies an ordered point chain.  A two-point chain is a valid colored
    line when its endpoints differ.  A face with three or more points is
    degenerate only when no non-collinear triple exists; the defining plane is
    not assumed to come from the first three vertices. */
 CadPointChainPlanarity CadGeometry_ClassifyPointChain(
-    const double (*coordinates)[3], int count, double coplanarTolerance);
+    const double* coordinates, int count, double coplanarTolerance);
 
 #ifdef __cplusplus
 }

@@ -256,7 +256,7 @@ static uint8_t reconstructed_side(const AnmFaceRecord* face,
         faceCoordinates[ordinal][1] = (double)point[1];
         faceCoordinates[ordinal][2] = (double)point[2];
     }
-    (void)CadGeometry_ComputePolygonNormal(faceCoordinates,
+    (void)CadGeometry_ComputePolygonNormal(faceCoordinates[0],
                                            face->pointCount, normal);
     if (normal[1] < 0.0) side |= 1U;
     if (normal[2] >= 0.0) side |= 2U;

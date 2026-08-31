@@ -1,0 +1,89 @@
+option(
+    'gui',
+    type: 'feature',
+    value: 'enabled',
+    description: 'Build the SDL3/OpenGL desktop editor',
+)
+
+option(
+    'tools',
+    type: 'boolean',
+    value: true,
+    description: 'Build command-line conversion tools',
+)
+
+option(
+    'tests',
+    type: 'boolean',
+    value: true,
+    description: 'Build and register the test suite',
+)
+
+option(
+    'recovery_corpus',
+    type: 'string',
+    value: '',
+    description: 'Optional recovered CAD data root for corpus validation',
+)
+
+option(
+    'anm_corpus',
+    type: 'string',
+    value: '',
+    description: 'Optional recovered ANM data root for corpus validation',
+)
+
+option(
+    'recovery_expected_total',
+    type: 'integer',
+    value: 500,
+    min: 0,
+    description: 'Expected CAD files in the canonical recovery corpus',
+)
+
+option(
+    'recovery_expected_x11',
+    type: 'integer',
+    value: 475,
+    min: 0,
+    description: 'Expected later-X11 files in the canonical recovery corpus',
+)
+
+option(
+    'recovery_expected_legacy',
+    type: 'integer',
+    value: 25,
+    min: 0,
+    description: 'Expected legacy files in the canonical recovery corpus',
+)
+
+option(
+    'anm_expected_total',
+    type: 'integer',
+    value: 379,
+    min: 0,
+    description: 'Expected files in the canonical ANM corpus',
+)
+
+option(
+    'anm_expected_3dan',
+    type: 'integer',
+    value: 358,
+    min: 0,
+    description: 'Expected 3DAN files in the canonical ANM corpus',
+)
+
+option(
+    'anm_expected_3dgi',
+    type: 'integer',
+    value: 21,
+    min: 0,
+    description: 'Expected 3DGI files in the canonical ANM corpus',
+)
+
+option(
+    'sdl3_root',
+    type: 'string',
+    value: '',
+    description: 'Root of an extracted official SDL3 Visual C++ development archive',
+)

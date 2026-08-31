@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static int failures;
 
@@ -14,6 +15,14 @@ static int failures;
         }                                                                     \
     } while (0)
 
+enum { PORTABLE_FONT_ADVANCE = 8, BUTTON_TEXT_PADDING = 4 };
+
+static void check_label_fits(CadAnimationPanelRect control,
+                             const char* label) {
+    CHECK(control.w - BUTTON_TEXT_PADDING >=
+          (int)strlen(label) * PORTABLE_FONT_ADVANCE);
+}
+
 static void test_reference_layout_and_hits(void) {
     CadAnimationPanelLayout layout;
     CadAnimationPanelHit hit;
@@ -21,7 +30,20 @@ static void test_reference_layout_and_hits(void) {
         (CadAnimationPanelRect){90, 610, 900, 126}, &layout);
     CHECK(layout.usable);
     CHECK(layout.strip.w == 880);
-    CHECK(layout.static_copy.w == 128);
+    CHECK(layout.readout.w == 160);
+    CHECK(layout.readout.x + layout.readout.w < layout.loop.x);
+    CHECK(layout.static_copy.w == 132);
+    check_label_fits(layout.create_all, "Create All");
+    check_label_fits(layout.create_selected, "Create Sel");
+    check_label_fits(layout.count_down, "Count -");
+    check_label_fits(layout.count_up, "Count +");
+    check_label_fits(layout.insert, "Insert");
+    check_label_fits(layout.duplicate, "Duplicate");
+    check_label_fits(layout.delete_frame, "Delete");
+    check_label_fits(layout.copy_all, "Copy All");
+    check_label_fits(layout.copy_selected, "Copy Sel");
+    check_label_fits(layout.add_faces, "Add Faces");
+    check_label_fits(layout.static_copy, "Make Static Copy");
     hit = CadAnimationPanel_HitTest(&layout, layout.play.x + 2,
                                     layout.play.y + 2, 16, 1);
     CHECK(hit.action == CAD_ANIMATION_PANEL_PLAY_PAUSE);
@@ -64,6 +86,8 @@ static void test_narrow_layout_clips_controls(void) {
         (CadAnimationPanelRect){0, 0, 410, 126}, &layout);
     CHECK(layout.usable);
     CHECK(layout.first.w > 0);
+    CHECK(layout.readout.w == 100);
+    CHECK(layout.readout.x + layout.readout.w < layout.loop.x);
     CHECK(layout.loop.w > 0);
     CHECK(layout.interpolation.w == 0);
     CHECK(layout.static_copy.w > 0);

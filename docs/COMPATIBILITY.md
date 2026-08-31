@@ -1,5 +1,27 @@
 # Compatibility matrix
 
+## Platforms and toolchains
+
+| Platform/toolchain | Core and tools | SDL3/OpenGL GUI | Continuous verification |
+| --- | :---: | :---: | --- |
+| Windows 10+ / MSVC x64 | Yes | Yes | Debug and release builds plus the complete automated test suite |
+| Windows 10+ / MinGW-w64 UCRT64 | Yes | Yes | Debug-optimized build plus the complete automated test suite |
+| Linux / Clang | Yes | Optional | GUI-disabled ASan/UBSan build and complete core test suite |
+| Linux / GCC | Yes | Yes | GUI build and complete test suite; one hidden frame under Xvfb and software OpenGL |
+
+Meson is the sole project build system. The `gui` feature may be `enabled`,
+`disabled`, or left at `auto`; disabling it proves that the core, converter,
+and their tests do not acquire SDL3 or OpenGL dependencies. The `tools` and
+`tests` options independently control the converter and test executables.
+
+Windows CI obtains SDL3 either from the official verified VC development
+archive or the MSYS2 UCRT64 package. Linux GUI builds use the distribution's
+SDL3 and OpenGL development packages. Native file dialogs, confirmation
+prompts, directory enumeration, and bitmap-font rendering use portable
+backends rather than Win32-only GUI APIs.
+
+## File formats and workflows
+
 | Format/workflow | Read | Write | Notes |
 | --- | :---: | :---: | --- |
 | Later X11 CAD records | Yes | Yes | Native fixed-offset big-endian stream, including tags 3/4; unchanged sources save byte-exactly |

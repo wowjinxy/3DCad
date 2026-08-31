@@ -1253,7 +1253,8 @@ static void derive_pose_faces(const CadFileData* data, CadPose* pose) {
             coordinates[ordinal][2] = current->z;
         }
         if (ordinal != count ||
-            !CadGeometry_ComputePolygonNormal(coordinates, count, areaNormal))
+            !CadGeometry_ComputePolygonNormal(coordinates[0], count,
+                                              areaNormal))
             continue;
         length = sqrt(areaNormal[0] * areaNormal[0] +
                       areaNormal[1] * areaNormal[1] +
@@ -1276,7 +1277,7 @@ static void derive_pose_faces(const CadFileData* data, CadPose* pose) {
 
 static CadResult evaluate_with_map(
     const CadFileData* data, CadPoseSample sample,
-    const int16_t map[CAD_ANIMATION_FRAMES][CAD_MAX_POINTS],
+    const int16_t* map,
     uint64_t generation, CadPose* output) {
     int pointIndex;
     if (!data || !map || !output)
@@ -1296,10 +1297,10 @@ static CadResult evaluate_with_map(
         position.z = base->pointz;
         pointA = sample.frameA >= 0 &&
                          sample.frameA < CAD_ANIMATION_FRAMES
-                     ? map[sample.frameA][pointIndex] : -1;
+                     ? map[sample.frameA * CAD_MAX_POINTS + pointIndex] : -1;
         pointB = sample.frameB >= 0 &&
                          sample.frameB < CAD_ANIMATION_FRAMES
-                     ? map[sample.frameB][pointIndex] : -1;
+                     ? map[sample.frameB * CAD_MAX_POINTS + pointIndex] : -1;
         if (active_animation_point(data, pointA)) {
             const CadAnimationPoint* a = &data->animationPoints[pointA];
             position.x = a->pointx;
@@ -1352,7 +1353,7 @@ CadResult CadPose_Evaluate(const CadFileData* data, CadPoseSample sample,
                                CAD_TAG_ANIMATION_POINT, -1,
                                "Could not build the pose point mapping");
     }
-    result = evaluate_with_map(data, sample, map, 1, output);
+    result = evaluate_with_map(data, sample, map[0], 1, output);
     free(map);
     return result;
 }
@@ -1542,7 +1543,7 @@ CadResult CadAnimationSession_Evaluate(CadAnimationSession* session,
                                      session->interpolation);
     ++session->poseGeneration;
     result = evaluate_with_map(data, sample,
-                               session->animationPointForBasePoint,
+                               session->animationPointForBasePoint[0],
                                session->poseGeneration, &session->pose);
     if (!CadResult_IsSuccess(&result)) return result;
     output->topology = data;

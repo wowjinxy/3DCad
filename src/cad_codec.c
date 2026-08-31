@@ -274,7 +274,7 @@ static void reconstruct_legacy_sides(CadFileData* data) {
             pointIndex = point->nextPoint;
         }
         if (pointCount == polygon->npoints)
-            (void)CadGeometry_ComputePolygonNormal(coordinates, pointCount,
+            (void)CadGeometry_ComputePolygonNormal(coordinates[0], pointCount,
                                                    normal);
         polygon->side = (uint8_t)((normal[1] < 0.0 ? 1 : 0) |
                                   (normal[2] >= 0.0 ? 2 : 0) |

@@ -19,7 +19,7 @@ static void test_first_three_collinear_is_still_planar(void) {
         {0.0, 0.0, 4.0}, {1.0, 0.0, 4.0}, {2.0, 0.0, 4.0},
         {2.0, 2.0, 4.0}, {0.0, 2.0, 4.0}
     };
-    CHECK(CadGeometry_ClassifyPointChain(points, 5, 0.01) ==
+    CHECK(CadGeometry_ClassifyPointChain(points[0], 5, 0.01) ==
           CAD_POINT_CHAIN_COPLANAR);
 }
 
@@ -33,14 +33,14 @@ static void test_polygon_normal_uses_complete_winding(void) {
     };
     double normal[3] = {1.0, 1.0, 1.0};
 
-    CHECK(CadGeometry_ComputePolygonNormal(clockwise, 5, normal));
+    CHECK(CadGeometry_ComputePolygonNormal(clockwise[0], 5, normal));
     CHECK(fabs(normal[0]) < 1e-12);
     CHECK(fabs(normal[1]) < 1e-12);
     CHECK(normal[2] < 0.0);
-    CHECK(!CadGeometry_ComputePolygonNormal(degenerate, 3, normal));
+    CHECK(!CadGeometry_ComputePolygonNormal(degenerate[0], 3, normal));
     CHECK(normal[0] == 0.0 && normal[1] == 0.0 && normal[2] == 0.0);
     CHECK(!CadGeometry_ComputePolygonNormal(NULL, 3, normal));
-    CHECK(!CadGeometry_ComputePolygonNormal(clockwise, 5, NULL));
+    CHECK(!CadGeometry_ComputePolygonNormal(clockwise[0], 5, NULL));
 }
 
 static void test_non_coplanar_and_degenerate_chains(void) {
@@ -54,13 +54,13 @@ static void test_non_coplanar_and_degenerate_chains(void) {
     };
     const double point_line[][3] = {{3.0, 4.0, 5.0}, {3.0, 4.0, 5.0}};
     const double line[][3] = {{3.0, 4.0, 5.0}, {3.0, 4.0, 6.0}};
-    CHECK(CadGeometry_ClassifyPointChain(nonplanar, 5, 0.01) ==
+    CHECK(CadGeometry_ClassifyPointChain(nonplanar[0], 5, 0.01) ==
           CAD_POINT_CHAIN_NON_COPLANAR);
-    CHECK(CadGeometry_ClassifyPointChain(collinear, 4, 0.01) ==
+    CHECK(CadGeometry_ClassifyPointChain(collinear[0], 4, 0.01) ==
           CAD_POINT_CHAIN_DEGENERATE);
-    CHECK(CadGeometry_ClassifyPointChain(point_line, 2, 0.01) ==
+    CHECK(CadGeometry_ClassifyPointChain(point_line[0], 2, 0.01) ==
           CAD_POINT_CHAIN_DEGENERATE);
-    CHECK(CadGeometry_ClassifyPointChain(line, 2, 0.01) ==
+    CHECK(CadGeometry_ClassifyPointChain(line[0], 2, 0.01) ==
           CAD_POINT_CHAIN_COPLANAR);
 }
 
@@ -72,9 +72,9 @@ static void test_invalid_input_and_tolerance(void) {
     };
     CHECK(CadGeometry_ClassifyPointChain(NULL, 2, 0.01) ==
           CAD_POINT_CHAIN_INVALID);
-    CHECK(CadGeometry_ClassifyPointChain(invalid, 2, 0.01) ==
+    CHECK(CadGeometry_ClassifyPointChain(invalid[0], 2, 0.01) ==
           CAD_POINT_CHAIN_INVALID);
-    CHECK(CadGeometry_ClassifyPointChain(near_planar, 4, 0.01) ==
+    CHECK(CadGeometry_ClassifyPointChain(near_planar[0], 4, 0.01) ==
           CAD_POINT_CHAIN_COPLANAR);
 }
 

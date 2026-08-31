@@ -48,6 +48,7 @@ typedef struct CadAnimationPanelLayout {
     CadAnimationPanelRect panel;
     CadAnimationPanelRect inner;
     CadAnimationPanelRect first, previous, play, stop, next, last;
+    CadAnimationPanelRect readout;
     CadAnimationPanelRect loop, interpolation, fps_down, fps_up, all_frames, dock;
     CadAnimationPanelRect strip;
     CadAnimationPanelRect create_all, create_selected, count_down, count_up;

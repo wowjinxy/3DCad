@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-typedef struct FontWin32 FontWin32;
+typedef struct Font Font;
 
 typedef struct GuiInput {
     int mouse_x;
@@ -53,7 +53,7 @@ void gui_cancel_input(GuiState* g);
 void gui_handle_key(GuiState* g, int key, unsigned modifiers, int pressed);
 const char* gui_window_title(GuiState* g);
 
-void gui_set_font(GuiState* g, FontWin32* font);
+void gui_set_font(GuiState* g, Font* font);
 void gui_load_tool_icons(GuiState* g, const char* resource_path);
 void gui_load_anim_icons(GuiState* g, const char* resource_path);
 void gui_update(GuiState* g, const GuiInput* in, int win_w, int win_h);

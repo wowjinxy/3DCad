@@ -7,8 +7,9 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "font_win32.h"
+#include "font.h"
 #include "gui.h"
+#include "file_dialog.h"
 #include "cad_version.h"
 
 #define APP_NAME "3DCad"
@@ -22,7 +23,7 @@ typedef struct AppState {
     SDL_Window* window;
     SDL_GLContext gl_context;
     GuiState* gui;
-    FontWin32* font;
+    Font* font;
     GuiInput input;
     float pending_wheel;
     float pending_button_x;
@@ -38,6 +39,7 @@ typedef struct AppState {
     bool right_gesture_tracking;
     bool vsync_enabled;
     bool font_refresh_pending;
+    bool smoke_test;
     char current_title[1024];
 } AppState;
 
@@ -124,7 +126,7 @@ static void refresh_font(AppState* app) {
     }
 
     const float display_scale = get_window_display_scale(app->window);
-    FontWin32* replacement = font_create_helvetica(DEFAULT_FONT_SIZE, display_scale);
+    Font* replacement = font_create_default(DEFAULT_FONT_SIZE, display_scale);
     if (!replacement) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "Unable to create the UI font; text rendering will be unavailable");
@@ -234,7 +236,7 @@ static int gui_keycode(SDL_Keycode key) {
     case SDLK_KP_MULTIPLY: return '*';
     case SDLK_KP_DIVIDE: return '/';
     default:
-        if (key >= 0 && key <= 0x7f) return (int)key;
+        if (key <= 0x7f) return (int)key;
         return 0;
     }
 }
@@ -254,15 +256,16 @@ static void refresh_window_title(AppState* app) {
 }
 
 SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
-
     AppState* app = (AppState*)SDL_calloc(1, sizeof(*app));
     if (!app) {
         return fail_sdl("application state allocation");
     }
     app->input_scale_x = 1.0f;
     app->input_scale_y = 1.0f;
+    for (int index = 1; index < argc; ++index) {
+        if (SDL_strcmp(argv[index], "--smoke-test") == 0)
+            app->smoke_test = true;
+    }
     *appstate = app;
 
     if (!SDL_SetAppMetadata(APP_NAME, APP_VERSION, APP_IDENTIFIER)) {
@@ -289,6 +292,7 @@ SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char* argv[]) {
     if (!app->window) {
         return fail_sdl("window creation");
     }
+    FileDialog_SetParent(app->window);
 
     if (!set_initial_window_size(app->window)) {
         return fail_sdl("setting the initial window size");
@@ -325,7 +329,7 @@ SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char* argv[]) {
     refresh_font(app);
     load_resources(app);
 
-    if (!SDL_ShowWindow(app->window)) {
+    if (!app->smoke_test && !SDL_ShowWindow(app->window)) {
         return fail_sdl("showing the window");
     }
 
@@ -550,6 +554,17 @@ SDL_AppResult SDLCALL SDL_AppIterate(void* appstate) {
     if (!SDL_GL_SwapWindow(app->window)) {
         return fail_sdl("swapping the OpenGL window");
     }
+    if (app->smoke_test) {
+        const GLenum error = glGetError();
+        if (error != GL_NO_ERROR) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "OpenGL smoke test failed with error 0x%x",
+                         (unsigned)error);
+            return SDL_APP_FAILURE;
+        }
+        SDL_Log("3DCad GUI smoke test passed");
+        return SDL_APP_SUCCESS;
+    }
 
     clear_transient_input(&app->input);
     app->pending_button_position = false;
@@ -579,6 +594,7 @@ void SDLCALL SDL_AppQuit(void* appstate, SDL_AppResult result) {
         SDL_GL_DestroyContext(app->gl_context);
     }
     if (app->window) {
+        FileDialog_SetParent(NULL);
         SDL_DestroyWindow(app->window);
     }
 

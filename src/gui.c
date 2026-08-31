@@ -2,7 +2,7 @@
 
 #include "gui.h"
 #include "render_gl.h"
-#include "font_win32.h"
+#include "font.h"
 #include "cad_core.h"
 #include "file_dialog.h"
 #include "cad_view.h"
@@ -28,25 +28,12 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
+#include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_opengl.h>
 #include <SDL3/SDL_timer.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#ifndef _WIN32
-#include <sys/stat.h>
-#endif
 #include <ctype.h>
 #include <stdarg.h>
 
@@ -104,7 +91,7 @@ typedef enum GuiAuxWindowId {
 } GuiAuxWindowId;
 
 struct GuiState {
-    FontWin32* font;
+    Font* font;
     GuiCommand pending_command;
 
     /* CAD core */
@@ -516,12 +503,12 @@ static const char* cad_result_message(const CadResult* result) {
     CadDiagnosticSeverity preferred = CadResult_IsSuccess(result)
                                           ? CAD_DIAGNOSTIC_WARNING
                                           : CAD_DIAGNOSTIC_ERROR;
-    for (int i = 0; i < result->diagnosticCount; ++i) {
+    for (size_t i = 0; i < result->diagnosticCount; ++i) {
         if (result->diagnostics[i].severity == preferred &&
             result->diagnostics[i].message[0])
             return result->diagnostics[i].message;
     }
-    for (int i = 0; i < result->diagnosticCount; ++i) {
+    for (size_t i = 0; i < result->diagnosticCount; ++i) {
         if (result->diagnostics[i].message[0])
             return result->diagnostics[i].message;
     }
@@ -874,25 +861,16 @@ static int confirm_replace_palette(GuiState* g, CadPaletteFormat format,
                           ? g && g->document.colDirty
                           : g && g->document.palDirty;
     if (!dirty) return 1;
-#ifdef _WIN32
     char prompt[512];
     snprintf(prompt, sizeof(prompt),
-             "Save changes to the %s before %s?\n\n"
-             "Yes: save\nNo: discard\nCancel: keep editing",
+             "Save changes to the %s before %s?",
              format == CAD_PALETTE_FORMAT_COL ? "COL color palette"
                                                : "PAL material map",
              action ? action : "continuing");
-    int answer = MessageBoxA(GetActiveWindow(), prompt,
-                             "3DCad - Unsaved palette changes",
-                             MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
-    if (answer == IDCANCEL || answer == 0) return 0;
-    if (answer == IDYES) return save_palette(g, format);
-    return answer == IDNO;
-#else
-    gui_set_status(g, "Unsaved palette changes: save before %s",
-                   action ? action : "continuing");
-    return 0;
-#endif
+    const int answer = FileDialog_ConfirmSaveDiscard(
+        "3DCad - Unsaved palette changes", prompt);
+    if (answer == FILE_DIALOG_CONFIRM_SAVE) return save_palette(g, format);
+    return answer == FILE_DIALOG_CONFIRM_DISCARD;
 }
 
 static int confirm_replace_document(GuiState* g, const char* action) {
@@ -904,26 +882,19 @@ static int confirm_replace_document(GuiState* g, const char* action) {
     col_dirty = g->document.colDirty;
     pal_dirty = g->document.palDirty;
     if (!model_dirty && !col_dirty && !pal_dirty) return 1;
-#ifdef _WIN32
     char prompt[512];
     snprintf(prompt, sizeof(prompt),
-             "Save modified model/color resources before %s?\n\n"
-             "Yes: save each modified resource\nNo: discard\nCancel: keep editing",
+             "Save modified model/color resources before %s?",
              action ? action : "continuing");
-    int answer = MessageBoxA(GetActiveWindow(), prompt, "3DCad - Unsaved changes",
-                             MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
-    if (answer == IDCANCEL || answer == 0) return 0;
-    if (answer == IDYES) {
+    const int answer = FileDialog_ConfirmSaveDiscard(
+        "3DCad - Unsaved changes", prompt);
+    if (answer == FILE_DIALOG_CONFIRM_SAVE) {
         if (model_dirty && !save_document(g)) return 0;
         if (col_dirty && !save_palette(g, CAD_PALETTE_FORMAT_COL)) return 0;
         if (pal_dirty && !save_palette(g, CAD_PALETTE_FORMAT_PAL)) return 0;
         return 1;
     }
-    return answer == IDNO;
-#else
-    gui_set_status(g, "Unsaved changes: save before %s", action ? action : "continuing");
-    return 0;
-#endif
+    return answer == FILE_DIALOG_CONFIRM_DISCARD;
 }
 
 static void replace_document(GuiState* g, const CadCore* replacement,
@@ -974,20 +945,6 @@ static void gui_draw_interaction_overlays(GuiState* g, int view_index);
 static int apply_palette_index_to_selection(GuiState* g, uint8_t index);
 static void handle_palette_panel(GuiState* g, const GuiInput* in);
 static void draw_palette_panel(GuiState* g);
-
-#ifdef _WIN32
-static int gui_utf8_to_wide(const char* source, wchar_t* target, int capacity) {
-    if (!source || !target || capacity <= 0) return 0;
-    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, source, -1,
-                               target, capacity) > 0;
-}
-
-static int gui_wide_to_utf8(const wchar_t* source, char* target, int capacity) {
-    if (!source || !target || capacity <= 0) return 0;
-    return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, source, -1,
-                               target, capacity, NULL, NULL) > 0;
-}
-#endif
 
 static void execute_editor_command(GuiState* g, CadCommandId command) {
     char filename[GUI_PATH_CAPACITY];
@@ -1168,16 +1125,11 @@ static void execute_editor_command(GuiState* g, CadCommandId command) {
                      "ANM export reported %u compatibility warning(s).\n\n%s\n\nContinue?",
                      validation.warningCount,
                      details[0] ? details : cad_result_message(&validation));
-#ifdef _WIN32
-            if (MessageBoxA(GetActiveWindow(), warning,
-                            "3DCad - ANM export warning",
-                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            if (!FileDialog_ConfirmContinue("3DCad - ANM export warning",
+                                            warning)) {
                 gui_set_status(g, "ANM export cancelled after validation warnings");
                 break;
             }
-#else
-            gui_set_status(g, "%s", warning);
-#endif
         }
         if (FileDialog_Save(filename, sizeof(filename),
                             "ANM Files\0*.anm\0All Files\0*.*\0",
@@ -1681,45 +1633,51 @@ static const char* asm_result_message(const CadResult* result) {
     return "Unknown ASM import failure";
 }
 
-#ifdef _WIN32
+static int gui_path_join(char* path_out, size_t path_capacity,
+                         const char* directory, const char* leaf) {
+    size_t length;
+    const char* separator;
+    int written;
+    if (!path_out || !path_capacity || !directory || !leaf) return 0;
+    length = strlen(directory);
+    separator = length && (directory[length - 1] == '/' ||
+                           directory[length - 1] == '\\') ? "" : "/";
+    written = snprintf(path_out, path_capacity, "%s%s%s",
+                       directory, separator, leaf);
+    return written >= 0 && (size_t)written < path_capacity;
+}
+
 static int collect_asm_folder(const char* folder_path,
                               CadAsmTextSource** sources,
                               size_t* source_count, size_t* source_capacity,
                               CadResult* failure) {
-    wchar_t wide_folder[GUI_PATH_CAPACITY * 2];
-    wchar_t search_path[GUI_PATH_CAPACITY * 2];
-    WIN32_FIND_DATAW find_data;
-    HANDLE find_handle;
-    if (!gui_utf8_to_wide(folder_path, wide_folder,
-                          ARRAY_COUNT(wide_folder)) ||
-        _snwprintf_s(search_path, ARRAY_COUNT(search_path), _TRUNCATE,
-                     L"%ls\\*.asm", wide_folder) < 0)
+    char** matches;
+    int match_count = 0;
+    int match_index;
+    if (!folder_path || !sources || !source_count || !source_capacity)
         return 0;
-    find_handle = FindFirstFileW(search_path, &find_data);
-    if (find_handle == INVALID_HANDLE_VALUE) return 0;
-    do {
-        char file_name[GUI_PATH_CAPACITY];
+    matches = SDL_GlobDirectory(folder_path, "*.asm",
+                                SDL_GLOB_CASEINSENSITIVE, &match_count);
+    if (!matches) return 0;
+    for (match_index = 0; match_index < match_count; ++match_index) {
         char full_path[GUI_PATH_CAPACITY * 2];
-        int written;
-        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (!gui_wide_to_utf8(find_data.cFileName, file_name,
-                              ARRAY_COUNT(file_name))) {
-            FindClose(find_handle);
+        SDL_PathInfo info;
+        if (!gui_path_join(full_path, sizeof(full_path), folder_path,
+                           matches[match_index]) ||
+            !SDL_GetPathInfo(full_path, &info)) {
+            SDL_free(matches);
             return 0;
         }
-        written = snprintf(full_path, sizeof(full_path), "%s\\%s",
-                           folder_path, file_name);
-        if (written < 0 || (size_t)written >= sizeof(full_path) ||
-            !append_asm_source(sources, source_count, source_capacity,
-                               file_name, full_path, failure)) {
-            FindClose(find_handle);
+        if (info.type != SDL_PATHTYPE_FILE) continue;
+        if (!append_asm_source(sources, source_count, source_capacity,
+                               matches[match_index], full_path, failure)) {
+            SDL_free(matches);
             return 0;
         }
-    } while (FindNextFileW(find_handle, &find_data));
-    FindClose(find_handle);
+    }
+    SDL_free(matches);
     return *source_count != 0;
 }
-#endif
 
 static void collect_optional_constant_sources(
     const char* shapes_folder, CadAsmTextSource** sources,
@@ -1741,23 +1699,29 @@ static void collect_optional_constant_sources(
         inc_folder[--length] = '\0';
     separator = strrchr(inc_folder, '\\');
     if (!separator) separator = strrchr(inc_folder, '/');
-    if (separator) *separator = '\0';
-    length = strlen(inc_folder);
-    if (length + strlen("\\INC") + 1 >= sizeof(inc_folder)) return;
-    memcpy(inc_folder + length, "\\INC", strlen("\\INC") + 1);
+    if (separator) {
+        if (separator == inc_folder) separator[1] = '\0';
+        else *separator = '\0';
+    } else if (!(length == 2 && inc_folder[1] == ':')) {
+        memcpy(inc_folder, ".", 2);
+    }
+    {
+        char parent[GUI_PATH_CAPACITY * 2];
+        memcpy(parent, inc_folder, strlen(inc_folder) + 1);
+        if (!gui_path_join(inc_folder, sizeof(inc_folder), parent, "INC"))
+            return;
+    }
     for (index = 0; index < (size_t)ARRAY_COUNT(files); ++index) {
         char full_path[GUI_PATH_CAPACITY * 2];
         CadResult ignored;
         size_t before = *source_count;
-        int written = snprintf(full_path, sizeof(full_path), "%s\\%s",
-                               shapes_folder, files[index]);
-        if (written < 0 || (size_t)written >= sizeof(full_path)) continue;
+        if (!gui_path_join(full_path, sizeof(full_path), shapes_folder,
+                           files[index])) continue;
         (void)append_asm_source(sources, source_count, source_capacity,
                                 files[index], full_path, &ignored);
         if (*source_count != before) continue;
-        written = snprintf(full_path, sizeof(full_path), "%s\\%s",
-                           inc_folder, files[index]);
-        if (written < 0 || (size_t)written >= sizeof(full_path)) continue;
+        if (!gui_path_join(full_path, sizeof(full_path), inc_folder,
+                           files[index])) continue;
         (void)append_asm_source(sources, source_count, source_capacity,
                                 files[index], full_path, &ignored);
     }
@@ -1781,7 +1745,6 @@ static void scan_asm_folder_for_shapes(GuiState* g,
         gui_set_status(g, "ASM folder path is too long");
         return;
     }
-#ifdef _WIN32
     if (!collect_asm_folder(folder_path, &asm_sources, &asm_count,
                             &asm_capacity, &result)) {
         gui_set_status(g, "Could not read ASM folder: %s",
@@ -1790,11 +1753,6 @@ static void scan_asm_folder_for_shapes(GuiState* g,
         free_asm_source_array(&asm_sources, &asm_count);
         return;
     }
-#else
-    (void)asm_capacity;
-    gui_set_status(g, "ASM shape browsing is currently Windows-only");
-    return;
-#endif
     qsort(asm_sources, asm_count, sizeof(*asm_sources), compare_asm_source);
     collect_optional_constant_sources(folder_path, &constant_sources,
                                       &constant_count, &constant_capacity);
@@ -2030,7 +1988,7 @@ static int shape_browser_key(GuiState* g, int key) {
     return 1;
 }
 
-void gui_set_font(GuiState* g, FontWin32* font) {
+void gui_set_font(GuiState* g, Font* font) {
     if (!g) return;
     g->font = font;
 }
@@ -2586,7 +2544,7 @@ static void attach_polygon_to_root(CadCore* core, int16_t polygon_index) {
 }
 
 static int16_t create_polygon_from_coordinates(CadCore* core,
-                                               const double coords[][3], int count,
+                                               const double* coords, int count,
                                                uint8_t color, uint8_t side,
                                                int reverse) {
     if (!core || !coords || count < CAD_MIN_FACE_POINTS || count > CAD_MAX_FACE_POINTS) {
@@ -2596,7 +2554,9 @@ static int16_t create_polygon_from_coordinates(CadCore* core,
     int made = 0;
     for (int i = 0; i < count; ++i) {
         int source = reverse ? count - 1 - i : i;
-        points[made] = CadCore_AddPoint(core, coords[source][0], coords[source][1], coords[source][2]);
+        const double* coordinate = coords + source * 3;
+        points[made] = CadCore_AddPoint(core, coordinate[0], coordinate[1],
+                                        coordinate[2]);
         if (points[made] == INVALID_INDEX) break;
         ++made;
     }
@@ -2633,7 +2593,7 @@ static int16_t duplicate_polygon_from_core(CadCore* destination, const CadCore* 
         coords[i][2] = point->pointz;
     }
     const CadPolygon* polygon = &source->data.polygons[polygon_index];
-    return create_polygon_from_coordinates(destination, coords, count,
+    return create_polygon_from_coordinates(destination, coords[0], count,
                                            polygon->color, polygon->side, reverse);
 }
 
@@ -3028,7 +2988,7 @@ static int polygon_is_flat(const CadCore* core, int16_t polygon_index) {
         coordinates[i][1] = p->pointy;
         coordinates[i][2] = p->pointz;
     }
-    return CadGeometry_ClassifyPointChain(coordinates, count, 0.01) ==
+    return CadGeometry_ClassifyPointChain(coordinates[0], count, 0.01) ==
            CAD_POINT_CHAIN_COPLANAR;
 }
 
@@ -3370,7 +3330,7 @@ static void update_face_creation_status(GuiState* g, int view_index) {
         gui_set_status(g, "Face: vertex 1 set; choose the next point (Backspace removes it)");
     } else if (count == 2) {
         CadPointChainPlanarity planarity =
-            CadGeometry_ClassifyPointChain(coords, count, 0.01);
+            CadGeometry_ClassifyPointChain(coords[0], count, 0.01);
         if (planarity == CAD_POINT_CHAIN_COPLANAR)
             gui_set_status(g, "Face: 2 vertices form a colored line; Enter/right-click finishes");
         else
@@ -3378,7 +3338,7 @@ static void update_face_creation_status(GuiState* g, int view_index) {
     } else {
         double nx = 0.0, ny = 0.0, nz = 0.0;
         CadPointChainPlanarity planarity =
-            CadGeometry_ClassifyPointChain(coords, count, 0.01);
+            CadGeometry_ClassifyPointChain(coords[0], count, 0.01);
         const char* normal_axis;
         for (int i = 0; i < count; ++i) {
             int next = (i + 1) % count;
@@ -3417,7 +3377,7 @@ static int create_face_from_selection(GuiState* g) {
         coords[i][0] = point->pointx; coords[i][1] = point->pointy; coords[i][2] = point->pointz;
     }
     CadPointChainPlanarity planarity =
-        CadGeometry_ClassifyPointChain(coords, count, 0.01);
+        CadGeometry_ClassifyPointChain(coords[0], count, 0.01);
     if (planarity == CAD_POINT_CHAIN_DEGENERATE) {
         gui_set_status(g, count == 2
                            ? "Face rejected: colored-line endpoints coincide"
@@ -3429,7 +3389,8 @@ static int create_face_from_selection(GuiState* g) {
         return 0;
     }
     if (!history_push(g)) return 0;
-    int16_t polygon = create_polygon_from_coordinates(g->cad, coords, count, 0, 0, 0);
+    int16_t polygon = create_polygon_from_coordinates(g->cad, coords[0], count,
+                                                       0, 0, 0);
     CadCore_ClearSelection(g->cad);
     if (polygon == INVALID_INDEX) {
         history_cancel(g);
@@ -3621,8 +3582,8 @@ static void cut_selected_faces(GuiState* g) {
             memcpy(triangle[0], source[0], sizeof(triangle[0]));
             memcpy(triangle[1], source[i], sizeof(triangle[1]));
             memcpy(triangle[2], source[i + 1], sizeof(triangle[2]));
-            int16_t result = create_polygon_from_coordinates(g->cad, triangle, 3,
-                                                              original.color, original.side, 0);
+            int16_t result = create_polygon_from_coordinates(
+                g->cad, triangle[0], 3, original.color, original.side, 0);
             if (result == INVALID_INDEX) { failed = 1; break; }
             CadCore_SelectPolygon(g->cad, result);
             ++made;
@@ -4108,20 +4069,6 @@ static int handle_view_scrollbar_input(GuiState* g, const GuiInput* in, int view
     return 1;
 }
 
-static void draw_grid(Rect inner) {
-    RG_Color grid = { 220,220,220,255 };
-    RG_Color axis = { 120,120,255,255 };
-    for (int x = inner.x; x < inner.x + inner.w; x += 20) {
-        rg_line(x, inner.y, x, inner.y + inner.h, grid);
-    }
-    for (int y = inner.y; y < inner.y + inner.h; y += 20) {
-        rg_line(inner.x, y, inner.x + inner.w, y, grid);
-    }
-    rg_line(inner.x + inner.w / 2, inner.y, inner.x + inner.w / 2, inner.y + inner.h, axis);
-    rg_line(inner.x, inner.y + inner.h / 2, inner.x + inner.w, inner.y + inner.h / 2, axis);
-}
-
-
 static int menu_item_enabled(const GuiState* g, const CadMenuItemDescriptor* item) {
     if (!g || !item || (item->flags & (CAD_MENU_ITEM_SEPARATOR | CAD_MENU_ITEM_DISABLED))) return 0;
     EditorCommandContext context = editor_command_context(g);
@@ -4285,12 +4232,9 @@ static void handle_shape_browser_click(GuiState* g, const GuiInput* in) {
     if (pt_in_rect(in->mouse_x, in->mouse_y, layout.replace_button) && in->mouse_pressed) {
         const CadAsmShapeInfo* shape;
         const char* name;
-        const char* separator;
         const char* source_name;
         char* import_path_copy;
         char import_path[GUI_PATH_CAPACITY * 2];
-        size_t folder_length;
-        int written;
         if (!g->shape_preview_valid || g->shape_selected < 0) {
             gui_set_status(g, "Select a valid ASM shape preview before Replace");
             return;
@@ -4304,15 +4248,8 @@ static void handle_shape_browser_click(GuiState* g, const GuiInput* in) {
             return;
         }
         source_name = g->shape_asm_sources[shape->sourceIndex].name;
-        folder_length = strlen(g->shape_folder_path);
-        separator = folder_length &&
-                    (g->shape_folder_path[folder_length - 1] == '\\' ||
-                     g->shape_folder_path[folder_length - 1] == '/')
-                        ? "" : "\\";
-        written = snprintf(import_path, sizeof(import_path), "%s%s%s",
-                           g->shape_folder_path, separator,
-                           source_name);
-        if (written < 0 || (size_t)written >= sizeof(import_path)) {
+        if (!gui_path_join(import_path, sizeof(import_path),
+                           g->shape_folder_path, source_name)) {
             gui_set_status(g, "The previewed ASM source path is too long");
             return;
         }
@@ -4937,7 +4874,7 @@ static void handle_palette_panel(GuiState* g, const GuiInput* in) {
         apply_document_palette(g);
         break;
     case CAD_PALETTE_PANEL_PAL_SAMPLE_PLUS:
-        if (g->palette_sample_index + 1 < CAD_PAL_INDEX_COUNT)
+        if (g->palette_sample_index + 1 < (int)CAD_PAL_INDEX_COUNT)
             ++g->palette_sample_index;
         apply_document_palette(g);
         break;
@@ -5929,7 +5866,7 @@ static void gui_draw_interaction_overlays(GuiState* g, int view_index) {
         if (valid) {
             const RG_Color chain_color = { 125, 50, 190, 255 };
             CadPointChainPlanarity planarity =
-                CadGeometry_ClassifyPointChain(coords, count, 0.01);
+                CadGeometry_ClassifyPointChain(coords[0], count, 0.01);
             const RG_Color close_color =
                 planarity == CAD_POINT_CHAIN_COPLANAR
                     ? (RG_Color){ 30, 150, 85, 255 }
@@ -5977,7 +5914,7 @@ static size_t utf8_previous_boundary(const char* text, size_t length) {
     return length;
 }
 
-static const char* fit_text_to_width(const FontWin32* font, const char* text,
+static const char* fit_text_to_width(const Font* font, const char* text,
                                      int max_width, char* buffer,
                                      size_t capacity) {
     size_t length;
@@ -6000,7 +5937,7 @@ static const char* fit_text_to_width(const FontWin32* font, const char* text,
     return buffer;
 }
 
-static void draw_fitted_text(const FontWin32* font, int x, int y,
+static void draw_fitted_text(const Font* font, int x, int y,
                              int max_width, const char* text, uint8_t gray) {
     char fitted[256];
     const char* visible;
@@ -6112,8 +6049,8 @@ static void draw_animation_panel(GuiState* g) {
         snprintf(readout, sizeof(readout), "F %.2f / %d  %.0f fps",
                  g->animation.previewFrame, frames,
                  g->animation.fps);
-        font_draw(g->font, layout.last.x + layout.last.w + 7,
-                  layout.last.y + 3, readout, 0);
+        draw_fitted_text(g->font, layout.readout.x, layout.readout.y + 3,
+                         layout.readout.w, readout, 0);
     }
 
     for (int frame = 0; frame < CAD_ANIMATION_FRAMES; ++frame) {

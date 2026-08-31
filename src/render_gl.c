@@ -4,7 +4,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "../include/stb_image.h"
 
+#include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_opengl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,7 +101,18 @@ void rg_line(int x1, int y1, int x2, int y2, RG_Color c) {
 
 RG_Texture* rg_load_texture(const char* path) {
     int w, h, channels;
-    unsigned char* data = stbi_load(path, &w, &h, &channels, 4); /* Force RGBA */
+    size_t encoded_size = 0;
+    void* encoded = SDL_LoadFile(path, &encoded_size);
+    unsigned char* data;
+    if (!encoded || encoded_size > INT_MAX) {
+        fprintf(stderr, "Failed to read image %s: %s\n", path,
+                encoded ? "file is too large" : SDL_GetError());
+        SDL_free(encoded);
+        return NULL;
+    }
+    data = stbi_load_from_memory((const stbi_uc*)encoded, (int)encoded_size,
+                                 &w, &h, &channels, 4); /* Force RGBA */
+    SDL_free(encoded);
     if (!data) {
         fprintf(stderr, "Failed to load image %s: %s\n", path, stbi_failure_reason());
         return NULL;

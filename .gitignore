@@ -11,17 +11,16 @@ x64/
 [Dd]ebug/
 [Rr]elease/
 /build/
+/build-*/
+/_build/
 /out/
-cmake-build-*/
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-install_manifest.txt
 compile_commands.json
-CTestTestfile.cmake
-_deps/
-vcpkg_installed/
-CMakeUserPresets.json
+meson-private/
+meson-logs/
+meson-info/
+.ninja_deps
+.ninja_log
+build.ninja
 *.exe
 *.dll
 *.lib
@@ -31,6 +30,10 @@ CMakeUserPresets.json
 *.pdb
 *.ilk
 *.exp
+
+# Meson wrap downloads (keep the reviewed wrap definitions)
+/subprojects/*
+!/subprojects/*.wrap
 
 # NuGet packages
 packages/
